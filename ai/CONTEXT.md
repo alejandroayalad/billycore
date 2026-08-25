@@ -70,7 +70,6 @@ first time this table has been worth reading.
 | `docs/DATA_MODEL.md` | Written · §4.1 is one column behind the schema (D24) |
 | `docs/API.md` | Written · §5 and §6 now have running implementations |
 | `docs/SECURITY.md` | Written |
-| `docs/ROADMAP.md` | **Empty** |
 | `ai/CONTEXT.md`, `ai/DECISIONS.md` | Written · D1–D26 |
 | `ai/CONVENTIONS.md`, `ai/CONSTRAINTS.md`, `ai/WORKFLOW.md`, `ai/GLOSSARY.md` | **Empty** |
 | BillySat, BillyAgent | Docs-only scaffolds, no code. Do not start them. |
@@ -82,21 +81,29 @@ first time this table has been worth reading.
 | | |
 |---|---|
 | Started | 2026-08-22 |
-| MVP deadline | **2026-09-22 — hard** |
+| MVP target | 2026-09-22 — **a target, no longer hard** (D28) |
+| Realistic landing | early-to-mid October |
 | Budget | 2 h/weekday + 4 h Saturday + 4 h Sunday ≈ **18 h/week** |
-| Total remaining | **≈ 78 hours** |
+| Remaining to the target | ≈ 72 hours |
+| Estimated to finish the scope | **≈ 80–90 hours** |
 
-That number is the most important fact in this document. Every design decision in
-`docs/` is subordinate to it. Seventy-eight hours is roughly two normal working weeks,
-spent in two-hour fragments, on a system with six design documents and around thirty
-open questions.
+Those last two lines are the most important fact in this document, and they do not
+agree. D27 put bank statements and reconciliation into the MVP; D28 answered the
+collision by moving the date rather than cutting the scope. The number to watch is no
+longer "hours left" but the gap between the two.
+
+The deadline having moved once, the honest risk is that it stops constraining anything.
+What holds it in place is that D27 wrote the scope down: the date moves for *that* list,
+and adding to the list is a new decision, not an adjustment.
 
 The success criterion has not moved (PRODUCT.md):
 
 > I can see my last month of transactions, well classified, in a good table with good
 > financial information.
 
-**Nothing that does not serve that sentence should be built before 2026-09-22.**
+**Nothing that does not serve that sentence gets built.** That rule survives D28 intact
+— it applies with more force now, not less, because the scope grew rather than the
+discipline loosening.
 
 ---
 
@@ -116,18 +123,31 @@ M1 was Gmail → Evidence → SQLite, idempotent on the Gmail message id: no Cla
 transaction extraction, no reconciliation, no AI, no HSBC. All of it now exists, runs
 against the live mailbox, and is provably idempotent without a network.
 
-**M2 is where the design stops being about plumbing.** The 800 transaction-bearing
-messages in §3.1 are four templates with three date formats, and the parser work is the
-first thing in this project that BillyCore could get *quietly wrong* — a mis-parsed
-amount is worse than a missing one, because it looks like an answer. The open order:
+**M2 is where the design stops being about plumbing**, and D27 made it bigger than
+parsers. The scope is now three things that have to land together:
 
-1. Per-template parsers for the four Nu templates, `internal/adapter/parser` (D11, D16)
-2. Claims with field-level confidence, and `claim_fields` in migration 002
-3. Transactions, and the `EXTRACTED` stage that produces them
-4. `GET /v1/transactions` — and then §8.1, which is still the largest hole in the MVP
+1. **Email → Transactions.** Per-template parsers for the Nu templates
+   (`internal/adapter/parser`, D11, D16), Claims with field-level confidence, and the
+   `EXTRACTED` stage that produces Transactions. ~45 h.
+2. **Statements.** Intake by hand through `POST /v1/evidence` — measured 2026-08-25, the
+   statement emails carry no PDF and BillyCore may not follow the links to fetch one
+   (D16, D27). PDF text extraction is the open problem: Go has no standard library for
+   it, so this is either a dependency the author approves (SECURITY.md §11) or an
+   external extractor posting to `POST /v1/claims`, which is the escape hatch D11
+   designed for exactly this. ~25 h.
+3. **Reconciliation.** DOMAIN.md §6's six signals, and the transfers that appear in both
+   Sources collapsing into one Transaction. ~20 h, and it drags six open questions onto
+   the path with it.
 
-The clock in §2 has not moved and neither has the criterion: a table of last month's
-transactions. That is **38 transactions**, not 1,044 artifacts.
+**The order matters more than the estimates.** 1 before 3, because reconciliation cannot
+be tested until there are two kinds of Transaction to reconcile — and 2 before 3 for the
+same reason. Statement parsing is the piece most likely to blow its estimate, and it is
+the only one whose input format has never been seen.
+
+The criterion has not moved: a table of last month's transactions. From email that is
+**37 rows** — 22 inflows, 15 outflows, measured, not estimated. The statement adds the
+card purchases that no email contains, which is the difference between a table of money
+moving and a table of what was bought.
 
 ---
 
@@ -348,8 +368,11 @@ real parsers, real transactions in a table — not more design.
    candidates: `curl | jq`, a `billycore tx` CLI table, or a single static HTML page fed
    by `GET /v1/transactions`. Undecided, and it is on the critical path — the MVP is not
    demonstrable without it.
-2. **What gets cut?** Nothing is currently on the cut list. Against ~78 hours, that is
-   the largest risk in the project, larger than any technical unknown here.
+2. ~~**What gets cut?**~~ **Closed by D28: nothing.** The question was put directly on
+   2026-08-25 with four options on the table — ship late, statement-only, reconcile by
+   hand, or drop history — and the answer was to hold the scope and move the date. The
+   risk this was guarding against has not gone away; it has changed shape, from *"what
+   gets dropped at the last minute"* to *"does a movable deadline constrain anything"*.
 3. **Repository layout — the root is fixed; one repo or three is not.**
    `billycore` is now its own git repository with its own remote
    (`github.com/alejandroayalad/billycore`) and its own `.gitignore`, which closes the

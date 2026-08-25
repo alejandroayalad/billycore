@@ -404,6 +404,64 @@ DATA_MODEL.md and D13 are untouched: this is configuration, not a domain entity,
 table is created.
 **Source.** Author decision, 2026-08-25.
 
+### D27 — Bank statements and reconciliation are in the MVP
+**Status:** Accepted · 2026-08-25 · Reversibility: expensive
+**Decision.** The MVP is not "Nu email in a table". It is **Nu email plus the Nu card
+statement, reconciled**. Statements become a second Source of `source_type`
+`BANK_STATEMENT`, and DOMAIN.md §6 reconciliation ships rather than being deferred to
+v2.
+**Why.** Two reasons, and the second is the real one. First, with two Sources the same
+transfer genuinely appears twice — an email and a statement line — so deduplication
+stops being hypothetical. Second and larger: **Nu does not email card purchases**
+(CONTEXT.md §3.1 — zero in 1,044 messages), so the statement is the only place they
+exist. An email-only table shows money moving between accounts; it cannot answer *what
+did I buy*, which is most of what PRODUCT.md's success sentence means by "well
+classified".
+**Rejected — cut reconciliation, ship the email table.** Argued for on 2026-08-25 on the
+grounds that one Source with one email per event has nothing to reconcile, and that
+cutting it removes ~20 hours and five open questions from the critical path. It loses
+because its premise was wrong: the author intends statements, and the single-Source
+world it assumed was never the plan. Recorded because the reasoning was sound given the
+premise, and the premise is the part that failed.
+**Consequence — statements arrive by hand.** Measured 2026-08-25: all 23
+`estado de cuenta` emails are `text/html` with **no attachment**, carrying links behind
+an app login, and D16 forbids BillyCore resolving them. The 12 PDFs in the mailbox are
+contracts, not statements. So intake is `POST /v1/evidence` (API.md §6) with the user
+supplying the file — which is why that endpoint ships rather than being deferred.
+**Consequence — open questions become blocking.** DOMAIN.md Q1 (time window), Q3
+(different amounts), Q7 and Q8 (which contradictions force `NO_MATCH` vs `AMBIGUOUS`),
+Q15 (does one Transaction absorb the other), and DATA_MODEL.md Q1 (what a reconciliation
+candidate references) all move from "week three at the earliest" onto the path. Each
+still gets stopped at and logged (D21).
+**Consequence — the budget does not fit.** ~80–90 hours of work against ~72 remaining.
+Resolved by D28.
+**Source.** Author decision, 2026-08-25.
+
+### D28 — The deadline moves; the scope does not
+**Status:** Accepted · 2026-08-25 · Reversibility: cheap · Supersedes the "hard" deadline in CONTEXT.md §2
+**Decision.** **2026-09-22 stops being a hard deadline.** It remains the target. When the
+two collide, the date gives way and the scope in D27 is delivered whole.
+**Closes.** CONTEXT.md §8.2 — *what gets cut?* Nothing.
+**Why.** The deadline was self-imposed and binds one person. The scope is what makes the
+product the thing PRODUCT.md describes rather than a demonstration of plumbing. Shipping
+a table without card spending on time would meet a date and miss the point.
+**Rejected — reconcile by hand for the MVP.** Build both parsers, show duplicate
+transfers, defer automatic reconciliation to M3. Saves ~20 hours and four open questions
+and keeps the date. It loses because the author chose the scope over the date, plainly,
+when both were put side by side.
+**Rejected — statement only, drop the email parsers.** The statement carries card
+purchases *and* transfers, so one Source could produce the whole table and reconciliation
+would have nothing to do. Genuinely cheaper. Not chosen; the email path is already built
+as far as Evidence and the author wants both.
+**Consequence.** CONTEXT.md §2's "**2026-09-22 — hard**" is now false and is corrected.
+The estimate on the table is **early-to-mid October** at ~18 h/week. Nothing else about
+§2 changes: the success criterion is untouched, and "nothing that does not serve that
+sentence gets built" applies with more force now, not less, because the scope grew.
+**Consequence — a deadline that moves once can move again.** The honest risk this
+creates is that it stops being a constraint at all. The mitigation is that D27 fixed the
+scope in writing: the date moves for *that* list, and a new item on it is a new decision.
+**Source.** Author decision, 2026-08-25.
+
 ---
 
 ## Template
