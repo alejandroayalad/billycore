@@ -1,6 +1,6 @@
 # BillyCore — Decisions
 
-**Last updated:** 2026-08-23
+**Last updated:** 2026-08-25
 
 A running log of decisions that are settled. One entry per decision, newest at the
 bottom, never rewritten in place — a decision that stops being true is **superseded** by
@@ -301,6 +301,43 @@ become *"copy `~/.billy/`"* — the directory now contains `credentials.json`, a
 exists precisely so that backups do not carry live refresh tokens. This wording is
 user-facing documentation, not an internal note.
 **Source.** Author decision, 2026-08-23. Supersedes ARCHITECTURE.md §10 Q1.
+
+### D23 — `source_reference` is the canonical name for Evidence identity
+**Status:** Accepted · 2026-08-25 · Reversibility: cheap
+**Decision.** The concept has one name in code and in the schema: **`source_reference`**.
+ARCHITECTURE.md §5 calls it `source_artifact_key` and API.md uses that spelling on the
+wire; both keep their wording, and the wire field is mapped to `source_reference` at the
+HTTP boundary. For Gmail the value is the message id.
+**Closes.** The naming collision found while scoping M1 (CONTEXT.md §5 item 1).
+**Why.** Three names for one concept across three documents, and the domain constructor
+had to name one regardless — whichever it named would become canonical silently.
+`source_reference` wins because it is the name in DATA_MODEL.md, which is the document
+describing the physical thing being named.
+**Consequence.** DATA_MODEL.md §4.1 needs no change. A mapping exists in exactly one
+place, the HTTP layer, and nowhere else. The second meaning DATA_MODEL.md §4.1 gives the
+column — "the preserved reference when `raw_content` is NULL" — is untouched by this and
+remains as written.
+**Source.** Author decision, 2026-08-25.
+
+### D24 — `content_type` becomes a column; the contract does not change
+**Status:** Accepted · 2026-08-25 · Reversibility: cheap
+**Decision.** Add `content_type TEXT` to the `evidence` table in migration 001. For Gmail
+the value is `message/rfc822`, since Evidence stores the full RFC822 artifact.
+`content_bytes` on the wire stays derived from `length(raw_content)` and is not stored.
+**Closes.** The wire/schema gap found while scoping M1 (CONTEXT.md §5 item 2).
+**Why.** The simplest of the two available choices. API.md §4 and §6 already carry
+`content_type`, so adding one column makes the code match a contract that is already
+written, while the alternative means amending the public interface document. Migration
+001 has not run anywhere, so the column costs nothing now and a second migration later.
+**Rejected — drop `content_type` from API.md.** Defensible: nothing in M1 reads it, and
+the smallest schema is a virtue. It loses because it changes the contract to match an
+implementation gap rather than the reverse, and because the value is genuinely useful the
+moment a second Source exists — a PDF statement and an email are not the same kind of
+artifact, and `GET /v1/evidence/{id}` is the endpoint that has to say which it handed you.
+**Consequence.** DATA_MODEL.md §4.1's table definition is now one column behind the
+schema BillyCore actually creates. That is a documentation correction for the author to
+make, not a licence for the code to drift further.
+**Source.** Author decision, 2026-08-25.
 
 ---
 
