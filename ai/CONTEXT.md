@@ -1,6 +1,6 @@
 # BillyCore — Context
 
-**Last updated:** 2026-08-24
+**Last updated:** 2026-08-25
 
 Orientation for anyone — human or agent — starting work on BillyCore. `docs/` describes
 the system as designed. This file describes where the project actually *is*, which is a
@@ -102,6 +102,108 @@ only sender in scope, the Gmail message id is the source artifact key, and sync 
 idempotent.
 
 Step 5 is where the design meets reality and where `docs/` starts getting corrected.
+
+---
+
+## 3.1 What the real data says — measured 2026-08-25
+
+Step 5 happened. `billycore peek` reached the live mailbox and these are counts
+from it, not estimates. **Do not use Gmail's `resultSizeEstimate`** — it returned
+201 for every query asked of it, including ones with three real hits. Every number
+below comes from paginating message ids.
+
+### Volume
+
+| Query | Count |
+|---|---|
+| `from:nu@nu.com.mx`, all time | **1,044** |
+| `from:marketing.nu.com.mx`, all time | 41 |
+| `from:nu.com.mx newer_than:30d` | 54 |
+| HSBC, all senders, all time | **36** |
+
+### Nu templates
+
+Four templates carry a financial event. They are 800 of 1,044 messages — **77%**,
+and the top two alone are 67%.
+
+| Subject | All time | Last 30d | Event |
+|---|---|---|---|
+| `Tu transferencia fue exitosa` | 354 | 15 | OUTFLOW |
+| `¡Recibiste una transferencia!` | 345 | 22 | INFLOW |
+| `¡Recibimos tu pago!` | 90 | 1 | Card payment |
+| `Tu comprobante de pago de servicio` | 11 | 0 | Service payment |
+| **transaction-bearing** | **800** | **38** | |
+| contacts, card limits, statement notices, Apple Pay, marketing | 244 | 14 | none |
+
+**The MVP month is 38 transactions.**
+
+### Fields, by template
+
+`Tu transferencia fue exitosa` — the richest:
+
+```
+Monto: $1,000.00            Folio: QURN4HRT7
+Fecha: 16/AGO/2026          Nombre: <beneficiary>
+Hora: 17:44                 Entidad: HSBC
+Concepto: Transferencia     Tarjeta de débito: ••••7662
+Número de referencia: 160826    Estatus: Completada
+Clave de rastreo: NU3AG95KNAK990QOSMHUM86DL8SV
+```
+
+`¡Recibiste una transferencia!` — `Monto`, `Fecha: 18 AGO 2026`, `Hora`, sender
+name in prose. No folio, no tracking key.
+
+`¡Recibimos tu pago!` — bare amount line, product name, **no date in the body**.
+
+`Tu comprobante de pago de servicio` — `Monto`, `Tipo de transacción`, merchant as
+`Empresa:`, `Código de operación` (a UUID), `18 jul 2026 - 10:03:51`.
+
+### Consequences for the design
+
+1. **Three date formats across four templates**, with Spanish month names in two
+   cases. One date parser will not serve; this argues for per-template parsers.
+2. **`Clave de rastreo` is a natural key.** SPEI tracking keys are globally unique.
+   Two artifacts sharing one are the same transaction with no ambiguity — a far
+   stronger signal than the merchant/amount/time comparison in DOMAIN.md §6, and
+   partial evidence toward DOMAIN.md Q14.
+3. **`Tarjeta de débito: ••••7662` is the counterparty's account, not the user's.**
+   It sits in the recipient block with `Nombre` and `Entidad`. Recording it as the
+   user's AccountIdentifier would poison the account signal in DOMAIN.md §6, which
+   treats a known-account contradiction as grounds to block reconciliation.
+4. **`¡Recibimos tu pago!` carries no body date**, so `occurred_at` falls back to
+   `internalDate`. This is exactly the rule DATA_MODEL.md §4.5 already specifies —
+   now validated rather than assumed.
+5. **Amounts are `$1,000.00`** — comma thousands separator, two decimals. Strip the
+   comma, parse to minor units, never through a float.
+6. **These emails carry tracking pixels.** SECURITY.md §7's "never resolve remote
+   references" is not hypothetical: a parser that fetched images would report every
+   re-parse to Nu's ESP.
+
+### The card-spending gap
+
+**Nu does not email card purchases.** Zero in 1,044 messages. They are push
+notifications in the app. The `"compra aprobada"` hits in the mailbox are merchant
+receipts from Mixup/iShop, not Nu.
+
+The `estado de cuenta disponible` emails carry **no PDF** — checked, both are
+`text/html` with no attachment. The statement is behind the app login.
+
+**HSBC contributes nothing.** 36 emails all time: session summaries, security
+alerts, payment reminders, promotions. No transaction notifications.
+
+So Gmail as a Source means **Nu transfers and payments, and nothing else**. The
+MVP table is an honest account-level view of money moving. It is not a record of
+what the user bought.
+
+> **Known mismatch with DOMAIN.md.** Its worked example is
+> `Compra aprobada por $800 MXN en AMZN`. That email does not exist in this
+> mailbox. Merchant normalization (DOMAIN.md Q2) and the AMZN/Amazon aliasing
+> discussion solve a problem the real Evidence does not pose: transfer
+> counterparties are person names and CLABE entities, not merchant descriptors.
+> The domain question is settled first; then DOMAIN.md changes. Not decided here.
+
+Recovering card spending is a **Source** problem, not a parser problem, and
+PRODUCT.md already names bank statements as a first-class Source. Out of M1 scope.
 
 ---
 
