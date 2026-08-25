@@ -2,12 +2,15 @@ package gmail
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -63,12 +66,17 @@ type Message struct {
 }
 
 // ListIDs returns message ids matching a Gmail search query, newest first,
-// following pagination up to limit.
+// following pagination up to limit. A limit of zero or less means every match:
+// a sync wants the whole mailbox, and `peek` wants a screenful.
 func (c *Client) ListIDs(ctx context.Context, query string, limit int) ([]string, error) {
 	var ids []string
 	pageToken := ""
-	for len(ids) < limit {
-		q := url.Values{"q": {query}, "maxResults": {strconv.Itoa(min(500, limit-len(ids)))}}
+	for limit <= 0 || len(ids) < limit {
+		pageSize := 500
+		if limit > 0 {
+			pageSize = min(pageSize, limit-len(ids))
+		}
+		q := url.Values{"q": {query}, "maxResults": {strconv.Itoa(pageSize)}}
 		if pageToken != "" {
 			q.Set("pageToken", pageToken)
 		}
@@ -158,4 +166,63 @@ func (c *Client) get(ctx context.Context, u string, into any) error {
 		return fmt.Errorf("gmail API returned %s", resp.Status)
 	}
 	return json.Unmarshal(body, into)
+}
+
+// GetRaw fetches a message as the full RFC 822 artifact it arrived as.
+//
+// `format=RAW` rather than `format=FULL` because Evidence stores what Billy
+// observed, verbatim (D7): headers, MIME structure, encodings and all. A parsed
+// payload is already an interpretation, and interpretation is a Claim.
+//
+// Nothing here decodes MIME, follows a link, or resolves an image. These emails
+// carry tracking pixels (CONTEXT.md §3.1), so a fetch that resolved remote
+// references would report every sync to Nu's ESP (SECURITY.md §7).
+func (c *Client) GetRaw(ctx context.Context, id string) (*Message, []byte, error) {
+	u := apiBase + "/messages/" + url.PathEscape(id) + "?format=RAW"
+
+	var raw struct {
+		ID           string `json:"id"`
+		ThreadID     string `json:"threadId"`
+		InternalDate string `json:"internalDate"`
+		SizeEstimate int    `json:"sizeEstimate"`
+		Raw          string `json:"raw"`
+	}
+	if err := c.get(ctx, u, &raw); err != nil {
+		return nil, nil, err
+	}
+
+	content, err := decodeRaw(raw.Raw)
+	if err != nil {
+		// The message id is safe to name; the body is not (SECURITY.md §10).
+		return nil, nil, fmt.Errorf("gmail message %s: %w", id, err)
+	}
+	if len(content) > MaxArtifactBytes {
+		return nil, nil, fmt.Errorf("gmail message %s exceeds %d bytes: refusing to record it", id, MaxArtifactBytes)
+	}
+
+	m := &Message{ID: raw.ID, ThreadID: raw.ThreadID, SizeEstimate: raw.SizeEstimate}
+	ms, err := strconv.ParseInt(raw.InternalDate, 10, 64)
+	if err != nil {
+		// Without it there is no trustworthy observed_at, and the Date: header
+		// is not a substitute — it is sender-controlled (SECURITY.md §7, §8).
+		return nil, nil, fmt.Errorf("gmail message %s has no usable internalDate", id)
+	}
+	m.InternalDate = time.UnixMilli(ms).UTC()
+	return m, content, nil
+}
+
+// decodeRaw undoes Gmail's web-safe base64. Padding is accepted either way
+// because the encoding a server sends is not a thing to be strict about.
+func decodeRaw(s string) ([]byte, error) {
+	if s == "" {
+		return nil, errors.New("empty raw payload")
+	}
+	if content, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return content, nil
+	}
+	content, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+	if err != nil {
+		return nil, errors.New("raw payload is not web-safe base64")
+	}
+	return content, nil
 }

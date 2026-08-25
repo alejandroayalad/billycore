@@ -339,6 +339,71 @@ schema BillyCore actually creates. That is a documentation correction for the au
 make, not a licence for the code to drift further.
 **Source.** Author decision, 2026-08-25.
 
+### D25 — `EvidenceIngested` is emitted in M1; `domain_event` is in migration 001
+**Status:** Accepted · 2026-08-25 · Reversibility: cheap
+**Decision.** M1 emits `EvidenceIngested`. Migration 001 creates `domain_event` alongside
+`evidence`. The event is written in the same SQLite transaction as the row that produced
+it, and **only when the insert actually created a row** — a duplicate that hits
+`ON CONFLICT (source_id, source_reference) DO NOTHING` emits nothing. Payload is what
+DOMAIN.md §8 specifies: `evidenceId`, `sourceReference`, and the observed timestamp.
+`GET /v1/events` is not in M1; the events are written and not yet read.
+**Closes.** CONTEXT.md §5 item 5.
+**Why.** DATA_MODEL.md §4.7 requires an event to be persisted in the same transaction as
+its change, and calls a change that commits without its event invisible to every
+consumer. The first ~1,044 Evidence rows are the ones every later Claim and Transaction
+traces back to; leaving them without an event makes the audit anchor start late. The
+alternative costs more the longer it waits, which is the definition of a decision that
+should not be deferred.
+**Rejected — Evidence only, `domain_event` in migration 002.** Genuinely smaller, and it
+keeps M1's scope exactly at "Gmail → Evidence → SQLite". It loses because the two ways to
+recover afterwards are both bad: a backfill stamps `occurred_at` with a time the
+ingestion did not happen — a lie in an append-only log whose whole value is ordering —
+or the first rows keep a permanent hole and DATA_MODEL.md §4.7's rule becomes a rule that
+holds from migration 002 onward, which is not a rule.
+**Consequence.** The repository's insert must report whether a row was created, which
+M1's idempotency requirement already demanded independently. Writing evidence and event
+in one transaction fixes the repository's shape now rather than after there is data.
+DOMAIN.md Q10 — which events v1 needs — stays open for the other five; this entry answers
+it for `EvidenceIngested` only.
+**Source.** Author decision, 2026-08-25. DATA_MODEL.md §4.7, DOMAIN.md §8.
+
+### D26 — Source configuration lives in `~/.billy/sources.json`
+**Status:** Accepted · 2026-08-25 · Reversibility: cheap
+**Decision.** A `sources.json` beside `billy.db` and `credentials.json`, read at startup,
+mapping a Source id to its type and its fetch configuration. For Gmail that is a search
+query:
+
+```json
+{ "sources": [ { "id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx" } ] }
+```
+
+It holds **no credentials** — those stay in `credentials.json` at `0600` (D14), and the
+split is the point: a Source is configuration, a refresh token is a secret, and they have
+different lifetimes and different blast radii. A missing file means no Source is
+configured, which is not a startup failure: `POST /v1/sources/{id}/sync` answers `404`
+for an id it does not know, exactly as API.md §5 specifies.
+**Closes.** CONTEXT.md §5 item 3.
+**Why.** `POST /v1/sources/{id}/sync` promises a `404` for an unconfigured Source, so
+something has to hold the set of configured Sources. A file is the shape this ends up in
+regardless — adding a second mailbox should not require rebuilding the binary — and
+writing it now costs one small parser rather than a migration and a write path later.
+**Rejected — a compile-time registry in the composition root.** Cheaper today, about
+fifteen lines, and it invents no format. It loses because the format gets invented
+anyway the first time the user wants a Source the author did not compile in, and by then
+there is a working system to change rather than an empty one.
+**Rejected — a `source` table and migration 002.** Backs up with the database and is
+queryable, but D13 says there is no Source table in v1, and rows have to get in somehow:
+either another endpoint or hand-written SQL. The most work of the three, for a set that
+has one element.
+**Consequence.** BillyCore reads a second file at startup, and a malformed one is a
+startup error rather than a silent empty set — a typo'd `sources.json` that reported "no
+Sources configured" would surface as a `404` from sync, which is the least informative
+possible way to learn about it. `credentials.json` stays the only `0600` file; the
+backup guidance in D22 is unchanged, because `sources.json` carries nothing secret.
+DATA_MODEL.md and D13 are untouched: this is configuration, not a domain entity, and no
+table is created.
+**Source.** Author decision, 2026-08-25.
+
 ---
 
 ## Template

@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,7 +19,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alejandroayalad/billycore/internal/adapter/api"
+	"github.com/alejandroayalad/billycore/internal/adapter/config"
 	"github.com/alejandroayalad/billycore/internal/adapter/source/gmail"
+	"github.com/alejandroayalad/billycore/internal/adapter/store/sqlite"
+	"github.com/alejandroayalad/billycore/internal/app"
+	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
 // Secrets arrive through the environment, never through flags: a flag value is
@@ -31,6 +35,14 @@ const (
 	clientIDEnv     = "BILLYCORE_GMAIL_CLIENT_ID"
 	clientSecretEnv = "BILLYCORE_GMAIL_CLIENT_SECRET"
 )
+
+// databaseFile is the one file the user backs up. D22 fixes where it lives; D15
+// and D22 both insist the backup gesture stays "copy billy.db" and never "copy
+// ~/.billy", because credentials.json is in that directory.
+const databaseFile = "billy.db"
+
+// shutdownGrace bounds how long a sync in flight may finish in.
+const shutdownGrace = 30 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -68,7 +80,7 @@ func runServe(args []string) error {
 		return err
 	}
 	addr := fs.String("addr", "127.0.0.1:8787", "address to bind; loopback unless you mean otherwise")
-	dir := fs.String("dir", defaultDir, "data directory holding billy.db and credentials.json")
+	dir := fs.String("dir", defaultDir, "data directory holding billy.db, credentials.json, and sources.json")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -88,14 +100,36 @@ func runServe(args []string) error {
 	if err := ensureDataDir(*dir); err != nil {
 		return err
 	}
-	slog.Info("billycore starting", "addr", *addr, "dir", *dir)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", handleHealthz)
+	db, err := sqlite.Open(filepath.Join(*dir, databaseFile))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	sources, err := config.LoadSources(*dir)
+	if err != nil {
+		return err
+	}
+	targets, err := syncTargets(sources, *dir)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		// Not a startup failure: BillyCore serves, and every sync answers 404
+		// until a Source is configured (D26).
+		slog.Warn("no Source is configured: every sync will answer 404",
+			"file", filepath.Join(*dir, config.SourcesFile))
+	}
+
+	evidence := sqlite.NewEvidenceRepository(db)
+	server := api.NewServer(app.NewIngestor(evidence), evidence, targets, db)
+
+	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(targets))
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           mux,
+		Handler:           server.Handler(token),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -114,21 +148,42 @@ func runServe(args []string) error {
 		return err
 	case <-ctx.Done():
 		slog.Info("shutting down")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		// A sync in flight may be most of the way through a mailbox. Give it
+		// room to finish rather than abandoning work that is already fetched.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)
 	}
 }
 
-// handleHealthz reports whether the process can serve requests. Unauthenticated
-// and deliberately outside /v1 (API.md §11). It will need a database check the
-// moment there is a database to check.
-func handleHealthz(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"status":      "ok",
-		"api_version": "v1",
-	})
+// syncTargets turns configuration into something the API can sync.
+//
+// The fetcher is a function rather than a value because building it is where an
+// access token gets refreshed: a client built once at startup would stop working
+// an hour into the daemon's life (D26).
+func syncTargets(sources []config.Source, dir string) (map[string]api.SyncTarget, error) {
+	targets := make(map[string]api.SyncTarget, len(sources))
+	for _, source := range sources {
+		switch source.Type {
+		case domain.SourceGmail:
+			query := source.Query
+			targets[source.ID] = api.SyncTarget{
+				Source: app.Source{ID: source.ID, Type: source.Type},
+				Fetcher: func(ctx context.Context) (app.SourceFetcher, error) {
+					client, err := gmail.NewClient(ctx, dir)
+					if err != nil {
+						return nil, err
+					}
+					return gmail.NewFetcher(client, query), nil
+				},
+			}
+		default:
+			// Configuration that names a Source kind BillyCore cannot fetch is
+			// a startup error, not a 404 discovered later.
+			return nil, fmt.Errorf("source %q is of type %s, which has no fetcher yet", source.ID, source.Type)
+		}
+	}
+	return targets, nil
 }
 
 // defaultDataDir is ~/.billy — one predictable location the user can name, back

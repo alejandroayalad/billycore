@@ -1,0 +1,93 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/alejandroayalad/billycore/internal/domain"
+)
+
+func writeSources(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, SourcesFile), []byte(content), 0o600); err != nil {
+		t.Fatalf("write %s: %v", SourcesFile, err)
+	}
+	return dir
+}
+
+func TestLoadSources(t *testing.T) {
+	dir := writeSources(t, `{
+	  "sources": [
+	    { "id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx" }
+	  ]
+	}`)
+
+	sources, err := LoadSources(dir)
+	if err != nil {
+		t.Fatalf("LoadSources: %v", err)
+	}
+	if len(sources) != 1 {
+		t.Fatalf("loaded %d sources, want 1", len(sources))
+	}
+	want := Source{ID: "gmail_primary", Type: domain.SourceGmail, Query: "from:nu@nu.com.mx"}
+	if sources[0] != want {
+		t.Errorf("source = %+v, want %+v", sources[0], want)
+	}
+}
+
+// No file means no Source configured, which sync reports as a 404. It is not a
+// reason to refuse to start.
+func TestLoadSourcesAcceptsAMissingFile(t *testing.T) {
+	sources, err := LoadSources(t.TempDir())
+	if err != nil {
+		t.Fatalf("LoadSources: %v", err)
+	}
+	if len(sources) != 0 {
+		t.Errorf("loaded %d sources from an empty directory", len(sources))
+	}
+}
+
+func TestLoadSourcesRejectsBadConfiguration(t *testing.T) {
+	cases := map[string]struct {
+		content string
+		says    string
+	}{
+		"malformed JSON": {
+			content: `{"sources": [`,
+			says:    "not valid JSON",
+		},
+		"no id": {
+			content: `{"sources": [{"type": "GMAIL", "query": "from:nu@nu.com.mx"}]}`,
+			says:    "no id",
+		},
+		"duplicate id": {
+			content: `{"sources": [
+			  {"id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx"},
+			  {"id": "gmail_primary", "type": "GMAIL", "query": "from:hsbc@hsbc.com.mx"}
+			]}`,
+			says: "twice",
+		},
+		"unknown type": {
+			content: `{"sources": [{"id": "whatsapp", "type": "WHATSAPP", "query": "x"}]}`,
+			says:    "not a known kind of Source",
+		},
+		"gmail without a query": {
+			content: `{"sources": [{"id": "gmail_primary", "type": "GMAIL"}]}`,
+			says:    "no query",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := LoadSources(writeSources(t, tc.content))
+			if err == nil {
+				t.Fatal("LoadSources accepted a configuration it cannot act on")
+			}
+			if !strings.Contains(err.Error(), tc.says) {
+				t.Errorf("error does not explain the problem: %v", err)
+			}
+		})
+	}
+}
