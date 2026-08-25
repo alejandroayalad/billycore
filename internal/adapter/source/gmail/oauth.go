@@ -1,6 +1,7 @@
 package gmail
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -34,7 +36,14 @@ const (
 // without a human granting consent in a browser. This is why it lives behind a
 // `billycore auth` subcommand rather than inside the daemon — SECURITY.md §6
 // refuses to turn BillyCore into a binary you babysit through every restart.
-func Authorize(ctx context.Context, clientID, clientSecret string) (*GmailCredentials, error) {
+//
+// When manual is true the callback listener is still started, but the code may
+// instead be pasted on stdin. Google requires a loopback redirect for installed
+// apps, and 127.0.0.1 resolves to whichever machine the *browser* runs on — so
+// when the browser is on a different machine than BillyCore, the redirect lands
+// nowhere. The code is still in the failed page's address bar, and that is
+// enough to finish the exchange.
+func Authorize(ctx context.Context, clientID, clientSecret string, manual bool) (*GmailCredentials, error) {
 	// Port 0: the OS picks a free port. Google permits any port on a loopback
 	// redirect for Desktop clients, so nothing has to be pre-registered.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -111,7 +120,23 @@ func Authorize(ctx context.Context, clientID, clientSecret string) (*GmailCreden
 	fmt.Println()
 	fmt.Println("  " + authURL)
 	fmt.Println()
-	openBrowser(authURL)
+	if manual {
+		fmt.Println("The browser will fail to load 127.0.0.1 if it is on another machine.")
+		fmt.Println("That is expected. Copy the URL from the address bar and paste it here.")
+		fmt.Println()
+		fmt.Print("callback URL (or just the code): ")
+		go func() {
+			line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+			if err != nil {
+				resCh <- result{err: fmt.Errorf("reading pasted callback: %w", err)}
+				return
+			}
+			code, err := codeFromPaste(strings.TrimSpace(line), state)
+			resCh <- result{code: code, err: err}
+		}()
+	} else {
+		openBrowser(authURL)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -122,6 +147,38 @@ func Authorize(ctx context.Context, clientID, clientSecret string) (*GmailCreden
 		}
 		return exchange(ctx, clientID, clientSecret, res.code, verifier, redirectURI)
 	}
+}
+
+// codeFromPaste accepts either the whole failed callback URL or a bare code.
+//
+// The state check is not skipped just because a human did the transport: it is
+// what ties the response to the request this process made, and pasting the
+// wrong tab's URL is exactly the mistake it catches.
+func codeFromPaste(in, state string) (string, error) {
+	if in == "" {
+		return "", fmt.Errorf("nothing pasted")
+	}
+	if !strings.Contains(in, "?") && !strings.Contains(in, "=") {
+		return in, nil // a bare code; nothing to verify against
+	}
+	if i := strings.Index(in, "?"); i >= 0 {
+		in = in[i+1:]
+	}
+	q, err := url.ParseQuery(in)
+	if err != nil {
+		return "", fmt.Errorf("that does not parse as a callback URL: %w", err)
+	}
+	if e := q.Get("error"); e != "" {
+		return "", fmt.Errorf("authorization denied: %s", e)
+	}
+	if got := q.Get("state"); got != "" && got != state {
+		return "", fmt.Errorf("state mismatch: that URL belongs to a different authorization attempt")
+	}
+	code := q.Get("code")
+	if code == "" {
+		return "", fmt.Errorf("no code found in the pasted URL")
+	}
+	return code, nil
 }
 
 // tokenResponse is Google's token endpoint payload. Only the fields BillyCore

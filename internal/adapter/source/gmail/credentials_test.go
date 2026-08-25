@@ -127,3 +127,28 @@ func TestPKCEChallengeIsDerivedFromTheVerifier(t *testing.T) {
 		t.Fatal("challenge equals verifier; it must be the S256 hash")
 	}
 }
+
+func TestCodeFromPaste(t *testing.T) {
+	const state = "STATE123"
+	full := "http://127.0.0.1:55764/callback?state=" + state + "&code=4%2F0AVGzR1D&scope=gmail.readonly"
+
+	if got, err := codeFromPaste(full, state); err != nil || got != "4/0AVGzR1D" {
+		t.Errorf("full URL: got %q, %v; want the decoded code", got, err)
+	}
+	if got, err := codeFromPaste("4/0AVGzR1D", state); err != nil || got != "4/0AVGzR1D" {
+		t.Errorf("bare code: got %q, %v", got, err)
+	}
+	// The state check is the point: a URL from another attempt must not pass.
+	if _, err := codeFromPaste("http://127.0.0.1:1/callback?state=OTHER&code=x", state); err == nil {
+		t.Error("a callback URL from a different authorization attempt was accepted")
+	}
+	if _, err := codeFromPaste("http://127.0.0.1:1/callback?error=access_denied", state); err == nil {
+		t.Error("a denial was treated as success")
+	}
+	if _, err := codeFromPaste("http://127.0.0.1:1/callback?state="+state, state); err == nil {
+		t.Error("a URL with no code was accepted")
+	}
+	if _, err := codeFromPaste("", state); err == nil {
+		t.Error("empty paste was accepted")
+	}
+}

@@ -50,10 +50,12 @@ func run() error {
 		switch cmd {
 		case "auth":
 			return runAuth(args)
+		case "peek":
+			return runPeek(args)
 		case "serve":
 			return runServe(args)
 		default:
-			return fmt.Errorf("unknown command %q (commands: serve, auth)", cmd)
+			return fmt.Errorf("unknown command %q (commands: serve, auth, peek)", cmd)
 		}
 	}
 	return runServe(os.Args[1:])
@@ -182,6 +184,7 @@ func runAuth(args []string) error {
 		return err
 	}
 	dir := fs.String("dir", defaultDir, "data directory holding billy.db and credentials.json")
+	manual := fs.Bool("manual", false, "paste the callback URL instead of listening for it; use when the browser is on another machine")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -209,7 +212,7 @@ func runAuth(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	g, err := gmail.Authorize(ctx, clientID, clientSecret)
+	g, err := gmail.Authorize(ctx, clientID, clientSecret, *manual)
 	if err != nil {
 		return err
 	}
@@ -220,4 +223,61 @@ func runAuth(args []string) error {
 	// The token itself is never printed. SECURITY.md §10.
 	slog.Info("gmail authorized", "scope", gmail.ScopeReadonly, "credentials", filepath.Join(*dir, gmail.CredentialsFile))
 	return nil
+}
+
+// runPeek lists messages from a Source without recording anything.
+//
+// A diagnostic, not a pipeline stage: it opens no database and creates no
+// Evidence. It exists because CONTEXT.md §3 step 5 — look at real bank email
+// before designing a parser — is the step the whole milestone is for.
+//
+// The query is a flag rather than configuration, because where Source
+// configuration belongs is still open (CONTEXT.md §5 item 3) and D21 forbids
+// answering that in passing.
+func runPeek(args []string) error {
+	fs := flag.NewFlagSet("peek", flag.ExitOnError)
+	defaultDir, err := defaultDataDir()
+	if err != nil {
+		return err
+	}
+	dir := fs.String("dir", defaultDir, "data directory holding billy.db and credentials.json")
+	query := fs.String("query", "from:nu@nu.com.mx", "Gmail search query")
+	limit := fs.Int("limit", 25, "maximum messages to list")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	client, err := gmail.NewClient(ctx, *dir)
+	if err != nil {
+		return err
+	}
+	ids, err := client.ListIDs(ctx, *query, *limit)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%d message(s) matching %q\n\n", len(ids), *query)
+
+	for _, id := range ids {
+		m, err := client.GetMetadata(ctx, id)
+		if err != nil {
+			// One bad message must not stop the listing (SECURITY.md §7).
+			fmt.Printf("%-18s  ERROR: %v\n", id, err)
+			continue
+		}
+		fmt.Printf("%-18s  %s  %7d  %s\n",
+			m.ID, m.InternalDate.Format("2006-01-02 15:04"), m.SizeEstimate, truncate(m.Subject, 60))
+	}
+	return nil
+}
+
+// truncate keeps the listing one line per message on a normal terminal.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }
