@@ -10,35 +10,55 @@ Read this first, then [docs/PRODUCT.md](../docs/PRODUCT.md).
 
 ---
 
-## 1. State: a skeleton exists, the pipeline does not
+## 1. State: M1 is done — real Evidence, from the real mailbox
 
-There is a `go.mod`, a binary that runs, and roughly 180 lines of Go. There is still
-**no commit**.
+The pipeline exists as far as Evidence, and stops there deliberately.
 
-What runs today: `billycore` starts, creates `~/.billy` at `0700`, refuses to start
-without a bearer token, warns when bound off-loopback, serves `GET /healthz`, and shuts
-down on a signal. Alongside it, `Money` and `Currency` exist as pure domain values, and
-the import-graph assertion that enforces D6 is written and passing.
+On **2026-08-25** `POST /v1/sources/gmail_primary/sync` ran twice against the live
+mailbox:
 
-What does not exist: no database, no migration, no Gmail, no Evidence, no Claim, no
-Transaction, no `/v1` route of any kind. **The entire pipeline described in `docs/` is
-unwritten.** The ratio of design prose to code is roughly 600:1.
+| Run | Discovered | Created | Skipped | Wall clock |
+|---|---|---|---|---|
+| First | 1,044 | 1,044 | 0 | 3m 36s |
+| Second | 1,044 | 0 | 1,044 | **1.1s** |
 
-Everything in `docs/` is **unvalidated design**. It has never been run against a real
-email. Treat it as a well-reasoned hypothesis, not as a description of working software.
+The second line is the milestone. Ingestion is idempotent on the Gmail message id, and
+it is idempotent because `UNIQUE (source_id, source_reference)` says so — not because
+the code remembered to check. `~/.billy/billy.db` now holds **1,044 Evidence rows and
+1,044 `EvidenceIngested` events**: 51 MB of verbatim RFC 822 reaching back to
+2023-08-23, every row at stage `RECEIVED`, every row with its content.
+
+What runs today: `billycore auth`, `billycore peek`, and `billycore serve` — `GET
+/healthz`, `POST /v1/sources/{id}/sync`, and `GET /v1/evidence/{id}`, the last two behind
+a bearer token compared in constant time.
+
+What does not exist: **no Claim, no parser, no Transaction**, no reconciliation, no AI,
+no HSBC, and no way to see any of this that is not `curl | jq`. Nothing in that mailbox
+has been *interpreted*. Evidence is bytes Billy is certain it received; it is not yet a
+single financial fact, and the success criterion in §2 is about facts.
+
+`docs/` is no longer entirely unvalidated — the ingestion half has met real email, and
+§3.1 records where the design was already wrong about it. Everything from Claims onward
+remains a well-reasoned hypothesis that has never run.
 
 ### Code
 
 | Path | Lines | State |
 |---|---|---|
-| `go.mod` | — | Go 1.26.2, **zero dependencies** |
-| `cmd/billycore/main.go` | ~140 | Serves `/healthz`; data dir, token, and bind-address checks |
-| `internal/domain/money.go` | 58 | Integer minor units; rejects negatives and mixed-currency addition |
-| `internal/domain/currency.go` | 25 | Shape validation only — no minor-unit exponent (API.md Q8) |
-| `internal/domain/boundary_test.go` | 45 | The D6 import-graph assertion |
-| `internal/domain/money_test.go` | 54 | Passing |
-| `Makefile` | — | `make check` = fmt + vet + test |
-| `.gitignore` | — | `billy.db*`, `credentials.json`, build output |
+| `go.mod` | — | Go 1.26.2, one direct dependency: `modernc.org/sqlite` (D5) |
+| `cmd/billycore/main.go` | 338 | `serve`, `auth`, `peek`; data dir, token, bind-address checks |
+| `internal/domain/` | 259 | `Money`, `Currency`, `Evidence`, and the D6 import-graph assertion |
+| `internal/app/ports.go` | 74 | `EvidenceRepository`, `SourceFetcher`, `Artifact` |
+| `internal/app/ingest.go` | 132 | Fetch → Evidence → stop. No clock, no randomness, no I/O of its own |
+| `internal/adapter/store/sqlite/` | 451 | Open, pragmas, migrations, Evidence repository |
+| `internal/adapter/source/gmail/` | 282 + OAuth | `ListIDs`, `GetMetadata`, `GetRaw`, `Fetcher` |
+| `internal/adapter/api/` | 377 | Error envelope, bearer auth, the two `/v1` routes |
+| `internal/adapter/config/sources.go` | 92 | `sources.json` (D26) |
+| `internal/id/uuid.go` | 38 | UUID v4 from `crypto/rand`; outside the domain because randomness is I/O |
+| **Total** | **≈2,410 code · 1,878 test** | `make check` green, and green under `-race` |
+
+The ratio of design prose to code is no longer 600:1. It is roughly 2:1, which is the
+first time this table has been worth reading.
 
 ### Documents
 
@@ -46,12 +66,12 @@ email. Treat it as a well-reasoned hypothesis, not as a description of working s
 |---|---|
 | `docs/PRODUCT.md` | Written |
 | `docs/ARCHITECTURE.md` | Written |
-| `docs/DOMAIN.md` | Written |
-| `docs/DATA_MODEL.md` | Written |
-| `docs/API.md` | Written |
+| `docs/DOMAIN.md` | Written · worked example does not match the mailbox (§3.1) |
+| `docs/DATA_MODEL.md` | Written · §4.1 is one column behind the schema (D24) |
+| `docs/API.md` | Written · §5 and §6 now have running implementations |
 | `docs/SECURITY.md` | Written |
 | `docs/ROADMAP.md` | **Empty** |
-| `ai/CONTEXT.md`, `ai/DECISIONS.md` | Written |
+| `ai/CONTEXT.md`, `ai/DECISIONS.md` | Written · D1–D26 |
 | `ai/CONVENTIONS.md`, `ai/CONSTRAINTS.md`, `ai/WORKFLOW.md`, `ai/GLOSSARY.md` | **Empty** |
 | BillySat, BillyAgent | Docs-only scaffolds, no code. Do not start them. |
 
@@ -82,26 +102,32 @@ The success criterion has not moved (PRODUCT.md):
 
 ## 3. Next step
 
-**Gmail OAuth flow.** Get real email into the system.
+**Read the 1,044 emails Billy now holds, and turn four templates into Claims.**
 
-This is the right first move, and the reason is §1: no part of this design has met real
-data. The two banks that matter are **Nubank** and **HSBC**, and until their actual
-emails are in hand, every parser decision is speculation.
-
-Rough shape of the first vertical slice, in order:
+The first vertical slice, in order — M1 is closed:
 
 1. ~~`go mod init`, one binary that starts and serves `/healthz`~~ — **done**
-2. SQLite open, embedded migration, `evidence` table only
-3. Gmail OAuth — read-only scopes (SECURITY.md §5), token to `credentials.json` at `0600`
-4. Fetch → persist Evidence at stage `RECEIVED`, stop there
-5. **Look at real Nubank and HSBC emails.** Then design the parser.
+2. ~~SQLite open, embedded migration, `evidence` table~~ — **done**, migration 001
+3. ~~Gmail OAuth — read-only scopes, token to `credentials.json` at `0600`~~ — **done**
+4. ~~Fetch → persist Evidence at stage `RECEIVED`, stop there~~ — **done**, 1,044 rows
+5. ~~Look at real Nubank and HSBC emails~~ — **done**, and §3.1 is what they said
 
-Steps 2–4 are milestone **M1**, scoped to Gmail → Evidence only: no Claims, no
-transaction extraction, no reconciliation, no AI, no HSBC. Nu (`nu@nu.com.mx`) is the
-only sender in scope, the Gmail message id is the source artifact key, and sync must be
-idempotent.
+M1 was Gmail → Evidence → SQLite, idempotent on the Gmail message id: no Claims, no
+transaction extraction, no reconciliation, no AI, no HSBC. All of it now exists, runs
+against the live mailbox, and is provably idempotent without a network.
 
-Step 5 is where the design meets reality and where `docs/` starts getting corrected.
+**M2 is where the design stops being about plumbing.** The 800 transaction-bearing
+messages in §3.1 are four templates with three date formats, and the parser work is the
+first thing in this project that BillyCore could get *quietly wrong* — a mis-parsed
+amount is worse than a missing one, because it looks like an answer. The open order:
+
+1. Per-template parsers for the four Nu templates, `internal/adapter/parser` (D11, D16)
+2. Claims with field-level confidence, and `claim_fields` in migration 002
+3. Transactions, and the `EXTRACTED` stage that produces them
+4. `GET /v1/transactions` — and then §8.1, which is still the largest hole in the MVP
+
+The clock in §2 has not moved and neither has the criterion: a table of last month's
+transactions. That is **38 transactions**, not 1,044 artifacts.
 
 ---
 
@@ -238,34 +264,36 @@ implementation is exactly what these documents exist to prevent.
 
 ### Found while scoping M1 — 2026-08-24
 
-Five open items that reading the documents together surfaced. None is answered here.
-They are recorded so M1 does not close one by accident; each needs an author decision
-and a `DECISIONS.md` entry.
+Five open items that reading the documents together surfaced. **Four are now closed** —
+D23, D24, D25, D26 — each by an author decision taken before the code that depended on
+it, which is the protocol working rather than a formality observed. Item 4 was answered
+by the `billycore auth` subcommand without a decision entry, because nothing was
+genuinely in question once it was written.
 
-1. **`source_artifact_key` vs `source_reference` — three names for one concept.**
-   ARCHITECTURE.md §5 and the API wire field say `source_artifact_key`;
-   DATA_MODEL.md §4.1's column is `source_reference`, where it *also* carries a second
-   meaning — "the preserved reference when `raw_content` is `NULL`". For Gmail both are
-   the message id, so M1 will not notice. The domain constructor has to name one, and
-   whichever it names becomes canonical by default.
-2. **`content_type` is on the wire and not in the schema.** API.md §4 and §6 carry
-   `content_type` and `content_bytes` on Evidence; the `evidence` table has neither
-   column. `content_bytes` is derivable; `content_type` is not. `GET /v1/evidence/{id}`
-   cannot match the documented shape without a schema change or a contract change.
-3. **Where does Source *configuration* live?** `POST /v1/sources/{id}/sync` returns
-   `404` for an unconfigured Source, but D13 says there is no Source table and D14
-   scoped `credentials.json` to credentials only. Nothing says where "`gmail_primary`
-   means this account, filtered to `from:nu@nu.com.mx`" is written down. M1 needs it.
-4. **The OAuth grant is interactive; the daemon is not.** SECURITY.md §6 argues against
-   anything that turns BillyCore into a binary you babysit through every restart. The
-   first grant needs a browser and a loopback callback, and `main.go` has no subcommand
-   structure. A `billycore auth` subcommand is the obvious shape and no document
-   describes one.
-5. **Is `EvidenceIngested` emitted in M1?** DATA_MODEL.md §4.7 requires an event to be
-   written in the same transaction as the change producing it; DOMAIN.md Q10 asks which
-   events v1 actually needs. Skipping it leaves the first Evidence rows permanently
-   without an event. Including it pulls `domain_event` into migration 001. This one gets
-   more expensive the longer it waits.
+1. ~~**`source_artifact_key` vs `source_reference` — three names for one concept.**~~
+   **Closed by D23**: `source_reference` is canonical in code and schema, and
+   `source_artifact_key` stays the wire spelling. The mapping now exists in exactly one
+   file — `internal/adapter/api/api.go` — and nowhere else.
+2. ~~**`content_type` is on the wire and not in the schema.**~~ **Closed by D24**:
+   `content_type TEXT` is in migration 001 and carries `message/rfc822` for all 1,044
+   rows; `content_bytes` stays derived from `length(raw_content)`. DATA_MODEL.md §4.1 is
+   therefore one column behind the schema BillyCore creates — the author's correction to
+   make, not a licence for the code to drift further.
+3. ~~**Where does Source *configuration* live?**~~ **Closed by D26**:
+   `~/.billy/sources.json`, beside the database and the credentials, holding no secret
+   of its own. A missing file means no Source is configured and every sync answers
+   `404`; a malformed one is a startup error, because a typo that silently produced an
+   empty set would surface as that same `404`.
+4. ~~**The OAuth grant is interactive; the daemon is not.**~~ **Settled in code**, with
+   no decision entry: `billycore auth` performs the one interactive grant, `serve` never
+   asks for a browser, and the access token is refreshed per sync rather than at startup
+   — a client built once would stop working an hour into the daemon's life. No document
+   describes the subcommand yet.
+5. ~~**Is `EvidenceIngested` emitted in M1?**~~ **Closed by D25**: yes, and
+   `domain_event` is in migration 001. The event is written in the same transaction as
+   the row and only when a row was created, so a re-sync emits nothing. All 1,044
+   Evidence rows have one. DOMAIN.md Q10 — which events v1 needs — stays open for the
+   other five.
 
 ---
 
@@ -322,15 +350,16 @@ real parsers, real transactions in a table — not more design.
    demonstrable without it.
 2. **What gets cut?** Nothing is currently on the cut list. Against ~78 hours, that is
    the largest risk in the project, larger than any technical unknown here.
-3. **Repository layout — and the repository root is wrong.** `billycore`, `billysat`,
-   and `billyagent` sit inside one git repository whose root is **`/Users/alexayala`,
-   the home directory**, with no `.gitignore` at that root and zero commits. `~/.ssh/`,
-   `~/.env`, and `~/.claude.json` are therefore untracked files inside a live repo, and
-   `billycore/.gitignore` protects nothing above `billycore/`. Nothing has leaked —
-   there are no commits — but the first `git add -A` from the wrong directory would.
-   **Fix this before M1 step 3 writes a real refresh token to disk**, not before the
-   first commit. Separately, for an open-source release these are probably three repos;
-   that part is cheap now and annoying later.
+3. **Repository layout — the root is fixed; one repo or three is not.**
+   `billycore` is now its own git repository with its own remote
+   (`github.com/alejandroayalad/billycore`) and its own `.gitignore`, which closes the
+   dangerous half of this item: the repository root was the home directory, with
+   `~/.ssh/`, `~/.env`, and `~/.claude.json` sitting untracked inside a live repo, and
+   `billycore/.gitignore` protecting nothing above itself. Nothing leaked — there were
+   no commits — and M1 wrote a real refresh token to disk only after the split.
+   Still open: whether `billycore`, `billysat`, and `billyagent` are one repository or
+   three for an open-source release. Cheap now, annoying later.
+
 4. **Licence.** Undecided. Required before the repository goes public.
 5. **Contribution model.** Open source with outside contributors implies issues, a
    README, and a CONTRIBUTING file. None exist. Not needed before 2026-09-22.
