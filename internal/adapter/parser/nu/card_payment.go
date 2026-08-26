@@ -35,7 +35,7 @@ import (
 func parseCardPayment(text string) (parser.Extraction, error) {
 	product, found := between(text, "el pago que hiciste a tu ", " por")
 	if !found {
-		return parser.Extraction{}, fmt.Errorf("nu: %s: template changed — no payment sentence", TemplateCardPayment)
+		return parser.Extraction{}, fmt.Errorf("nu: %s: %s — no payment sentence", TemplateCardPayment, templateChanged)
 	}
 
 	// The amount is the first bare `$` line after the sentence that introduces
@@ -45,7 +45,7 @@ func parseCardPayment(text string) (parser.Extraction, error) {
 	// those on some artifacts.
 	raw, found := amountAfter(text, "el pago que hiciste a tu ")
 	if !found {
-		return parser.Extraction{}, fmt.Errorf("nu: %s: template changed — no amount below the payment sentence", TemplateCardPayment)
+		return parser.Extraction{}, fmt.Errorf("nu: %s: %s — no amount below the payment sentence", TemplateCardPayment, templateChanged)
 	}
 	money, err := parser.ParseMoney(raw, Currency)
 	if err != nil {

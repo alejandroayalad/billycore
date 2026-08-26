@@ -33,7 +33,7 @@ func parseServicePayment(text string) (parser.Extraction, error) {
 	// is nothing but a timestamp is unambiguous on its own.
 	wall, found := firstTimestampLine(text)
 	if !found {
-		return parser.Extraction{}, fmt.Errorf("nu: %s: template changed — no timestamp line", TemplateServicePayment)
+		return parser.Extraction{}, fmt.Errorf("nu: %s: %s — no timestamp line", TemplateServicePayment, templateChanged)
 	}
 
 	// `Costo extra:` is deliberately not read. It is a fee, and a fee is a

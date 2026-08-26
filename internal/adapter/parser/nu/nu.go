@@ -205,6 +205,14 @@ func occurredAt(text string) (time.Time, error) {
 	return wall.WithClock(h, m, s).In(zone).UTC(), nil
 }
 
+// templateChanged is the phrase every drift error carries.
+//
+// A constant rather than four copies of a string literal, because the failure
+// classifier matches on it to tell "Nu changed the template" apart from "this
+// artifact is malformed" — and a classifier keyed to a phrase one of the four
+// call sites reworded would silently stop recognising the case it exists for.
+const templateChanged = "template changed"
+
 // missing names the fields a recognised template failed to produce. A template
 // that stops carrying a field it always carried is drift worth surfacing, not
 // an empty column to be shrugged at.
@@ -219,7 +227,7 @@ func missing(template parser.Template, fields map[string]string) error {
 		return nil
 	}
 	sortStrings(absent)
-	return fmt.Errorf("nu: %s: template changed — no %s", template, strings.Join(absent, ", "))
+	return fmt.Errorf("nu: %s: %s — no %s", template, templateChanged, strings.Join(absent, ", "))
 }
 
 func sortStrings(s []string) {
