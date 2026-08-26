@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/alejandroayalad/billycore/internal/adapter/parser"
+	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
 // parseCardPayment reads `¡Recibimos tu pago!` — a payment landing on the
@@ -14,20 +15,23 @@ import (
 // alone on its own line under "Recibimos el pago que hiciste a tu <product>
 // por:", and there is no date anywhere in the body.
 //
-// # Two things this parser deliberately does not do
+// # What this parser deliberately does not do
 //
 // It does not supply a date. DATA_MODEL.md §4.5 already specifies the fallback
 // to the Source's delivery timestamp, and applying it here would mean this
 // layer inventing a timestamp the artifact does not contain. OccurredAt stays
 // zero and the caller applies the rule.
 //
-// It does not set a Direction, and that is an open question rather than an
-// oversight. This message is the user paying their own credit card: money
-// leaves one account they own and lands on another. Whether that is an OUTFLOW,
-// an INFLOW, both, or a transfer that should net to neither depends on which
-// Account the Transaction is attributed to — which DOMAIN.md does not settle,
-// and D21 says to stop at rather than pick. Direction is therefore absent, not
-// guessed, and the 90 artifacts extract cleanly in every other respect.
+// The direction is OUTFLOW (D31): this is a debit paying down what the user
+// owes on the card, so money left an account they hold. It is stated from the
+// paying side, which is the only side this artifact describes — nothing here
+// names the account the money came from.
+//
+// The same event seen from the card's side is a credit, and when the card
+// statement arrives as a second Source it will say so. Collapsing the two into
+// one movement is reconciliation's problem (DOMAIN.md §6), and D31 records why
+// it is a sharp one: amount and time will match while direction contradicts,
+// which is the shape §6 treats as grounds to block a match.
 func parseCardPayment(text string) (parser.Extraction, error) {
 	product, found := between(text, "el pago que hiciste a tu ", " por")
 	if !found {
@@ -53,6 +57,7 @@ func parseCardPayment(text string) (parser.Extraction, error) {
 
 	return parser.Extraction{
 		Template:     TemplateCardPayment,
+		Direction:    domain.Outflow,
 		Amount:       money,
 		Counterparty: product,
 	}, nil

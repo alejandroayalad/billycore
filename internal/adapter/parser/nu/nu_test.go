@@ -67,10 +67,11 @@ func TestParseTemplates(t *testing.T) {
 			fixture: "card_payment.html",
 			subject: "¡Recibimos tu pago!",
 			want: parser.Extraction{
-				Template: nu.TemplateCardPayment,
-				Amount:   mxn(t, 112025),
-				// No Direction and no OccurredAt, both deliberately: see
-				// card_payment.go.
+				Template:  nu.TemplateCardPayment,
+				Direction: domain.Outflow, // D31 — a debit paying down the card
+				Amount:    mxn(t, 112025),
+				// No OccurredAt: the body carries no timestamp, and the
+				// DATA_MODEL.md §4.5 fallback is the caller's to apply.
 				Counterparty: "Tarjeta Garantizada Nu",
 			},
 		},

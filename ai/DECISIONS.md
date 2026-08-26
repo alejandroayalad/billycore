@@ -524,6 +524,57 @@ field Billy will assert with no support in the artifact, which is a different th
 when Claims grow field-level confidence.
 **Source.** Author decision, 2026-08-25.
 
+### D31 — `¡Recibimos tu pago!` is an OUTFLOW
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** The card payment receipt records money **leaving** the user: it is a
+payment against the balance owed on their Nu credit card. `parseCardPayment` sets
+`Direction: OUTFLOW` for all 90 artifacts.
+**Closes.** The question left open by the card payment parser on 2026-08-25, which
+extracted those 90 artifacts with no direction rather than guessing (D21).
+**Why.** The author's account of what the message means: a debit paying down card debt.
+Money left an account they hold and reduced what they owe.
+**Consequence — the direction is stated from the paying account's point of view.** The
+same event seen from the card's side is a credit. Nothing in this artifact names the
+account the money came *from*, so the Transaction this produces describes the payment,
+not the card's balance.
+**Consequence — this is the first real double-count risk, and it lands in
+reconciliation.** When the card statement arrives as a second Source (D27), the same
+payment appears there as a credit on the card. Two artifacts, one movement of money,
+opposite signs. DOMAIN.md §6 has to collapse them rather than record an OUTFLOW and an
+INFLOW that cancel — and the amount/time signals will match while the direction signal
+contradicts, which is exactly the shape §6 treats as grounds to *block* a match. This is
+a known problem to be solved there, not here.
+**Consequence — a card payment is still dateless.** `OccurredAt` stays zero: the body
+carries no timestamp, and DATA_MODEL.md §4.5's fallback to the Source's delivery
+timestamp remains the caller's to apply. D31 answers direction and nothing else.
+**Source.** Author decision, 2026-08-26.
+
+### D32 — The result is seen two ways: a terminal table and a plain web page
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** BillyCore ships **both** surfaces, and both read the same
+`GET /v1/transactions`:
+1. **`billycore tx`** — a table in the terminal, from the same binary as `serve` (D4).
+2. **A single plain HTML page** — one file, no framework, no build step, no client
+   state, rendering the same rows as a table.
+**Closes.** CONTEXT.md §8.1 — *how is the result actually seen?* — which was on the
+critical path, because the success criterion is a table and none of the candidates had
+been chosen.
+**Why.** The criterion in PRODUCT.md is *"I can see my last month of transactions, well
+classified, in a good table with good financial information."* `curl | jq` does not
+satisfy the word *table*, and the author wants both a terminal view and a browser one.
+**Consequence — the API is the contract, not the renderer.** Both surfaces are thin: a
+change to what a Transaction means changes `GET /v1/transactions`, and the two views
+follow. Neither may compute a financial fact of its own.
+**Consequence — this stays a page, not a UI.** PRODUCT.md is explicit that a UI is not
+Core's job; that is BillySat. The line held here is that the page has no framework, no
+build step, no client-side state and no route but its own. The moment it wants a second
+screen, it has stopped being this and is BillySat's problem.
+**Open — does Core serve the page, or is it a file the user opens?** Serving it from the
+binary is the only version that works without a second server, and D18's single bearer
+token then has to reach a browser, which is friction a `curl` call does not have.
+Not decided here. It is the part of this decision most worth arguing with.
+**Source.** Author decision, 2026-08-26.
+
 ---
 
 ## Template

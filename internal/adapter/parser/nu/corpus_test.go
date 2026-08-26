@@ -64,14 +64,12 @@ func TestCorpus(t *testing.T) {
 			t.Errorf("%s (%s): amount currency is %q", ref, got.Template, got.Amount.Currency())
 		}
 
-		// Direction, where the template settles it, is a valid domain value.
-		if got.Direction != "" {
-			if err := got.Direction.Validate(); err != nil {
-				t.Errorf("%s (%s): %v", ref, got.Template, err)
-			}
+		// Every template settles a direction, the card payment included
+		// since D31. There is no longer a case where one is absent.
+		if err := got.Direction.Validate(); err != nil {
+			t.Errorf("%s (%s): %v", ref, got.Template, err)
+		} else {
 			withDirection++
-		} else if got.Template != nu.TemplateCardPayment {
-			t.Errorf("%s (%s): no direction, and only the card payment template may omit one", ref, got.Template)
 		}
 
 		// A counterparty is never blank on a template that carries one.
@@ -116,7 +114,7 @@ func TestCorpus(t *testing.T) {
 	assertCount(t, "NU_CARD_PAYMENT", perTemplate[nu.TemplateCardPayment], 90)
 	assertCount(t, "NU_SERVICE_PAYMENT", perTemplate[nu.TemplateServicePayment], 11)
 	assertCount(t, "with a body timestamp", withDate, 710)
-	assertCount(t, "with a direction", withDirection, 710)
+	assertCount(t, "with a direction", withDirection, 800)
 }
 
 // reportDrift compares each parsed timestamp against Gmail's own delivery
