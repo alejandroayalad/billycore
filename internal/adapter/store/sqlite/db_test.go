@@ -42,8 +42,8 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if userVersion != 2 {
-		t.Errorf("user_version = %d, want 2 after migration 002", userVersion)
+	if userVersion != 3 {
+		t.Errorf("user_version = %d, want 3 after migration 003", userVersion)
 	}
 
 	for _, table := range []string{"evidence", "domain_event"} {
@@ -249,5 +249,40 @@ func TestOpenTightensAWidenedFile(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("mode = %04o, want 0600", perm)
+	}
+}
+
+// Migration 003 creates the constraint that makes extraction idempotent. The
+// primary key is the whole point: it is what a second pass collides with.
+func TestMigration003CreatesTheActiveClaimConstraint(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	for _, id := range []string{"c-1", "c-2"} {
+		if _, err := db.Exec(`INSERT INTO claims (id, state, created_at, updated_at)
+			VALUES (?, 'ACTIVE', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z')`, id); err != nil {
+			t.Fatalf("seed claim %s: %v", id, err)
+		}
+	}
+
+	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-1', 'c-1')`); err != nil {
+		t.Fatalf("first active claim: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-1', 'c-2')`); err == nil {
+		t.Error("the database accepted two active claims for one artifact")
+	}
+
+	// Provenance is a real reference, not a promise: the pointer cannot name a
+	// Claim or an artifact that does not exist.
+	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-missing', 'c-2')`); err == nil {
+		t.Error("the database accepted an active claim for evidence that does not exist")
 	}
 }
