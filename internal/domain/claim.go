@@ -38,16 +38,16 @@ func (s ClaimState) String() string { return string(s) }
 // ever reads, and it means the answer to "what can Billy claim about a
 // movement?" is in one place.
 //
-// It is seven names: the six from that table, plus occurred_at (D33). The
-// event time is a fact extracted from Evidence exactly like the amount, and
-// giving it a private path to the Transaction would let one interpreted value
-// skip validation, provenance and confidence — three properties every other
-// extracted value has to earn.
+// It is eight names: the six from that table, plus occurred_at (D33) and
+// tracking_key (D36). The event time is a fact extracted from Evidence exactly
+// like the amount, and giving it a private path to the Transaction would let
+// one interpreted value skip validation, provenance and confidence — three
+// properties every other extracted value has to earn.
 //
-// It is deliberately *not* extended to cover the identifiers Nu's templates
-// carry: folio, clave de rastreo, concepto. Each is a vocabulary decision, and
-// taking one in passing inside an implementation is the exact thing D21 exists
-// to prevent.
+// It is deliberately *not* extended to cover the rest of the identifiers Nu's
+// templates carry: folio, concepto, número de referencia, código de operación.
+// Each is a vocabulary decision, and taking one in passing inside an
+// implementation is the exact thing D21 exists to prevent.
 type FieldName string
 
 const (
@@ -69,6 +69,19 @@ const (
 	// That fallback is deliberately not applied in the domain: a Claim records
 	// what the artifact said, and says nothing when it said nothing.
 	FieldOccurredAt FieldName = "occurred_at"
+
+	// FieldTrackingKey is the SPEI `Clave de rastreo` (D36), kept verbatim.
+	//
+	// SPEI tracking keys are globally unique, so two artifacts sharing one are
+	// the same movement with no ambiguity — the strongest reconciliation signal
+	// DOMAIN.md §6 can be given. It is also the rarest: 16 of 1,044 artifacts
+	// carry one, and never an inflow, so the two halves of a transfer can never
+	// be matched by it. It earns its place against the second Source D27 adds,
+	// not against this mailbox.
+	//
+	// Opaque on purpose. Billy stores what the artifact said and does not
+	// validate the shape of another system's identifier.
+	FieldTrackingKey FieldName = "tracking_key"
 )
 
 // TimeLayout is how a Claim writes a timestamp: UTC RFC 3339 with milliseconds,
@@ -86,6 +99,7 @@ var fieldIsInt = map[FieldName]bool{
 	FieldDirection:         false,
 	FieldFinancialStatus:   false,
 	FieldOccurredAt:        false,
+	FieldTrackingKey:       false,
 }
 
 func (n FieldName) Validate() error {
