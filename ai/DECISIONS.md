@@ -575,6 +575,41 @@ token then has to reach a browser, which is friction a `curl` call does not have
 Not decided here. It is the part of this decision most worth arguing with.
 **Source.** Author decision, 2026-08-26.
 
+### D33 — `occurred_at` is a Claim field; the vocabulary is seven names
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** `occurred_at` joins the closed `FieldName` set in `internal/domain`,
+alongside the six DATA_MODEL.md §4.4 writes down. It is a text field holding a UTC
+RFC 3339 timestamp, and it carries its own confidence like every other field.
+**Closes.** The gap surfaced on 2026-08-26 while building the Claim aggregate:
+DATA_MODEL.md §4.5 has `occurred_at` as an always-populated *Transaction* column, but
+§4.4's Claim vocabulary does not list it, so nothing carried the event time from a
+parsed email to a Transaction.
+**Why.** The event time is a fact extracted from Evidence, exactly like the amount or
+the merchant, and it is extracted with the same fallibility. Passing it to the
+Transaction through a separate path would give one interpreted value a private channel
+that skips Claim validation, skips provenance, and skips confidence — three properties
+every other extracted value has to earn.
+**Consequence — the card payment stops being a special case.** All 90
+`¡Recibimos tu pago!` artifacts carry no body date, so they simply have no `occurred_at`
+field: no row, no value, no belief. DATA_MODEL.md §4.5's fallback to the earliest
+`observed_at` then fires when the Transaction is built. That is DOMAIN.md §7's
+absence-versus-low-confidence distinction doing the work it was designed for, rather
+than the extractor inventing a timestamp on the side.
+**Consequence — the fallback stays outside the domain.** §4.5 already requires it to be
+computed before writing the Transaction and never inside a SQL query. The Claim records
+what the artifact said; the step that builds a Transaction applies the rule.
+**Consequence — DATA_MODEL.md §4.4's field table is now one row short.** The author's
+correction to make, like the §4.1 drift D24 left behind.
+**Rejected — store the timestamp as `value_int` unix seconds.** Cheaper to compare and
+sort. It loses because DATA_MODEL.md §2 already settled that timestamps are UTC RFC 3339
+text everywhere in this schema, and one column that disagrees is worth more confusion
+than it saves.
+**Still open — the identifiers.** Nu's `folio`, `clave de rastreo` and `concepto` remain
+outside the vocabulary. The tracking key is the one that matters, because DOMAIN.md §6
+wants it as a reconciliation signal; it appears on 16 of 1,044 artifacts and never on an
+inflow. Not decided here.
+**Source.** Author decision, 2026-08-26.
+
 ---
 
 ## Template

@@ -38,10 +38,16 @@ func (s ClaimState) String() string { return string(s) }
 // ever reads, and it means the answer to "what can Billy claim about a
 // movement?" is in one place.
 //
-// It is deliberately *not* extended here to cover the identifiers Nu's
-// templates carry — folio, clave de rastreo, concepto — or the event time. Each
-// of those is a vocabulary decision, and inventing one in passing inside an
-// implementation is the exact thing D21 exists to prevent.
+// It is seven names: the six from that table, plus occurred_at (D33). The
+// event time is a fact extracted from Evidence exactly like the amount, and
+// giving it a private path to the Transaction would let one interpreted value
+// skip validation, provenance and confidence — three properties every other
+// extracted value has to earn.
+//
+// It is deliberately *not* extended to cover the identifiers Nu's templates
+// carry: folio, clave de rastreo, concepto. Each is a vocabulary decision, and
+// taking one in passing inside an implementation is the exact thing D21 exists
+// to prevent.
 type FieldName string
 
 const (
@@ -51,7 +57,23 @@ const (
 	FieldAccountIdentifier FieldName = "account_identifier"
 	FieldDirection         FieldName = "direction"
 	FieldFinancialStatus   FieldName = "financial_status"
+
+	// FieldOccurredAt is when the artifact says the event happened, as UTC
+	// RFC 3339 text (D33). Text rather than a unix integer because
+	// DATA_MODEL.md §2 settled that timestamps are RFC 3339 everywhere in this
+	// schema, and one column that disagrees costs more confusion than it saves.
+	//
+	// Its absence is meaningful. All 90 `¡Recibimos tu pago!` artifacts carry
+	// no body date, so they have no row here at all — and DATA_MODEL.md §4.5's
+	// fallback to the earliest observed_at fires when the Transaction is built.
+	// That fallback is deliberately not applied in the domain: a Claim records
+	// what the artifact said, and says nothing when it said nothing.
+	FieldOccurredAt FieldName = "occurred_at"
 )
+
+// TimeLayout is how a Claim writes a timestamp: UTC RFC 3339 with milliseconds,
+// matching DATA_MODEL.md §2 and the layout the store and the API already use.
+const TimeLayout = "2006-01-02T15:04:05.000Z07:00"
 
 // fieldIsInt records the physical shape of each field, mirroring the
 // value_int / value_text split in DATA_MODEL.md §4.4. Storing an amount as text
@@ -63,6 +85,7 @@ var fieldIsInt = map[FieldName]bool{
 	FieldAccountIdentifier: false,
 	FieldDirection:         false,
 	FieldFinancialStatus:   false,
+	FieldOccurredAt:        false,
 }
 
 func (n FieldName) Validate() error {
@@ -114,6 +137,16 @@ func (f ClaimField) IsInt() bool            { return f.isInt }
 func (f ClaimField) Int() int64             { return f.intValue }
 func (f ClaimField) Text() string           { return f.textValue }
 func (f ClaimField) Confidence() Confidence { return f.confidence }
+
+// NewTimeField builds the occurred_at field from an instant, formatting it the
+// one way the schema accepts. Callers do not hand-roll the layout, so a Claim
+// cannot carry a timestamp that is right in a different format.
+func NewTimeField(t time.Time, c Confidence) (ClaimField, error) {
+	if t.IsZero() {
+		return ClaimField{}, errors.New("claim field: the zero time is absence, not a time")
+	}
+	return NewTextField(t.UTC().Format(TimeLayout), c)
+}
 
 var (
 	ErrClaimNoID         = errors.New("claim: id is required")
@@ -273,6 +306,18 @@ func validateFieldValue(name FieldName, f ClaimField) error {
 		if err := FinancialStatus(f.textValue).Validate(); err != nil {
 			return fmt.Errorf("claim field %q: %w", name, err)
 		}
+	case FieldOccurredAt:
+		t, err := time.Parse(time.RFC3339, f.textValue)
+		if err != nil {
+			return fmt.Errorf("claim field %q: %q is not RFC 3339: %w", name, f.textValue, err)
+		}
+		// A local time here would be a six-hour error wearing a timestamp's
+		// clothes. D29 chose the zone; by the time a value reaches a Claim the
+		// choice has been made and applied, so anything but UTC means it was
+		// not.
+		if _, offset := t.Zone(); offset != 0 {
+			return fmt.Errorf("claim field %q: %q is not UTC", name, f.textValue)
+		}
 	}
 	return nil
 }
@@ -333,6 +378,21 @@ func (c Claim) Money() (Money, bool) {
 		return Money{}, false // unreachable: the constructor validated both
 	}
 	return money, true
+}
+
+// OccurredAt is when the artifact said the event happened, and whether it said
+// at all. A false is not midnight and not the zero time — it is the absence
+// DATA_MODEL.md §4.5's fallback exists to fill.
+func (c Claim) OccurredAt() (time.Time, bool) {
+	f, ok := c.fields[FieldOccurredAt]
+	if !ok {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339, f.textValue)
+	if err != nil {
+		return time.Time{}, false // unreachable: the constructor validated it
+	}
+	return t.UTC(), true
 }
 
 // --- lifecycle --------------------------------------------------------------

@@ -42,15 +42,15 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if userVersion != 1 {
-		t.Errorf("user_version = %d, want 1 after migration 001", userVersion)
+	if userVersion != 2 {
+		t.Errorf("user_version = %d, want 2 after migration 002", userVersion)
 	}
 
 	for _, table := range []string{"evidence", "domain_event"} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
 		if err != nil {
-			t.Errorf("table %s missing after migration 001: %v", table, err)
+			t.Errorf("table %s missing after migrations: %v", table, err)
 		}
 	}
 
@@ -61,21 +61,111 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	}
 }
 
-// Migration 001 creates only what M1 writes to. A table appearing early is a
-// schema nobody has exercised, and DATA_MODEL.md §4 is not a build list.
-func TestMigration001CreatesNoUnusedTables(t *testing.T) {
+// A table is created when code writes to it, not when a document describes it.
+// A table appearing early is a schema nobody has exercised, and
+// DATA_MODEL.md §4 is not a build list.
+//
+// 002 brought the claim tables because M2 writes to them. `transactions` and
+// `transaction_evidence` are specified in §4.5 and §4.6 and still have no code
+// behind them, so they must still be absent.
+func TestMigrationsCreateNoUnusedTables(t *testing.T) {
 	db, err := Open(testDBPath(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer db.Close()
 
-	for _, table := range []string{"claims", "claim_evidence", "claim_fields", "transactions", "transaction_evidence"} {
+	for _, table := range []string{"transactions", "transaction_evidence"} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
 		if err == nil {
-			t.Errorf("table %s exists: migration 001 is M1 only", table)
+			t.Errorf("table %s exists, and nothing writes to it yet", table)
 		}
+	}
+}
+
+// Migration 002 creates what the Claim aggregate needs, with the physical
+// exclusivity DATA_MODEL.md §4.4 requires of a field's value.
+func TestMigration002CreatesTheClaimTables(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	for _, table := range []string{"claims", "claim_evidence", "claim_fields"} {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name); err != nil {
+			t.Errorf("table %s missing: %v", table, err)
+		}
+	}
+	for _, index := range []string{"idx_claim_evidence_by_evidence"} {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&name); err != nil {
+			t.Errorf("index %s missing: %v", index, err)
+		}
+	}
+
+	if _, err := db.Exec(`INSERT INTO claims (id, state, created_at, updated_at)
+		VALUES ('c1', 'ACTIVE', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z')`); err != nil {
+		t.Fatalf("insert claim: %v", err)
+	}
+
+	// A field holds an integer or text, never both and never neither.
+	both := `INSERT INTO claim_fields (claim_id, field_name, value_int, value_text, confidence)
+		VALUES ('c1', 'amount_minor', 100000, 'MXN', 'HIGH')`
+	if _, err := db.Exec(both); err == nil {
+		t.Error("claim_fields accepted a row with both a value_int and a value_text")
+	}
+	neither := `INSERT INTO claim_fields (claim_id, field_name, confidence)
+		VALUES ('c1', 'merchant', 'HIGH')`
+	if _, err := db.Exec(neither); err == nil {
+		t.Error("claim_fields accepted a row with no value at all")
+	}
+	ok := `INSERT INTO claim_fields (claim_id, field_name, value_int, confidence)
+		VALUES ('c1', 'amount_minor', 100000, 'HIGH')`
+	if _, err := db.Exec(ok); err != nil {
+		t.Errorf("claim_fields rejected a valid row: %v", err)
+	}
+}
+
+// Provenance must not be deletable out from under a Claim. DATA_MODEL.md §6:
+// nothing supporting a financial fact disappears because something else was
+// removed.
+func TestClaimProvenanceRestrictsDeletes(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO evidence
+		(id, source_id, source_type, source_reference, observed_at, created_at, processing_stage)
+		VALUES ('e1', 's1', 'GMAIL', 'ref-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("insert evidence: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO claims (id, state, created_at, updated_at)
+		VALUES ('c1', 'ACTIVE', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z')`); err != nil {
+		t.Fatalf("insert claim: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO claim_evidence (claim_id, evidence_id) VALUES ('c1', 'e1')`); err != nil {
+		t.Fatalf("insert provenance: %v", err)
+	}
+
+	if _, err := db.Exec(`DELETE FROM evidence WHERE id = 'e1'`); err == nil {
+		t.Error("Evidence supporting a Claim was deleted")
+	}
+	if _, err := db.Exec(`DELETE FROM claims WHERE id = 'c1'`); err == nil {
+		t.Error("a Claim with provenance was deleted")
+	}
+
+	// A claim_fields row is likewise not orphanable.
+	if _, err := db.Exec(`INSERT INTO claim_fields (claim_id, field_name, value_text, confidence)
+		VALUES ('c1', 'currency', 'MXN', 'HIGH')`); err != nil {
+		t.Fatalf("insert field: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM claims WHERE id = 'c1'`); err == nil {
+		t.Error("a Claim with fields was deleted")
 	}
 }
 

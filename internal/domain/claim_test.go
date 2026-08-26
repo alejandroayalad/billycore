@@ -311,3 +311,75 @@ func mustText(t *testing.T, v string, c domain.Confidence) domain.ClaimField {
 }
 
 func second(_ domain.Claim, err error) error { return err }
+
+// --- occurred_at (D33) ------------------------------------------------------
+
+func TestOccurredAtField(t *testing.T) {
+	when := time.Date(2026, 8, 16, 23, 44, 0, 0, time.UTC)
+
+	fields := transferFields(t)
+	f, err := domain.NewTimeField(when, domain.High)
+	if err != nil {
+		t.Fatalf("NewTimeField: %v", err)
+	}
+	fields[domain.FieldOccurredAt] = f
+	c := mustClaim(t, fields)
+
+	got, ok := c.OccurredAt()
+	if !ok {
+		t.Fatal("OccurredAt() reports no time")
+	}
+	if !got.Equal(when) {
+		t.Errorf("OccurredAt() = %v, want %v", got, when)
+	}
+	if text, _ := c.Field(domain.FieldOccurredAt); text.Text() != "2026-08-16T23:44:00.000Z" {
+		t.Errorf("stored as %q", text.Text())
+	}
+}
+
+// A non-UTC instant is normalised rather than rejected: the caller handed over
+// an unambiguous point in time, and only its spelling was local.
+func TestNewTimeFieldNormalisesToUTC(t *testing.T) {
+	mexico := time.FixedZone("CST", -6*60*60)
+	f, err := domain.NewTimeField(time.Date(2026, 7, 20, 21, 16, 0, 0, mexico), domain.High)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Text() != "2026-07-21T03:16:00.000Z" {
+		t.Errorf("stored as %q, want the UTC spelling", f.Text())
+	}
+}
+
+// The absence is the point: 90 card payment artifacts have no body date, and
+// DATA_MODEL.md §4.5's fallback fires because of it.
+func TestOccurredAtAbsenceIsNotMidnight(t *testing.T) {
+	c := mustClaim(t, transferFields(t))
+	if got, ok := c.OccurredAt(); ok {
+		t.Errorf("OccurredAt() = %v on a claim that never asserted one", got)
+	}
+	if _, err := domain.NewTimeField(time.Time{}, domain.High); err == nil {
+		t.Error("NewTimeField accepted the zero time")
+	}
+}
+
+func TestOccurredAtRejectsBadTimestamps(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"not a timestamp", "ayer"},
+		{"a date with no time", "2026-08-16"},
+		{"the Nu wall-clock format", "16/AGO/2026"},
+		{"a local offset, so D29 was never applied", "2026-08-16T17:44:00.000-06:00"},
+		{"an empty value", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fields := transferFields(t)
+			f, err := domain.NewTextField(tc.value, domain.High)
+			if err != nil {
+				return // an empty value never becomes a field at all
+			}
+			fields[domain.FieldOccurredAt] = f
+			if _, err := domain.NewClaim("c1", domain.ClaimProposed, []string{"e1"}, fields, created); err == nil {
+				t.Errorf("NewClaim accepted occurred_at = %q", tc.value)
+			}
+		})
+	}
+}
