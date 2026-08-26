@@ -150,17 +150,23 @@ func fieldsOf(e parser.Extraction) (map[domain.FieldName]domain.ClaimField, erro
 		b.moment(domain.FieldOccurredAt, e.OccurredAt, occurredAtConfidence(e.Template))
 	}
 
-	// financial_status — SETTLED on the outflow receipt and nowhere else (D35).
+	// financial_status — SETTLED on both transfer receipts (D35, D40).
 	//
-	// The subject line is the assertion: `Tu transferencia fue exitosa` says the
-	// transfer succeeded, and a SPEI transfer that succeeded is final. HIGH on
-	// the 16 rich-layout artifacts that also carry `Estatus: Completada`, MEDIUM
-	// on the 338 where the belief rests on the subject alone.
+	// The subject line is the assertion. `Tu transferencia fue exitosa` says the
+	// transfer succeeded, and `¡Recibiste una transferencia!` says the money is
+	// in the account; a SPEI transfer is final either way, and the receiving
+	// side is no less settled for having been written from the other end.
 	//
-	// The other three templates get no row. An inflow receipt and a card
-	// payment receipt state nothing about settlement, and DOMAIN.md §5's
-	// UNKNOWN is what the Transaction defaults to without Billy claiming it.
-	if e.Template == TemplateTransferOut {
+	// The confidence falls out of the same rule as everything else, with no
+	// special case: HIGH where `Estatus: Completada` states it — the 16
+	// rich-layout outflows — and MEDIUM where the belief rests on the subject
+	// alone. No inflow carries an `Estatus:` line, so all 345 of them are
+	// MEDIUM by that rule rather than by an exception written for them.
+	//
+	// The card payment and the service payment still get no row. Neither states
+	// anything about settlement, and DOMAIN.md §5's UNKNOWN is what the
+	// Transaction defaults to without Billy claiming it.
+	if e.Template == TemplateTransferOut || e.Template == TemplateTransferIn {
 		b.text(domain.FieldFinancialStatus, string(domain.StatusSettled), labelConfidence(e.Status != ""))
 	}
 

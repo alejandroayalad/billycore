@@ -121,8 +121,9 @@ func TestInterpretCorpus(t *testing.T) {
 	// Every template but the card payment names a counterparty: 800 - 90.
 	assertCount(t, "merchant", perField[domain.FieldMerchant], 710)
 
-	// D35: SETTLED on the outflow receipt, and nowhere else.
-	assertCount(t, "financial_status", perField[domain.FieldFinancialStatus], 354)
+	// D35 and D40: SETTLED on both transfer receipts — 354 outflows and 345
+	// inflows — and on neither the card payment nor the service payment.
+	assertCount(t, "financial_status", perField[domain.FieldFinancialStatus], 699)
 
 	// D36: the tracking key rides on the rich outflow layout alone.
 	assertCount(t, "tracking_key", perField[domain.FieldTrackingKey], 16)

@@ -144,7 +144,7 @@ func TestTheServicePaymentTimestampIsMedium(t *testing.T) {
 	}
 }
 
-func TestTheInflowClaimsNoStatusAndNoTrackingKey(t *testing.T) {
+func TestTheInflowIsSettledAndCarriesNoTrackingKey(t *testing.T) {
 	fields := interpretFixture(t, "inflow.html", "¡Recibiste una transferencia!")
 
 	if v, c := text(t, fields, domain.FieldDirection); v != "INFLOW" || c != domain.High {
@@ -154,8 +154,10 @@ func TestTheInflowClaimsNoStatusAndNoTrackingKey(t *testing.T) {
 	if _, c := text(t, fields, domain.FieldMerchant); c != domain.Medium {
 		t.Errorf("merchant confidence = %s, want MEDIUM", c)
 	}
-	if _, ok := fields[domain.FieldFinancialStatus]; ok {
-		t.Error("an inflow receipt states no financial status; Billy claimed one anyway")
+	// D40: the money is in the account. MEDIUM because no inflow carries an
+	// `Estatus:` line, so the belief rests on the subject alone.
+	if v, c := text(t, fields, domain.FieldFinancialStatus); v != "SETTLED" || c != domain.Medium {
+		t.Errorf("financial_status = %q at %s, want SETTLED at MEDIUM", v, c)
 	}
 	// The key never appears on the receiving side, which is why it cannot be
 	// the reconciliation backbone CONTEXT.md §3.1 hoped for.
