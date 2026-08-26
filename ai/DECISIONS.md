@@ -462,6 +462,68 @@ creates is that it stops being a constraint at all. The mitigation is that D27 f
 scope in writing: the date moves for *that* list, and a new item on it is a new decision.
 **Source.** Author decision, 2026-08-25.
 
+### D29 — A Nu wall-clock value is America/Mexico_City
+**Status:** Accepted · 2026-08-25 · Reversibility: bounded
+**Decision.** Every date and time parsed out of a Nu artifact is interpreted in
+**`America/Mexico_City`**, and stored as UTC RFC 3339 per DATA_MODEL.md §2. The parser
+layer keeps returning a zoneless `parser.Wall`; the conversion happens once, at an
+explicit call site in the Nu template parser, rather than being implied by a type.
+**Closes.** The question raised on 2026-08-25 while building `internal/adapter/parser`:
+no Nu email names a zone, and DATA_MODEL.md §2 requires one.
+**Why.** Nu México is a Mexican institution and the account is a Mexican one, so the
+wall clock in the email is Mexico City's. The alternative is not a smaller assumption —
+it is a different one, six hours wide.
+**Rejected — stamp UTC and move on.** Free, and the reason it loses is precisely that it
+is free: nothing in the Evidence would ever contradict it. A 21:16 transfer on 20 July
+becomes the 21st, and a month-end one moves into the next month — which is the boundary
+PRODUCT.md's "last month of transactions" is drawn on. An error no input can reveal is
+the definition of quietly wrong.
+**Rejected — the machine's local zone (`time.Local`).** Looks like deference and is
+actually non-determinism: the same artifact re-parsed on a laptop in Mexico and a VPS in
+Frankfurt produces two different Transactions, and a re-parse stops being reproducible.
+BillyCore is self-hosted (D1); where it is hosted must not change what it concludes.
+**Consequence — `import _ "time/tzdata"` in the binary.** D4 is one binary, and
+`time.LoadLocation` otherwise depends on a system tz database that a scratch container
+does not carry. The failure would be at runtime, on a machine the author is not sitting
+at. Measured 2026-08-25: ~413 KB on a ~16 MB binary. No `go.mod` change — `time/tzdata`
+is standard library, so SECURITY.md §11 does not apply.
+**Consequence — the stored corpus contains no ambiguous local time.** Mexico abolished
+DST on 2022-10-30, before the earliest artifact (2023-08-23), and `America/Mexico_City`
+is a constant −06:00 across 2023–2026 — verified against Go's tz database, not assumed.
+This is a fact about today's data, not a property of the decision. If DST returns, or a
+bank statement ever reaches back past 2022, the template parser meets its first
+ambiguous or nonexistent local time and that is a new question, not this one.
+**Consequence — this is a Source property, not a global one.** The decision is "Nu
+artifacts are Mexico City", not "Billy is Mexico City". A Source in another country
+brings its own zone.
+**Source.** Author decision, 2026-08-25.
+
+### D30 — A Nu amount is MXN
+**Status:** Accepted · 2026-08-25 · Reversibility: cheap
+**Decision.** Amounts parsed from Nu artifacts carry `Currency("MXN")`. `ParseMoney`
+continues to take the currency from its caller; the Nu template parser is the caller
+that supplies it.
+**Closes.** The question raised on 2026-08-25 while building `internal/adapter/parser`:
+`ParseMoney` must produce a Money, and Money without a currency is not one (DOMAIN.md
+§3).
+**Why.** Measured across all 1,044 artifacts: `MXN`, `USD`, `pesos` and `M.N.` appear
+**zero** times. Currency is therefore not a field these emails contain — it is an
+inference about the Source, and Nu México issues MXN accounts.
+**Consequence — the inference is recorded where it is made.** Not inside `ParseMoney`,
+which would quietly make every future Source Mexican; at the Nu template parser, which
+is the only place that knows which Source it is reading.
+**Consequence — `$` is not evidence of MXN.** Many currencies use the glyph. The
+reasoning is the Source, and a Source that could carry more than one currency — a card
+statement with a foreign-currency line — must state it rather than have it inferred.
+**Consequence — API.md Q8 stays open.** This decision names the currency, not its
+minor-unit exponent. `ParseMoney` still requires two fraction digits and refuses `$300`,
+so nothing here depends on an exponent table.
+**Open — does an inferred field carry the same confidence as a parsed one?** MXN is a
+field Billy will assert with no support in the artifact, which is a different thing from
+`Monto: $1,000.00`. DOMAIN.md §7 does not distinguish them. Not decided here; it lands
+when Claims grow field-level confidence.
+**Source.** Author decision, 2026-08-25.
+
 ---
 
 ## Template
