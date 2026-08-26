@@ -462,6 +462,337 @@ creates is that it stops being a constraint at all. The mitigation is that D27 f
 scope in writing: the date moves for *that* list, and a new item on it is a new decision.
 **Source.** Author decision, 2026-08-25.
 
+### D29 — A Nu wall-clock value is America/Mexico_City
+**Status:** Accepted · 2026-08-25 · Reversibility: bounded
+**Decision.** Every date and time parsed out of a Nu artifact is interpreted in
+**`America/Mexico_City`**, and stored as UTC RFC 3339 per DATA_MODEL.md §2. The parser
+layer keeps returning a zoneless `parser.Wall`; the conversion happens once, at an
+explicit call site in the Nu template parser, rather than being implied by a type.
+**Closes.** The question raised on 2026-08-25 while building `internal/adapter/parser`:
+no Nu email names a zone, and DATA_MODEL.md §2 requires one.
+**Why.** Nu México is a Mexican institution and the account is a Mexican one, so the
+wall clock in the email is Mexico City's. The alternative is not a smaller assumption —
+it is a different one, six hours wide.
+**Rejected — stamp UTC and move on.** Free, and the reason it loses is precisely that it
+is free: nothing in the Evidence would ever contradict it. A 21:16 transfer on 20 July
+becomes the 21st, and a month-end one moves into the next month — which is the boundary
+PRODUCT.md's "last month of transactions" is drawn on. An error no input can reveal is
+the definition of quietly wrong.
+**Rejected — the machine's local zone (`time.Local`).** Looks like deference and is
+actually non-determinism: the same artifact re-parsed on a laptop in Mexico and a VPS in
+Frankfurt produces two different Transactions, and a re-parse stops being reproducible.
+BillyCore is self-hosted (D1); where it is hosted must not change what it concludes.
+**Consequence — `import _ "time/tzdata"` in the binary.** D4 is one binary, and
+`time.LoadLocation` otherwise depends on a system tz database that a scratch container
+does not carry. The failure would be at runtime, on a machine the author is not sitting
+at. Measured 2026-08-25: ~413 KB on a ~16 MB binary. No `go.mod` change — `time/tzdata`
+is standard library, so SECURITY.md §11 does not apply.
+**Consequence — the stored corpus contains no ambiguous local time.** Mexico abolished
+DST on 2022-10-30, before the earliest artifact (2023-08-23), and `America/Mexico_City`
+is a constant −06:00 across 2023–2026 — verified against Go's tz database, not assumed.
+This is a fact about today's data, not a property of the decision. If DST returns, or a
+bank statement ever reaches back past 2022, the template parser meets its first
+ambiguous or nonexistent local time and that is a new question, not this one.
+**Consequence — this is a Source property, not a global one.** The decision is "Nu
+artifacts are Mexico City", not "Billy is Mexico City". A Source in another country
+brings its own zone.
+**Source.** Author decision, 2026-08-25.
+
+### D30 — A Nu amount is MXN
+**Status:** Accepted · 2026-08-25 · Reversibility: cheap
+**Decision.** Amounts parsed from Nu artifacts carry `Currency("MXN")`. `ParseMoney`
+continues to take the currency from its caller; the Nu template parser is the caller
+that supplies it.
+**Closes.** The question raised on 2026-08-25 while building `internal/adapter/parser`:
+`ParseMoney` must produce a Money, and Money without a currency is not one (DOMAIN.md
+§3).
+**Why.** Measured across all 1,044 artifacts: `MXN`, `USD`, `pesos` and `M.N.` appear
+**zero** times. Currency is therefore not a field these emails contain — it is an
+inference about the Source, and Nu México issues MXN accounts.
+**Consequence — the inference is recorded where it is made.** Not inside `ParseMoney`,
+which would quietly make every future Source Mexican; at the Nu template parser, which
+is the only place that knows which Source it is reading.
+**Consequence — `$` is not evidence of MXN.** Many currencies use the glyph. The
+reasoning is the Source, and a Source that could carry more than one currency — a card
+statement with a foreign-currency line — must state it rather than have it inferred.
+**Consequence — API.md Q8 stays open.** This decision names the currency, not its
+minor-unit exponent. `ParseMoney` still requires two fraction digits and refuses `$300`,
+so nothing here depends on an exponent table.
+**Open — does an inferred field carry the same confidence as a parsed one?** MXN is a
+field Billy will assert with no support in the artifact, which is a different thing from
+`Monto: $1,000.00`. DOMAIN.md §7 does not distinguish them. Not decided here; it lands
+when Claims grow field-level confidence.
+**Source.** Author decision, 2026-08-25.
+
+### D31 — `¡Recibimos tu pago!` is an OUTFLOW
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** The card payment receipt records money **leaving** the user: it is a
+payment against the balance owed on their Nu credit card. `parseCardPayment` sets
+`Direction: OUTFLOW` for all 90 artifacts.
+**Closes.** The question left open by the card payment parser on 2026-08-25, which
+extracted those 90 artifacts with no direction rather than guessing (D21).
+**Why.** The author's account of what the message means: a debit paying down card debt.
+Money left an account they hold and reduced what they owe.
+**Consequence — the direction is stated from the paying account's point of view.** The
+same event seen from the card's side is a credit. Nothing in this artifact names the
+account the money came *from*, so the Transaction this produces describes the payment,
+not the card's balance.
+**Consequence — this is the first real double-count risk, and it lands in
+reconciliation.** When the card statement arrives as a second Source (D27), the same
+payment appears there as a credit on the card. Two artifacts, one movement of money,
+opposite signs. DOMAIN.md §6 has to collapse them rather than record an OUTFLOW and an
+INFLOW that cancel — and the amount/time signals will match while the direction signal
+contradicts, which is exactly the shape §6 treats as grounds to *block* a match. This is
+a known problem to be solved there, not here.
+**Consequence — a card payment is still dateless.** `OccurredAt` stays zero: the body
+carries no timestamp, and DATA_MODEL.md §4.5's fallback to the Source's delivery
+timestamp remains the caller's to apply. D31 answers direction and nothing else.
+**Source.** Author decision, 2026-08-26.
+
+### D32 — The result is seen two ways: a terminal table and a plain web page
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** BillyCore ships **both** surfaces, and both read the same
+`GET /v1/transactions`:
+1. **`billycore tx`** — a table in the terminal, from the same binary as `serve` (D4).
+2. **A single plain HTML page** — one file, no framework, no build step, no client
+   state, rendering the same rows as a table.
+**Closes.** CONTEXT.md §8.1 — *how is the result actually seen?* — which was on the
+critical path, because the success criterion is a table and none of the candidates had
+been chosen.
+**Why.** The criterion in PRODUCT.md is *"I can see my last month of transactions, well
+classified, in a good table with good financial information."* `curl | jq` does not
+satisfy the word *table*, and the author wants both a terminal view and a browser one.
+**Consequence — the API is the contract, not the renderer.** Both surfaces are thin: a
+change to what a Transaction means changes `GET /v1/transactions`, and the two views
+follow. Neither may compute a financial fact of its own.
+**Consequence — this stays a page, not a UI.** PRODUCT.md is explicit that a UI is not
+Core's job; that is BillySat. The line held here is that the page has no framework, no
+build step, no client-side state and no route but its own. The moment it wants a second
+screen, it has stopped being this and is BillySat's problem.
+**Open — does Core serve the page, or is it a file the user opens?** Serving it from the
+binary is the only version that works without a second server, and D18's single bearer
+token then has to reach a browser, which is friction a `curl` call does not have.
+Not decided here. It is the part of this decision most worth arguing with.
+**Source.** Author decision, 2026-08-26.
+
+### D33 — `occurred_at` is a Claim field; the vocabulary is seven names
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** `occurred_at` joins the closed `FieldName` set in `internal/domain`,
+alongside the six DATA_MODEL.md §4.4 writes down. It is a text field holding a UTC
+RFC 3339 timestamp, and it carries its own confidence like every other field.
+**Closes.** The gap surfaced on 2026-08-26 while building the Claim aggregate:
+DATA_MODEL.md §4.5 has `occurred_at` as an always-populated *Transaction* column, but
+§4.4's Claim vocabulary does not list it, so nothing carried the event time from a
+parsed email to a Transaction.
+**Why.** The event time is a fact extracted from Evidence, exactly like the amount or
+the merchant, and it is extracted with the same fallibility. Passing it to the
+Transaction through a separate path would give one interpreted value a private channel
+that skips Claim validation, skips provenance, and skips confidence — three properties
+every other extracted value has to earn.
+**Consequence — the card payment stops being a special case.** All 90
+`¡Recibimos tu pago!` artifacts carry no body date, so they simply have no `occurred_at`
+field: no row, no value, no belief. DATA_MODEL.md §4.5's fallback to the earliest
+`observed_at` then fires when the Transaction is built. That is DOMAIN.md §7's
+absence-versus-low-confidence distinction doing the work it was designed for, rather
+than the extractor inventing a timestamp on the side.
+**Consequence — the fallback stays outside the domain.** §4.5 already requires it to be
+computed before writing the Transaction and never inside a SQL query. The Claim records
+what the artifact said; the step that builds a Transaction applies the rule.
+**Consequence — DATA_MODEL.md §4.4's field table is now one row short.** The author's
+correction to make, like the §4.1 drift D24 left behind.
+**Rejected — store the timestamp as `value_int` unix seconds.** Cheaper to compare and
+sort. It loses because DATA_MODEL.md §2 already settled that timestamps are UTC RFC 3339
+text everywhere in this schema, and one column that disagrees is worth more confusion
+than it saves.
+**Still open — the identifiers.** Nu's `folio`, `clave de rastreo` and `concepto` remain
+outside the vocabulary. The tracking key is the one that matters, because DOMAIN.md §6
+wants it as a reconciliation signal; it appears on 16 of 1,044 artifacts and never on an
+inflow. Not decided here.
+**Source.** Author decision, 2026-08-26.
+
+
+### D34 — Claim confidence tracks how the artifact yielded the value
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** One rule, applied at the Nu interpreter:
+
+| | |
+|---|---|
+| `HIGH` | the artifact states it on a labelled line |
+| `MEDIUM` | the artifact implies it — read from prose, from position, or from the template's own identity |
+| `LOW` | no artifact states it at all; Billy inferred it from the Source |
+
+`currency` is therefore **LOW on every Claim**, which closes the question D30 left
+open — *does an inferred field carry the same confidence as a parsed one?* It does not.
+**Closes.** D30's open item, and the confidence half of DOMAIN.md §7 for the four Nu
+templates.
+**Why.** Confidence is about *support*, and support is a property of the reading rather
+than of the value. `Monto: $1,000.00` under a label is an anchor Nu would have to change
+its template to break; "…a la cuenta de <name> en <bank>…" is a sentence Nu can reword in
+a marketing pass, and a reword yields a *wrong name* rather than no name. MXN is neither:
+it appears zero times in 1,044 artifacts.
+**Consequence — the rule lives beside the parsers, not in `internal/app`.** Only the code
+that did the reading knows which of the three happened. The use case must not re-derive it
+by guessing the layout from which other fields happen to be present.
+**Consequence — `parser.Extraction` gained `CounterpartyLabelled`.** The value alone
+cannot say whether a label or a sentence produced it, and inferring the layout from the
+presence of `Estatus:` would be exactly the clever guess this decision forbids.
+**Consequence — every Claim carries a LOW field, so LOW stops being a review flag.** The
+count of LOW fields is now the count of Claims. This was named as the cost when the
+decision was taken and accepted.
+**Consequence — `account_identifier` is never claimed, on any template.** Nu's
+account-shaped values — `Tarjeta de débito: ••••7662`, the service payment's `Número de
+cuenta:` — all belong to the *other* party. DOMAIN.md §6 treats a known-account
+contradiction as grounds to block reconciliation, so claiming one as the user's would not
+merely be wrong; it would prevent correct matches later (CONTEXT.md §3.1).
+**Consequence — the card payment claims no `merchant`.** Its counterparty is the user's
+own card product, which is not a counterparty. 90 artifacts get no belief rather than a
+plausible-looking wrong one.
+**Source.** Author decision, 2026-08-26.
+
+### D35 — A Nu outflow receipt is SETTLED; the other three templates claim no status
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** All **354** `Tu transferencia fue exitosa` artifacts carry
+`financial_status = SETTLED` — `HIGH` on the 16 that also say `Estatus: Completada`,
+`MEDIUM` on the 338 where the belief rests on the subject line. The inflow, card payment
+and service payment templates carry **no `financial_status` row at all**.
+**Closes.** The question raised on 2026-08-26 while building the extraction slice.
+**Why.** The subject line is itself the assertion — *your transfer was successful* — and a
+SPEI transfer that succeeded is final. Restricting SETTLED to the 16 artifacts carrying
+the explicit label would discard 338 statements that say the same thing in the subject
+rather than in a field.
+**Consequence — absence, not `UNKNOWN`.** The 446 artifacts that state nothing get no row.
+Writing `financial_status = UNKNOWN` would assert a belief identical to absence and store
+it twice, erasing the distinction DOMAIN.md §7 insists stays sharp. The Transaction
+defaults to `UNKNOWN` in slice 4 without Billy claiming it.
+**Consequence — the confidence split is the honest part.** 338 of the 354 rest on a
+subject line, and `MEDIUM` is what says so.
+**Open — should an inflow receipt be SETTLED too?** `¡Recibiste una transferencia!` means
+the money is in the account, which is arguably as settled as an outflow. It was not
+decided: the decision taken names 354, and 345 inflows were left claiming nothing.
+**Source.** Author decision, 2026-08-26.
+
+### D36 — `tracking_key` joins the vocabulary; it is eight names
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** `tracking_key` — the SPEI `Clave de rastreo` — joins the closed `FieldName`
+set in `internal/domain`, alongside the seven D33 left it at. Text, opaque, kept verbatim,
+`HIGH` where present.
+**Closes.** The identifier question D33 left open by name.
+**Why.** SPEI tracking keys are globally unique, so two artifacts sharing one are the same
+movement with no ambiguity — the strongest signal DOMAIN.md §6 can be given.
+**Consequence — it earns its place against the second Source, not this mailbox.** It
+appears on **16** of 1,044 artifacts and **never on an inflow**, so the two halves of a
+transfer between the user's own accounts can never be matched by it. Within Gmail alone it
+buys nothing; against the bank statement D27 adds, it may buy everything.
+**Consequence — no migration.** `claim_fields.field_name` is TEXT with no CHECK, because
+DATA_MODEL.md §2 puts that vocabulary in the domain. Migration 002 needed no change, which
+is that decision paying out.
+**Rejected — folio, concepto, número de referencia, código de operación.** Each remains a
+vocabulary decision of its own. Nothing is lost by waiting: Evidence is immutable and
+retained, so a later decision re-parses all 1,044 artifacts for free.
+**Source.** Author decision, 2026-08-26.
+
+### D37 — A parser-produced Claim is born PROPOSED and activated in the same transaction
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** The extraction use case calls `domain.NewClaim(..., ClaimProposed, ...)` and
+then `Activate`, and the store writes the Claim, its fields, its provenance, the
+`ClaimActivated` event and the Evidence stage advance in **one** transaction.
+**Closes.** The question raised on 2026-08-26: DOMAIN.md §5 has both states and §8 has the
+event, and nothing said which one a parser produces.
+**Why.** `Activate` is the only operation that performs the transition `ClaimActivated`
+describes. Constructing at `ACTIVE` would put an event in the log for a transition no code
+ever made — the log would describe an activation that did not happen.
+**Consequence — `created_at` equals `updated_at`.** The two states occupy one instant. That
+is honest: the Claim really was proposed and really was accepted, and nothing happened in
+between.
+**Consequence — it is the path `POST /v1/claims` will take** when an outside proposer
+offers an interpretation (D11, D12), with the difference that theirs may stop at
+`PROPOSED`.
+**Consequence — the stage advance is inside the Claim's transaction.** D25's argument
+applied twice: an event describing a change that did not commit is a lie about the domain,
+and Evidence marked `EXTRACTED` whose Claim rolled back is a worse one — an artifact Billy
+never revisits and has nothing to show for. Artifacts that produce *no* Claim advance
+through `EvidenceQueue.MarkExtracted` instead.
+**Source.** Author decision, 2026-08-26.
+
+
+### D38 — At most one ACTIVE Claim per piece of Evidence
+**Status:** Accepted · 2026-08-26 · Reversibility: moderate — it is a schema constraint
+**Decision.** `evidence_active_claim (evidence_id PRIMARY KEY, claim_id)`, migration 003.
+A row exists only while a Claim is `ACTIVE`. The primary key is the invariant.
+**Closes.** The question raised on 2026-08-26 while making extraction idempotent: nothing
+in `docs/` said how many Claims one artifact may have live at once.
+**Why.** DOMAIN.md §5 says `ACTIVE` means "the Claim Billy currently uses". Two of those
+for one artifact is not a richer answer, it is the absence of one — there is no rule for
+which a Transaction should be built from. Supersession exists precisely to move from one
+live interpretation to the next.
+**Consequence — extraction is idempotent by constraint, not by checking.** M1's ingestion
+is idempotent because `UNIQUE (source_id, source_reference)` says so, not because `Insert`
+remembered to look. Extraction now earns the property the same way. `Save` reports
+`created=false` on a collision, exactly as `Insert` does for an already-recorded artifact.
+**Consequence — the duplicate this prevents needs no crash.** A pass claims a row on a
+one-minute lease, runs long, and a second pass claims the same row. Both write a Claim;
+the stage guard does not help, because the second `UPDATE` matches no row and the Claim
+lands anyway. Measured: eight goroutines racing one artifact produce exactly one Claim and
+one `ClaimActivated`, over twenty runs under `-race`.
+**Consequence — the proposal endpoints still work.** A `PROPOSED` Claim takes no slot, so
+an outside proposer (D11, D12) may offer a competing interpretation of an artifact Billy
+has already interpreted. It collides only on activation, and there colliding is correct:
+activating a second interpretation *means* superseding the first, which is what
+`ClaimActivated`'s `supersededClaimId` records.
+**Rejected — `UNIQUE` on `claim_evidence(evidence_id)`.** The obvious constraint, and it
+forbids that competing proposal outright, which is the entire point of D11.
+**Rejected — deterministic Claim ids over the existing primary key.** Needs no new schema
+at all. It loses on the case that matters: after a parser is fixed, re-extraction would
+produce the same id and be silently skipped, blocking the improvement rather than
+superseding the old Claim with a better one.
+**Consequence — the transaction tables move to 004.** They were expected to be 003.
+**Source.** Author decision, 2026-08-26.
+
+### D39 — Extraction retries back off exponentially, and never stop
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** A failed extraction attempt backs the row off by `RetryBase * 2^(attempts-1)`,
+capped at `RetryCap`. `RetryBase` is one minute, `RetryCap` is 24 hours, and there is
+**no maximum attempt count**.
+**Closes.** The gap DATA_MODEL.md §7 leaves: it specifies the mechanism — `attempts`,
+`last_error`, `locked_until` — and names no schedule, the way ARCHITECTURE.md §7 specified
+a busy timeout without naming a value.
+**Why no maximum.** The failure that actually happens here is Nu changing a template: a few
+hundred artifacts start failing and the fix is a new parser. A capped backoff means those
+rows retry themselves within a day of the fix shipping, with nobody resetting anything. A
+row parked after N attempts needs a hand to bring it back — and DATA_MODEL.md §7 has
+already ruled out expressing "failed" as a stage, so there is no clean place to see the
+parked set either.
+**Consequence — a genuinely poisonous artifact costs one parse a day, forever.** Accepted:
+that is cheap, and the alternative silently loses data on the day a parser is fixed.
+**Consequence — `attempts` counts hand-outs, not handled failures.** It increments in the
+same statement that takes the lock. A parser that takes the whole process down with it —
+an OOM, a SIGKILL — never reaches code that could record a failure, and a count of handled
+failures would leave that row at zero forever, retried on every pass for the life of the
+database.
+**Consequence — retry is still not a stage.** Evidence that failed extraction stays at
+`RECEIVED`, exactly as received.
+**Source.** Author decision, 2026-08-26.
+
+### D40 — The inflow receipt is SETTLED too
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Supersedes.** D35's scope, and only its scope. D35's reasoning for the outflow receipt
+stands unchanged; this widens the set it applies to.
+**Decision.** `¡Recibiste una transferencia!` carries `financial_status = SETTLED` at
+`MEDIUM`, joining the 354 outflow receipts. **699 of 800** Claims now assert a status.
+**Why.** The subject line is the assertion, and it asserts the same fact from the other
+end: the money is in the account. A SPEI transfer is final either way, and the receiving
+side is no less settled for having been written from the recipient's point of view.
+Restricting SETTLED to the sending side recorded a difference in *who wrote the email*
+rather than a difference in what happened to the money.
+**Consequence — no special case in the code.** No inflow carries an `Estatus:` line, so
+all 345 land at `MEDIUM` through D34's ordinary rule — the belief rests on the subject
+alone — rather than through an exception written for them. The condition that changed is
+one template name.
+**Consequence — the card payment and the service payment still claim nothing.** Neither
+states anything about settlement, and DOMAIN.md §5's `UNKNOWN` is what the Transaction
+defaults to without Billy claiming it. Absence stays distinguishable from belief.
+**Source.** Author decision, 2026-08-26, answering the item D35 left open by name.
+
 ---
 
 ## Template

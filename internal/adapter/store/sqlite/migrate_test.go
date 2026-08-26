@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"database/sql"
 	"strings"
 	"testing"
 )
@@ -62,9 +63,17 @@ func TestApplyMigrationRollsBackOnFailure(t *testing.T) {
 	}
 	defer db.Close()
 
+	// Read the version Open left rather than hard-coding one: this test is
+	// about atomicity, and it should not need editing every time a real
+	// migration is added.
+	var before int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&before); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+
 	bad := migration{
-		version: 2,
-		name:    "002_broken.sql",
+		version: before + 1,
+		name:    "999_broken.sql",
 		sql:     "CREATE TABLE later_table (id TEXT) STRICT;\nTHIS IS NOT SQL;",
 	}
 	if err := applyMigration(db, bad); err == nil {
@@ -79,7 +88,72 @@ func TestApplyMigrationRollsBackOnFailure(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("user_version = %d after a failed migration, want 1", version)
+	if version != before {
+		t.Errorf("user_version = %d after a failed migration, want %d", version, before)
+	}
+}
+
+// The real upgrade path: a database already holding Evidence moves from 001 to
+// 002 without touching a row of it.
+//
+// This is not hypothetical. `~/.billy/billy.db` holds 1,044 Evidence rows
+// written under migration 001, and the next start of any BillyCore binary
+// applies 002 to it.
+func TestMigrateUpgradesAnExistingDatabaseInPlace(t *testing.T) {
+	path := testDBPath(t)
+
+	// A database at version 1 only, as M1 left it.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	if err := applyMigration(db, migrations[0]); err != nil {
+		t.Fatalf("apply 001: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO evidence
+		(id, source_id, source_type, source_reference, raw_content, observed_at, created_at, processing_stage)
+		VALUES ('e1', 's1', 'GMAIL', 'ref-1', x'6869', '2026-08-25T00:00:00.000Z', '2026-08-25T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("insert evidence: %v", err)
+	}
+	db.Close()
+
+	// Upgrade.
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a v1 database: %v", err)
+	}
+	defer upgraded.Close()
+
+	var version int
+	if err := upgraded.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if version != len(migrations) {
+		t.Errorf("user_version = %d, want %d", version, len(migrations))
+	}
+
+	// The Evidence is untouched, content included. Evidence is immutable, and a
+	// migration is not an exception to that.
+	var stage, reference string
+	var raw []byte
+	if err := upgraded.QueryRow(
+		`SELECT processing_stage, source_reference, raw_content FROM evidence WHERE id = 'e1'`,
+	).Scan(&stage, &reference, &raw); err != nil {
+		t.Fatalf("the existing Evidence did not survive the upgrade: %v", err)
+	}
+	if stage != "RECEIVED" || reference != "ref-1" || string(raw) != "hi" {
+		t.Errorf("evidence changed: stage %q, reference %q, content %q", stage, reference, string(raw))
+	}
+
+	var count int
+	if err := upgraded.QueryRow(`SELECT count(*) FROM claims`).Scan(&count); err != nil {
+		t.Errorf("claims table missing after the upgrade: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("the upgrade invented %d claims", count)
 	}
 }

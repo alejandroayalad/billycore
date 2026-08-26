@@ -1,0 +1,23 @@
+From: Nu <no-reply@nu.com.mx>
+To: redacted@example.test
+Subject: =?UTF-8?Q?Tu_transferencia_fue_exitosa?=
+Date: Sun, 20 Jul 2026 21:16:07 -0500
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY42"
+
+--BOUNDARY42
+Content-Type: text/html; charset="iso-8859-1"
+Content-Transfer-Encoding: quoted-printable
+
+<!doctype html><html><head><style>.x{color:#820AD1}</style><title>ignorado<=
+/title></head><body><div>Hola, Persona Uno:</div><ul><li><strong>Monto:</st=
+rong> $498.00</li><li><strong>Fecha:</strong> 20/07/2026</li><li><strong>Ho=
+ra:</strong> 21:16</li></ul><p>N=FAmero de referencia &mdash; Tarjeta de d=
+=E9bito</p><script>var x =3D "1 < 2";</script></body></html>
+--BOUNDARY42
+Content-Type: application/pdf; name="../../etc/passwd.pdf"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="../../etc/passwd.pdf"
+
+JVBERi0xLjQKJVBERg==
+--BOUNDARY42--
