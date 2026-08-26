@@ -610,6 +610,110 @@ wants it as a reconciliation signal; it appears on 16 of 1,044 artifacts and nev
 inflow. Not decided here.
 **Source.** Author decision, 2026-08-26.
 
+
+### D34 — Claim confidence tracks how the artifact yielded the value
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** One rule, applied at the Nu interpreter:
+
+| | |
+|---|---|
+| `HIGH` | the artifact states it on a labelled line |
+| `MEDIUM` | the artifact implies it — read from prose, from position, or from the template's own identity |
+| `LOW` | no artifact states it at all; Billy inferred it from the Source |
+
+`currency` is therefore **LOW on every Claim**, which closes the question D30 left
+open — *does an inferred field carry the same confidence as a parsed one?* It does not.
+**Closes.** D30's open item, and the confidence half of DOMAIN.md §7 for the four Nu
+templates.
+**Why.** Confidence is about *support*, and support is a property of the reading rather
+than of the value. `Monto: $1,000.00` under a label is an anchor Nu would have to change
+its template to break; "…a la cuenta de <name> en <bank>…" is a sentence Nu can reword in
+a marketing pass, and a reword yields a *wrong name* rather than no name. MXN is neither:
+it appears zero times in 1,044 artifacts.
+**Consequence — the rule lives beside the parsers, not in `internal/app`.** Only the code
+that did the reading knows which of the three happened. The use case must not re-derive it
+by guessing the layout from which other fields happen to be present.
+**Consequence — `parser.Extraction` gained `CounterpartyLabelled`.** The value alone
+cannot say whether a label or a sentence produced it, and inferring the layout from the
+presence of `Estatus:` would be exactly the clever guess this decision forbids.
+**Consequence — every Claim carries a LOW field, so LOW stops being a review flag.** The
+count of LOW fields is now the count of Claims. This was named as the cost when the
+decision was taken and accepted.
+**Consequence — `account_identifier` is never claimed, on any template.** Nu's
+account-shaped values — `Tarjeta de débito: ••••7662`, the service payment's `Número de
+cuenta:` — all belong to the *other* party. DOMAIN.md §6 treats a known-account
+contradiction as grounds to block reconciliation, so claiming one as the user's would not
+merely be wrong; it would prevent correct matches later (CONTEXT.md §3.1).
+**Consequence — the card payment claims no `merchant`.** Its counterparty is the user's
+own card product, which is not a counterparty. 90 artifacts get no belief rather than a
+plausible-looking wrong one.
+**Source.** Author decision, 2026-08-26.
+
+### D35 — A Nu outflow receipt is SETTLED; the other three templates claim no status
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** All **354** `Tu transferencia fue exitosa` artifacts carry
+`financial_status = SETTLED` — `HIGH` on the 16 that also say `Estatus: Completada`,
+`MEDIUM` on the 338 where the belief rests on the subject line. The inflow, card payment
+and service payment templates carry **no `financial_status` row at all**.
+**Closes.** The question raised on 2026-08-26 while building the extraction slice.
+**Why.** The subject line is itself the assertion — *your transfer was successful* — and a
+SPEI transfer that succeeded is final. Restricting SETTLED to the 16 artifacts carrying
+the explicit label would discard 338 statements that say the same thing in the subject
+rather than in a field.
+**Consequence — absence, not `UNKNOWN`.** The 446 artifacts that state nothing get no row.
+Writing `financial_status = UNKNOWN` would assert a belief identical to absence and store
+it twice, erasing the distinction DOMAIN.md §7 insists stays sharp. The Transaction
+defaults to `UNKNOWN` in slice 4 without Billy claiming it.
+**Consequence — the confidence split is the honest part.** 338 of the 354 rest on a
+subject line, and `MEDIUM` is what says so.
+**Open — should an inflow receipt be SETTLED too?** `¡Recibiste una transferencia!` means
+the money is in the account, which is arguably as settled as an outflow. It was not
+decided: the decision taken names 354, and 345 inflows were left claiming nothing.
+**Source.** Author decision, 2026-08-26.
+
+### D36 — `tracking_key` joins the vocabulary; it is eight names
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** `tracking_key` — the SPEI `Clave de rastreo` — joins the closed `FieldName`
+set in `internal/domain`, alongside the seven D33 left it at. Text, opaque, kept verbatim,
+`HIGH` where present.
+**Closes.** The identifier question D33 left open by name.
+**Why.** SPEI tracking keys are globally unique, so two artifacts sharing one are the same
+movement with no ambiguity — the strongest signal DOMAIN.md §6 can be given.
+**Consequence — it earns its place against the second Source, not this mailbox.** It
+appears on **16** of 1,044 artifacts and **never on an inflow**, so the two halves of a
+transfer between the user's own accounts can never be matched by it. Within Gmail alone it
+buys nothing; against the bank statement D27 adds, it may buy everything.
+**Consequence — no migration.** `claim_fields.field_name` is TEXT with no CHECK, because
+DATA_MODEL.md §2 puts that vocabulary in the domain. Migration 002 needed no change, which
+is that decision paying out.
+**Rejected — folio, concepto, número de referencia, código de operación.** Each remains a
+vocabulary decision of its own. Nothing is lost by waiting: Evidence is immutable and
+retained, so a later decision re-parses all 1,044 artifacts for free.
+**Source.** Author decision, 2026-08-26.
+
+### D37 — A parser-produced Claim is born PROPOSED and activated in the same transaction
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** The extraction use case calls `domain.NewClaim(..., ClaimProposed, ...)` and
+then `Activate`, and the store writes the Claim, its fields, its provenance, the
+`ClaimActivated` event and the Evidence stage advance in **one** transaction.
+**Closes.** The question raised on 2026-08-26: DOMAIN.md §5 has both states and §8 has the
+event, and nothing said which one a parser produces.
+**Why.** `Activate` is the only operation that performs the transition `ClaimActivated`
+describes. Constructing at `ACTIVE` would put an event in the log for a transition no code
+ever made — the log would describe an activation that did not happen.
+**Consequence — `created_at` equals `updated_at`.** The two states occupy one instant. That
+is honest: the Claim really was proposed and really was accepted, and nothing happened in
+between.
+**Consequence — it is the path `POST /v1/claims` will take** when an outside proposer
+offers an interpretation (D11, D12), with the difference that theirs may stop at
+`PROPOSED`.
+**Consequence — the stage advance is inside the Claim's transaction.** D25's argument
+applied twice: an event describing a change that did not commit is a lie about the domain,
+and Evidence marked `EXTRACTED` whose Claim rolled back is a worse one — an artifact Billy
+never revisits and has nothing to show for. Artifacts that produce *no* Claim advance
+through `EvidenceQueue.MarkExtracted` instead.
+**Source.** Author decision, 2026-08-26.
+
 ---
 
 ## Template
