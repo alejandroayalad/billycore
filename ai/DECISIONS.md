@@ -714,6 +714,85 @@ never revisits and has nothing to show for. Artifacts that produce *no* Claim ad
 through `EvidenceQueue.MarkExtracted` instead.
 **Source.** Author decision, 2026-08-26.
 
+
+### D38 — At most one ACTIVE Claim per piece of Evidence
+**Status:** Accepted · 2026-08-26 · Reversibility: moderate — it is a schema constraint
+**Decision.** `evidence_active_claim (evidence_id PRIMARY KEY, claim_id)`, migration 003.
+A row exists only while a Claim is `ACTIVE`. The primary key is the invariant.
+**Closes.** The question raised on 2026-08-26 while making extraction idempotent: nothing
+in `docs/` said how many Claims one artifact may have live at once.
+**Why.** DOMAIN.md §5 says `ACTIVE` means "the Claim Billy currently uses". Two of those
+for one artifact is not a richer answer, it is the absence of one — there is no rule for
+which a Transaction should be built from. Supersession exists precisely to move from one
+live interpretation to the next.
+**Consequence — extraction is idempotent by constraint, not by checking.** M1's ingestion
+is idempotent because `UNIQUE (source_id, source_reference)` says so, not because `Insert`
+remembered to look. Extraction now earns the property the same way. `Save` reports
+`created=false` on a collision, exactly as `Insert` does for an already-recorded artifact.
+**Consequence — the duplicate this prevents needs no crash.** A pass claims a row on a
+one-minute lease, runs long, and a second pass claims the same row. Both write a Claim;
+the stage guard does not help, because the second `UPDATE` matches no row and the Claim
+lands anyway. Measured: eight goroutines racing one artifact produce exactly one Claim and
+one `ClaimActivated`, over twenty runs under `-race`.
+**Consequence — the proposal endpoints still work.** A `PROPOSED` Claim takes no slot, so
+an outside proposer (D11, D12) may offer a competing interpretation of an artifact Billy
+has already interpreted. It collides only on activation, and there colliding is correct:
+activating a second interpretation *means* superseding the first, which is what
+`ClaimActivated`'s `supersededClaimId` records.
+**Rejected — `UNIQUE` on `claim_evidence(evidence_id)`.** The obvious constraint, and it
+forbids that competing proposal outright, which is the entire point of D11.
+**Rejected — deterministic Claim ids over the existing primary key.** Needs no new schema
+at all. It loses on the case that matters: after a parser is fixed, re-extraction would
+produce the same id and be silently skipped, blocking the improvement rather than
+superseding the old Claim with a better one.
+**Consequence — the transaction tables move to 004.** They were expected to be 003.
+**Source.** Author decision, 2026-08-26.
+
+### D39 — Extraction retries back off exponentially, and never stop
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** A failed extraction attempt backs the row off by `RetryBase * 2^(attempts-1)`,
+capped at `RetryCap`. `RetryBase` is one minute, `RetryCap` is 24 hours, and there is
+**no maximum attempt count**.
+**Closes.** The gap DATA_MODEL.md §7 leaves: it specifies the mechanism — `attempts`,
+`last_error`, `locked_until` — and names no schedule, the way ARCHITECTURE.md §7 specified
+a busy timeout without naming a value.
+**Why no maximum.** The failure that actually happens here is Nu changing a template: a few
+hundred artifacts start failing and the fix is a new parser. A capped backoff means those
+rows retry themselves within a day of the fix shipping, with nobody resetting anything. A
+row parked after N attempts needs a hand to bring it back — and DATA_MODEL.md §7 has
+already ruled out expressing "failed" as a stage, so there is no clean place to see the
+parked set either.
+**Consequence — a genuinely poisonous artifact costs one parse a day, forever.** Accepted:
+that is cheap, and the alternative silently loses data on the day a parser is fixed.
+**Consequence — `attempts` counts hand-outs, not handled failures.** It increments in the
+same statement that takes the lock. A parser that takes the whole process down with it —
+an OOM, a SIGKILL — never reaches code that could record a failure, and a count of handled
+failures would leave that row at zero forever, retried on every pass for the life of the
+database.
+**Consequence — retry is still not a stage.** Evidence that failed extraction stays at
+`RECEIVED`, exactly as received.
+**Source.** Author decision, 2026-08-26.
+
+### D40 — The inflow receipt is SETTLED too
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Supersedes.** D35's scope, and only its scope. D35's reasoning for the outflow receipt
+stands unchanged; this widens the set it applies to.
+**Decision.** `¡Recibiste una transferencia!` carries `financial_status = SETTLED` at
+`MEDIUM`, joining the 354 outflow receipts. **699 of 800** Claims now assert a status.
+**Why.** The subject line is the assertion, and it asserts the same fact from the other
+end: the money is in the account. A SPEI transfer is final either way, and the receiving
+side is no less settled for having been written from the recipient's point of view.
+Restricting SETTLED to the sending side recorded a difference in *who wrote the email*
+rather than a difference in what happened to the money.
+**Consequence — no special case in the code.** No inflow carries an `Estatus:` line, so
+all 345 land at `MEDIUM` through D34's ordinary rule — the belief rests on the subject
+alone — rather than through an exception written for them. The condition that changed is
+one template name.
+**Consequence — the card payment and the service payment still claim nothing.** Neither
+states anything about settlement, and DOMAIN.md §5's `UNKNOWN` is what the Transaction
+defaults to without Billy claiming it. Absence stays distinguishable from belief.
+**Source.** Author decision, 2026-08-26, answering the item D35 left open by name.
+
 ---
 
 ## Template
