@@ -29,6 +29,7 @@ func TestParseTemplates(t *testing.T) {
 				// 17:44 in Mexico City on 16 August is 23:44 UTC.
 				OccurredAt:              time.Date(2026, 8, 16, 23, 44, 0, 0, time.UTC),
 				Counterparty:            "Persona Dos",
+				CounterpartyLabelled:    true, // `Nombre:` — the rich layout labels it
 				CounterpartyInstitution: "HSBC",
 				CounterpartyCard:        "••••0000",
 				Concept:                 "Transferencia",
@@ -79,13 +80,16 @@ func TestParseTemplates(t *testing.T) {
 			fixture: "service_payment.html",
 			subject: "Tu comprobante de pago de servicio",
 			want: parser.Extraction{
-				Template:       nu.TemplateServicePayment,
-				Direction:      domain.Outflow,
-				Amount:         mxn(t, 90900),
-				OccurredAt:     time.Date(2026, 7, 18, 16, 3, 51, 0, time.UTC),
-				Counterparty:   "Servicio De Prueba",
-				ServiceAccount: "0000000000",
-				OperationCode:  "00000000-0000-4000-8000-000000000000",
+				Template:     nu.TemplateServicePayment,
+				Direction:    domain.Outflow,
+				Amount:       mxn(t, 90900),
+				OccurredAt:   time.Date(2026, 7, 18, 16, 3, 51, 0, time.UTC),
+				Counterparty: "Servicio De Prueba",
+				// `Empresa a la cual…` — labelled, and the label is the point:
+				// `Nombre:` here is the payer, not the counterparty.
+				CounterpartyLabelled: true,
+				ServiceAccount:       "0000000000",
+				OperationCode:        "00000000-0000-4000-8000-000000000000",
 			},
 		},
 	}

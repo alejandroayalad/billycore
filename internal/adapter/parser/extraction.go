@@ -62,6 +62,18 @@ type Extraction struct {
 	// does not answer it.
 	Counterparty string
 
+	// CounterpartyLabelled reports whether Counterparty was read from a labelled
+	// line rather than from a sentence.
+	//
+	// It exists because the two readings are not equally trustworthy and the
+	// value alone cannot tell them apart. `Nombre: <name>` is an anchor Nu would
+	// have to change the template to break; "…a la cuenta de <name> en <bank>…"
+	// is a sentence Nu can reword in a marketing pass, and a reword yields a
+	// wrong name rather than no name. The step that builds Claims turns this
+	// into HIGH versus MEDIUM confidence (D34), which it could otherwise only do
+	// by guessing the layout from which *other* fields happen to be present.
+	CounterpartyLabelled bool
+
 	// CounterpartyInstitution is the bank or entity holding the counterparty's
 	// account, such as "HSBC" or "NU MEXICO".
 	CounterpartyInstitution string

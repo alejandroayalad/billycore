@@ -56,6 +56,7 @@ func parseTransferOut(text string) (parser.Extraction, error) {
 	// because a label is a stronger anchor than a sentence Nu may rephrase.
 	if name, found := labelled(text, "Nombre:"); found {
 		out.Counterparty = name
+		out.CounterpartyLabelled = true
 		out.CounterpartyInstitution = optional(text, "Entidad:")
 	} else if name, found := between(text, "a la cuenta de ", " en "); found {
 		out.Counterparty = name

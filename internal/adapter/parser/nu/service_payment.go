@@ -40,13 +40,16 @@ func parseServicePayment(text string) (parser.Extraction, error) {
 	// second movement of money, not a property of this one — modelling it is a
 	// domain question this layer does not open.
 	out := parser.Extraction{
-		Template:       TemplateServicePayment,
-		Direction:      domain.Outflow,
-		Amount:         money,
-		OccurredAt:     wall.In(zone).UTC(),
-		Counterparty:   optional(text, "Empresa a la cual se realizará el pago:"),
-		ServiceAccount: optional(text, "Número de cuenta:"),
-		OperationCode:  optional(text, "Código de operación:"),
+		Template:     TemplateServicePayment,
+		Direction:    domain.Outflow,
+		Amount:       money,
+		OccurredAt:   wall.In(zone).UTC(),
+		Counterparty: optional(text, "Empresa a la cual se realizará el pago:"),
+		// Labelled, and the label is the whole point of this parser: `Nombre:`
+		// on this template is the payer, not the counterparty.
+		CounterpartyLabelled: true,
+		ServiceAccount:       optional(text, "Número de cuenta:"),
+		OperationCode:        optional(text, "Código de operación:"),
 	}
 	if err := missing(TemplateServicePayment, map[string]string{
 		"counterparty": out.Counterparty,
