@@ -48,6 +48,16 @@ type Server struct {
 	sources  map[string]SyncTarget
 	storage  Pinger
 
+	// onEvidenceAvailable is called after Evidence has been recorded, and it is
+	// how the pipeline learns there is something to do. Deliberately unnamed
+	// about *which* Evidence and deliberately not about sync: POST /v1/evidence
+	// will call the same callback, and so will anything else that writes an
+	// artifact. It is a notification, not a handoff — the work happens on a
+	// background pass, and this handler does not wait for it (D45).
+	//
+	// Nil is valid and means nothing is listening.
+	onEvidenceAvailable func()
+
 	// syncing guards against two syncs of one Source overlapping — API.md §5
 	// promises a 409 for that, and without it the second one would re-list the
 	// whole mailbox and race the first for every insert.
@@ -55,13 +65,14 @@ type Server struct {
 	syncing map[string]bool
 }
 
-func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, sources map[string]SyncTarget, storage Pinger) *Server {
+func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, sources map[string]SyncTarget, storage Pinger, onEvidenceAvailable func()) *Server {
 	return &Server{
-		ingestor: ingestor,
-		evidence: evidence,
-		sources:  sources,
-		storage:  storage,
-		syncing:  map[string]bool{},
+		ingestor:            ingestor,
+		evidence:            evidence,
+		sources:             sources,
+		storage:             storage,
+		onEvidenceAvailable: onEvidenceAvailable,
+		syncing:             map[string]bool{},
 	}
 }
 
@@ -108,6 +119,12 @@ type syncResponse struct {
 // imply an asynchronous HTTP contract: sync records Evidence, and extraction
 // advances behind it on its own pass. There is no job resource and nothing to
 // poll.
+//
+// The counts it answers with are therefore about *recording*, not about
+// interpreting. A sync that reports three Evidence created has created three
+// artifacts; whether they have become Claims yet is a question for the moment
+// after the pipeline has drained, and the response deliberately does not
+// pretend to answer it.
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	sourceID := r.PathValue("id")
 
@@ -142,6 +159,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, typeInternalError,
 			"The sync did not complete. Evidence recorded before the failure was kept; running it again resumes.")
 		return
+	}
+
+	// Only after a sync that completed. A failed one has left Evidence behind
+	// too — the ingestor keeps what it recorded before the failure — but that
+	// artifact is picked up by the retry tick rather than by a wake, and waking
+	// on a failure would mean every unreachable Source drove the pipeline.
+	if s.onEvidenceAvailable != nil {
+		s.onEvidenceAvailable()
 	}
 
 	writeJSON(w, http.StatusOK, syncResponse{

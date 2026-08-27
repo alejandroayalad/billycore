@@ -1,6 +1,6 @@
 # BillyCore — Decisions
 
-**Last updated:** 2026-08-25
+**Last updated:** 2026-08-26
 
 A running log of decisions that are settled. One entry per decision, newest at the
 bottom, never rewritten in place — a decision that stops being true is **superseded** by
@@ -901,6 +901,55 @@ different name.
 asking "which artifacts produced money?" reads `transaction_evidence`, not
 `processing_stage`. Accepted, and it is the same property `EXTRACTED` already has: 244 rows
 sit there having been extracted into nothing.
+**Source.** Author decision, 2026-08-26.
+
+### D45 — BillyCore runs one background pipeline worker, woken by signal and by a one-minute tick
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** One worker goroutine in the `serve` process advances stored Evidence. It wakes
+at startup, after Evidence has been successfully ingested, and every minute to find retries
+whose backoff has expired. Wake signals are **coalesced**: the channel holds one pending
+wake and the notifier never blocks. Each wake drains extraction and then Transaction
+construction, each until a pass reports zero rows. A pass that fails is logged and does not
+stop the other stage or the worker.
+**Closes.** The scheduling policy ARCHITECTURE.md §5 left unspecified when it described the
+stages: what runs them, how often, and what wakes them.
+**Why.** Three wake sources, because there are exactly three ways work becomes eligible.
+Restarting finds rows mid-pipeline and nobody to announce them, so the worker looks first.
+Ingestion creates work and knows the moment it did, so it says so. A retry falling due is
+the one that nothing can announce — D39's backoff is a timestamp in a column, and the
+instant it passes is not an event — so the tick exists for that and is sized to
+`RetryBase`, the shortest backoff there is. Coalescing is what keeps the first two from
+becoming a concurrency policy: ten syncs are ten notifications and still one drain, because
+a drain that has not started yet already covers everything those ten recorded.
+**Rejected — extraction inside the sync request.** It is the smallest change and it makes
+`POST /sync` return a number about Claims, which is what someone reading the response
+wants. It also makes the response time of a sync a function of how much work it happened to
+create, puts a parser on the request path where a panic is a 500 rather than a failed row,
+and gives `POST /v1/evidence` — one artifact, immediate — the same problem in a worse
+shape. API.md §5 promises a synchronous sync; it promises nothing about interpreting.
+**Rejected — a pass per stage on its own timer.** Independent tickers would run
+reconciliation before the extraction that fed it, so an artifact would take two intervals to
+cross two stages for no reason. Draining in order is one line and removes the question.
+**Rejected — one worker per stage, or a pool.** Both are answers to contention BillyCore
+does not have: one user, one SQLite file, and a corpus that extracts in seconds. The queue
+already tolerates concurrency through leases (D39), so this stays reversible — but adding
+goroutines before there is a wait to justify them is how a single-file daemon acquires a
+scheduler.
+**Consequence — sync counts describe recording, not interpreting.** A sync answers with
+Evidence created and says nothing about Claims. Whether the pipeline has caught up is a
+question for the moment after it drains, and the response deliberately does not pretend to
+answer it.
+**Consequence — the callback is named for the fact, not the caller.** `onEvidenceAvailable`,
+not `onSyncComplete`: `POST /v1/evidence` will call the same one, and so will anything else
+that writes an artifact.
+**Consequence — a failure is logged and retried, never escalated.** The error a pass returns
+is the queue being unreachable or the context ending; a bad artifact is already recorded
+against its own row and backed off. A worker that exited on one would take the pipeline down
+for the life of the process over a database that was briefly locked.
+**Consequence — shutdown cancels the worker before waiting for it.** Cancellation is what
+lets `Extractor` and `Reconciler` release rows they claimed and never attempted, so a
+restart finds them claimable at once instead of waiting out a lease. The wait shares the
+30-second shutdown grace with the HTTP server rather than adding its own.
 **Source.** Author decision, 2026-08-26.
 
 ---

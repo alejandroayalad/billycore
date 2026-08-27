@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,8 +97,24 @@ type stubPinger struct{ err error }
 
 func (s stubPinger) PingContext(context.Context) error { return s.err }
 
-// testServer wires a Server with no database, no network, and no clock.
+// testServer wires a Server with no database, no network, and no clock — and
+// with no pipeline listening, which is what most of these tests are about. That
+// nil is what proves a Server with nobody to notify is a valid Server: every
+// sync below runs through the same branch a daemon with no worker would.
 func testServer(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFetcher, fetcherErr error) http.Handler {
+	t.Helper()
+	return serverWith(t, repo, fetcher, fetcherErr, nil)
+}
+
+// notifyingServer is testServer with the pipeline's wake callback attached, and
+// a count of how many times it fired.
+func notifyingServer(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFetcher, fetcherErr error) (http.Handler, *atomic.Int64) {
+	t.Helper()
+	woken := new(atomic.Int64)
+	return serverWith(t, repo, fetcher, fetcherErr, func() { woken.Add(1) }), woken
+}
+
+func serverWith(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFetcher, fetcherErr error, notify func()) http.Handler {
 	t.Helper()
 	ingestor := &app.Ingestor{
 		Repo:  repo,
@@ -115,7 +132,7 @@ func testServer(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFet
 			},
 		},
 	}
-	return NewServer(ingestor, repo, sources, stubPinger{}).Handler(testToken)
+	return NewServer(ingestor, repo, sources, stubPinger{}, notify).Handler(testToken)
 }
 
 func request(t *testing.T, handler http.Handler, method, path, token string) *httptest.ResponseRecorder {
@@ -186,7 +203,7 @@ func TestHealthzNeedsNoToken(t *testing.T) {
 }
 
 func TestHealthzReportsUnreachableStorage(t *testing.T) {
-	server := NewServer(nil, newStubRepo(), nil, stubPinger{err: errors.New("database is locked")})
+	server := NewServer(nil, newStubRepo(), nil, stubPinger{err: errors.New("database is locked")}, nil)
 	w := request(t, server.Handler(testToken), http.MethodGet, "/healthz", "")
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
@@ -314,6 +331,88 @@ func TestSyncRefusesToOverlapItself(t *testing.T) {
 	// The lock is released when the sync ends, so the next one is served.
 	if again := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken).Code; again != http.StatusOK {
 		t.Errorf("sync after the first finished = %d, want 200", again)
+	}
+}
+
+// --- waking the pipeline -------------------------------------------------
+
+// D45: the handler notifies, it does not process. What the callback must be is
+// cheap and non-blocking; what it must not be is extraction running inside the
+// request that produced the Evidence.
+
+func TestASuccessfulSyncWakesThePipelineOnce(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), &stubFetcher{references: []string{"msg-a", "msg-b"}}, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body)
+	}
+	if got := woken.Load(); got != 1 {
+		t.Errorf("the pipeline was woken %d times, want 1 — once per sync, not once per artifact", got)
+	}
+}
+
+// A sync that recorded nothing new still wakes it. The handler knows how many
+// rows it created, and could stay quiet on zero; it does not, because Evidence
+// left mid-pipeline by an earlier run is exactly what a re-sync is often for,
+// and a wake that finds nothing costs one empty query per stage.
+func TestARepeatedSyncStillWakesThePipeline(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), &stubFetcher{references: []string{"msg-a"}}, nil)
+
+	request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+
+	if got := woken.Load(); got != 2 {
+		t.Errorf("the pipeline was woken %d times across two syncs, want 2", got)
+	}
+}
+
+func TestAFailedSyncDoesNotWakeThePipeline(t *testing.T) {
+	fetcher := &stubFetcher{references: []string{"msg-a"}, fetchErr: errors.New("gmail API returned 500")}
+	handler, woken := notifyingServer(t, newStubRepo(), fetcher, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+	if got := woken.Load(); got != 0 {
+		t.Errorf("a failed sync woke the pipeline %d times, want 0", got)
+	}
+}
+
+func TestAnUnreachableSourceDoesNotWakeThePipeline(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), nil, errors.New("no Gmail credentials"))
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if got := woken.Load(); got != 0 {
+		t.Errorf("an unreachable Source woke the pipeline %d times, want 0", got)
+	}
+}
+
+func TestAnUnconfiguredSourceDoesNotWakeThePipeline(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), &stubFetcher{}, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/hsbc_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+	if got := woken.Load(); got != 0 {
+		t.Errorf("an unconfigured Source woke the pipeline %d times, want 0", got)
+	}
+}
+
+// Every other test in this file runs against a Server with no callback at all,
+// which is the assertion this one only makes explicit: a daemon with no worker
+// serves normally rather than panicking on the first successful sync.
+func TestSyncWithNoPipelineListening(t *testing.T) {
+	handler := testServer(t, newStubRepo(), &stubFetcher{references: []string{"msg-a"}}, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body)
 	}
 }
 
