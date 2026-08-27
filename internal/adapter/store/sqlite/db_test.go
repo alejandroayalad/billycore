@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,8 +43,8 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if userVersion != 3 {
-		t.Errorf("user_version = %d, want 3 after migration 003", userVersion)
+	if userVersion != 4 {
+		t.Errorf("user_version = %d, want 4 after migration 004", userVersion)
 	}
 
 	for _, table := range []string{"evidence", "domain_event"} {
@@ -65,9 +66,15 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 // A table appearing early is a schema nobody has exercised, and
 // DATA_MODEL.md §4 is not a build list.
 //
-// 002 brought the claim tables because M2 writes to them. `transactions` and
-// `transaction_evidence` are specified in §4.5 and §4.6 and still have no code
-// behind them, so they must still be absent.
+// This test asserted the absence of `transactions` and `transaction_evidence`
+// through migrations 002 and 003. It now asserts their presence, because
+// migration 004 arrived with `internal/app/reconcile.go` — the code that writes
+// to them. The rule did not change; the code caught up with the document.
+//
+// What it still asserts is the rule itself, against the next table to be
+// described and not yet written: `reconciliation_candidate`, whose columns
+// DATA_MODEL.md §10 Q1 cannot even name until the domain settles what a
+// candidate references.
 func TestMigrationsCreateNoUnusedTables(t *testing.T) {
 	db, err := Open(testDBPath(t))
 	if err != nil {
@@ -75,12 +82,85 @@ func TestMigrationsCreateNoUnusedTables(t *testing.T) {
 	}
 	defer db.Close()
 
-	for _, table := range []string{"transactions", "transaction_evidence"} {
+	for _, table := range []string{"reconciliation_candidate"} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
 		if err == nil {
 			t.Errorf("table %s exists, and nothing writes to it yet", table)
 		}
+	}
+}
+
+// Migration 004 creates what the Transaction aggregate needs: the row, its
+// provenance to Evidence, and the slot that makes building one idempotent.
+//
+// It exercises the tables rather than only looking them up in sqlite_master. A
+// schema nobody has inserted into is a schema nobody has tested, and the two
+// facts worth proving here are physical: Money's halves are nullable together,
+// and `claim_transaction`'s primary key rejects a second Transaction for one
+// Claim (D41).
+func TestMigration004CreatesTheTransactionTables(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	for _, table := range []string{"transactions", "transaction_evidence", "claim_transaction"} {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name); err != nil {
+			t.Errorf("table %s missing: %v", table, err)
+		}
+	}
+	for _, index := range []string{
+		"idx_transactions_cursor",
+		"idx_transaction_evidence_by_evidence",
+		"idx_claim_transaction_by_transaction",
+	} {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&name); err != nil {
+			t.Errorf("index %s missing: %v", index, err)
+		}
+	}
+
+	// A Transaction with no amount is a legitimate row (DATA_MODEL.md §4.5).
+	// The domain forbids half a Money; the schema deliberately does not, which
+	// is what this asserts — the invariant lives in one place (D6), and it is
+	// not here.
+	if _, err := db.Exec(`
+		INSERT INTO transactions (
+			id, amount_minor, currency, merchant, account_identifier,
+			direction, financial_status, reconciliation_state,
+			occurred_at, created_at, updated_at
+		) VALUES ('tx-1', NULL, NULL, NULL, NULL, 'OUTFLOW', 'UNKNOWN', 'UNRECONCILED',
+			'2026-08-16T23:44:00.000Z', '2026-08-26T12:00:00.000Z', '2026-08-26T12:00:00.000Z')`,
+	); err != nil {
+		t.Fatalf("a Transaction without Money is valid storage: %v", err)
+	}
+
+	// The slot is the natural key. A second Transaction built from one Claim is
+	// the duplicate that puts the same money in the table twice, and the
+	// primary key is what refuses it — not a code path that remembered to look.
+	mustExec(t, db, `INSERT INTO evidence (id, source_id, source_type, source_reference, content_type, raw_content, observed_at, created_at, processing_stage)
+		VALUES ('ev-1', 'gmail_primary', 'EMAIL', 'msg-1', 'message/rfc822', x'00', '2026-08-16T23:44:00.000Z', '2026-08-26T12:00:00.000Z', 'EXTRACTED')`)
+	mustExec(t, db, `INSERT INTO claims (id, state, created_at, updated_at)
+		VALUES ('claim-1', 'ACTIVE', '2026-08-26T12:00:00.000Z', '2026-08-26T12:00:00.000Z')`)
+	mustExec(t, db, `INSERT INTO transaction_evidence (transaction_id, evidence_id) VALUES ('tx-1', 'ev-1')`)
+	mustExec(t, db, `INSERT INTO claim_transaction (claim_id, transaction_id) VALUES ('claim-1', 'tx-1')`)
+
+	mustExec(t, db, `
+		INSERT INTO transactions (id, direction, financial_status, reconciliation_state, occurred_at, created_at, updated_at)
+		VALUES ('tx-2', 'OUTFLOW', 'UNKNOWN', 'UNRECONCILED',
+			'2026-08-16T23:44:00.000Z', '2026-08-26T12:00:00.000Z', '2026-08-26T12:00:00.000Z')`)
+	if _, err := db.Exec(`INSERT INTO claim_transaction (claim_id, transaction_id) VALUES ('claim-1', 'tx-2')`); err == nil {
+		t.Error("a second Transaction for one Claim was accepted; claim_transaction's primary key is the whole idempotency (D41)")
+	}
+}
+
+func mustExec(t *testing.T, db *sql.DB, query string, args ...any) {
+	t.Helper()
+	if _, err := db.Exec(query, args...); err != nil {
+		t.Fatalf("exec: %v", err)
 	}
 }
 

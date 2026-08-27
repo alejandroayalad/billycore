@@ -793,6 +793,116 @@ states anything about settlement, and DOMAIN.md §5's `UNKNOWN` is what the Tran
 defaults to without Billy claiming it. Absence stays distinguishable from belief.
 **Source.** Author decision, 2026-08-26, answering the item D35 left open by name.
 
+### D41 — The natural key of a Transaction is the Claim it was built from
+**Status:** Accepted · 2026-08-26 · Reversibility: moderate — it is a schema constraint
+**Decision.** `claim_transaction (claim_id PRIMARY KEY, transaction_id)`, migration 004.
+`TransactionRepository.Save` takes the originating Claim id, claims the slot with
+`ON CONFLICT DO NOTHING`, and reports `created=false` when it loses. Re-running
+reconciliation writes nothing.
+**Closes.** The question raised on 2026-08-26 at the start of slice 4: slice 3's answer was
+one ACTIVE Claim per Evidence, and the equivalent here is not obvious. Getting it wrong
+duplicates money in a table.
+**Why the Claim rather than the Evidence.** The closed eight-name field vocabulary already
+means one Claim describes exactly one movement, whatever the artifact it came from held.
+Keying on the artifact says instead that one artifact yields at most one Transaction —
+true of all 1,044 emails, and false of the bank statement D27 put in the MVP, which is one
+PDF and forty movements. A constraint that has to be dropped one slice later is not the
+natural key.
+**Why a constraint and not a check.** The same argument D38 made, and the same race: a pass
+runs longer than its one-minute lease, a second pass claims the row, and both build. The
+stage guard does not help — the second `UPDATE` matches no row and the Transaction lands
+anyway. Measured: eight goroutines racing one Claim produce exactly one Transaction and one
+`TransactionCreated`.
+**Rejected — `UNIQUE (evidence_id)` on `transaction_evidence`.** One line, no new table,
+and correct for every artifact in the mailbox. It encodes "one artifact, at most one
+Transaction", which the statement Source breaks.
+**Rejected — a `source_claim_id` column on `transactions`.** Same idempotency with one
+fewer table. It adds a column DATA_MODEL.md §4.5 does not list and a claims→transactions
+foreign key §6's "foreign keys that exist" does not name, so it is a docs change as well as
+a schema one — and it puts an infrastructure fact on the aggregate root.
+**Rejected — a content key of amount, currency, direction and occurred_at.** Two 500 MXN
+transfers to the same person in one minute would become one, and once the `occurred_at`
+fallback lands the 90 card payments derive their time from `observed_at`, so near-identical
+rows would collide by construction. Deciding that two observations are one event is
+DOMAIN.md §6's job, with six signals, not a `UNIQUE` index's.
+**Consequence — a superseding Claim takes a free slot and builds a second Transaction.** A
+fixed parser produces a better Claim, and the Transaction built from the old one is still
+in the table. Retiring it is a decision this slice does not take and does not need; it is
+the price of keying on the interpretation rather than the artifact, and it is the direction
+that leaves the improvement reachable rather than silently skipped.
+**Consequence — `transaction_evidence` carries no uniqueness.** It stays what DATA_MODEL.md
+§4.6 describes: a join table taking no position on how many artifacts support one
+Transaction.
+**Source.** Author decision, 2026-08-26.
+
+### D42 — One ACTIVE Claim produces one Transaction
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** The reconciliation pass builds exactly one Transaction per ACTIVE Claim, born
+`UNRECONCILED`. It merges nothing. Against the corpus that is 800 Claims and 800
+Transactions — 710 today, and the remaining 90 once the `occurred_at` fallback lands.
+**Closes.** The question raised on 2026-08-26: whether reconciliation later merges
+Transactions or Claims.
+**Why.** DOMAIN.md §8's `TransactionReconciled` already speaks of a "surviving
+transactionId", and the API design has used Transaction ids throughout. Merging at build
+time would also put reconciliation logic inside the builder, where DOMAIN.md §6's other
+five signals cannot reach it.
+**Rejected — merge on `tracking_key` at build time.** It reaches 16 of 1,044 artifacts and
+never an inflow, so the two halves of a transfer — the pair it would exist to merge — can
+never be matched by it against this mailbox. D36 already said the key earns its place
+against the second Source, not against this one.
+**Consequence — the two halves of a self-transfer are two Transactions** until
+reconciliation runs. That is the honest state: Billy has two observations and has not yet
+decided they are one event.
+**Consequence — it makes DATA_MODEL.md Q1 answerable**, and does not answer it. A
+reconciliation candidate referencing Transaction ids is now the reading the code supports;
+the entry that settles it is still to be written, with the schema it implies.
+**Source.** Author decision, 2026-08-26.
+
+### D43 — A Transaction whose Claim asserts no status is UNKNOWN
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** Where the Claim carries no `financial_status` field, the Transaction takes
+`UNKNOWN`. 101 of 800 Claims: the 90 card payments and the 11 service payments. The domain
+constructor still *rejects* the empty status — the substitution is the use case's, made
+explicitly, and is not a default hidden inside `NewTransaction`.
+**Closes.** The question raised on 2026-08-26, and the item D40 left standing when it wrote
+that "`UNKNOWN` is what the Transaction defaults to without Billy claiming it" without
+anything yet implementing it.
+**Why.** DOMAIN.md §5 makes `UNKNOWN` a legitimate state precisely for this: Evidence may
+not reveal whether an event is an authorization or a settlement. Recording it is Billy
+saying it looked and cannot tell, which is a fact rather than a gap.
+**Rejected — SETTLED, because all four templates are receipts.** Defensible: a card
+payment email means the payment went through. It records an inference the artifact never
+made, and it makes "Billy could not tell" indistinguishable from "Billy read it" in the one
+column a balance depends on.
+**Rejected — a nullable `financial_status`.** Absence would stay absence, as it does for a
+Claim field. It contradicts DATA_MODEL.md §4.5, where the column is `NOT NULL`, and gives
+`UNKNOWN` a second spelling.
+**Consequence — the constructor rejects `""` and accepts `UNKNOWN`.** A caller that forgot
+the field must not look like one that read the artifact and could not tell.
+**Source.** Author decision, 2026-08-26.
+
+### D44 — RECONCILED means the pipeline is finished with a row, not that it carries a Transaction
+**Status:** Accepted · 2026-08-26 · Reversibility: cheap
+**Decision.** The 244 artifacts that produced no Claim advance from `EXTRACTED` to
+`RECONCILED` carrying nothing. `ReconcileQueue.ClaimForReconciliation` returns them rather
+than filtering them out, and the pass advances them through `MarkReconciled`.
+**Closes.** The question raised on 2026-08-26: whether `RECONCILED` is for every row or
+only for rows that carry a Transaction.
+**Why.** ARCHITECTURE.md §5 is explicit that stage is pipeline position and not domain
+state, and the precedent is already in the code: `MarkExtracted` advances artifacts nothing
+recognised, so that a pass does not re-read all 244 of them forever. The same argument
+applies one stage later, unchanged.
+**Rejected — leaving them at `EXTRACTED`.** It makes the stage column readable as a claim
+about the data, which is the more attractive reading. It also creates a permanent 244-row
+backlog that every reconciliation pass claims, finds nothing in, and releases — so the pass
+needs some other marker to stop re-reading them, which is the stage column under a
+different name.
+**Consequence — a `RECONCILED` row is not evidence that a Transaction exists.** Anything
+asking "which artifacts produced money?" reads `transaction_evidence`, not
+`processing_stage`. Accepted, and it is the same property `EXTRACTED` already has: 244 rows
+sit there having been extracted into nothing.
+**Source.** Author decision, 2026-08-26.
+
 ---
 
 ## Template

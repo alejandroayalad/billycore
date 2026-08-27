@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -157,6 +158,144 @@ func (q *EvidenceQueue) Release(ctx context.Context, evidenceID string, now time
 		evidenceID,
 	); err != nil {
 		return fmt.Errorf("release evidence %s: %w", evidenceID, err)
+	}
+	return nil
+}
+
+// ClaimForReconciliation locks up to limit rows at stage EXTRACTED and returns
+// them with their ACTIVE Claim, where one exists.
+//
+// The lock and the read are one transaction, for the reason
+// ClaimForExtraction gives: the UPDATE is what reserves the row, and a second
+// pass arriving mid-flight finds locked_until in the future and skips it.
+//
+// **A row with no Claim is returned, not filtered out.** 244 of the 1,044
+// stored artifacts carry none, and they still have to leave the queue (D44) —
+// filtering them here would leave them at EXTRACTED and have every later pass
+// re-read them for the life of the database.
+func (q *EvidenceQueue) ClaimForReconciliation(ctx context.Context, limit int, now, lockedUntil time.Time) ([]app.PendingReconciliation, error) {
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("claim for reconciliation: begin: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op once committed
+
+	// The same claim-and-read in one statement as ClaimForExtraction, against
+	// the next stage. observed_at comes back with the row because
+	// DATA_MODEL.md §4.5's fallback needs it and a second query per artifact to
+	// fetch a column this statement already touched would be 90 round trips for
+	// nothing.
+	//
+	// `attempts` increments here, at the moment the row is handed out. It is the
+	// same counter extraction used and it is deliberately not reset between
+	// stages: it counts how many times the pipeline has picked this row up, and
+	// a row that took four attempts to extract and one to reconcile has been
+	// picked up five times. Resetting it would hide a row that is expensive at
+	// both ends, which is the row worth seeing.
+	rows, err := tx.QueryContext(ctx, `
+		UPDATE evidence
+		SET locked_until = ?, attempts = attempts + 1
+		WHERE id IN (
+			SELECT id FROM evidence
+			WHERE processing_stage = ?
+			  AND (locked_until IS NULL OR locked_until <= ?)
+			ORDER BY observed_at, id
+			LIMIT ?
+		)
+		RETURNING id, observed_at, attempts`,
+		formatTime(lockedUntil), stageExtracted, formatTime(now), limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim for reconciliation: %w", err)
+	}
+
+	var pending []app.PendingReconciliation
+	for rows.Next() {
+		var work app.PendingReconciliation
+		var observedAt string
+		if err := rows.Scan(&work.EvidenceID, &observedAt, &work.Attempts); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("claim for reconciliation: scan: %w", err)
+		}
+		work.ObservedAt, err = time.Parse(time.RFC3339, observedAt)
+		if err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("claim for reconciliation: evidence %s: observed_at: %w", work.EvidenceID, err)
+		}
+		pending = append(pending, work)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("claim for reconciliation: iterate: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("claim for reconciliation: close: %w", err)
+	}
+
+	// The Claims, after the cursor is closed rather than during it: SQLite
+	// allows one statement at a time on a connection, and reading a Claim
+	// mid-RETURNING would deadlock against the cursor still holding it.
+	for i := range pending {
+		claimID, err := activeClaimID(ctx, tx, pending[i].EvidenceID)
+		if err != nil {
+			return nil, err
+		}
+		if claimID == "" {
+			continue // an artifact nothing recognised; HasClaim stays false
+		}
+		claim, err := loadClaim(ctx, tx, claimID)
+		if err != nil {
+			return nil, err
+		}
+		pending[i].Claim, pending[i].HasClaim = claim, true
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("claim for reconciliation: commit: %w", err)
+	}
+	return pending, nil
+}
+
+// activeClaimID returns the id of the Claim Billy currently uses for one
+// artifact, or "" where there is none.
+//
+// `evidence_active_claim` is the whole answer: D38 made its primary key the
+// invariant that there is at most one, so this cannot return two and does not
+// need a rule for choosing between them.
+func activeClaimID(ctx context.Context, q querier, evidenceID string) (string, error) {
+	var claimID string
+	err := q.QueryRowContext(ctx, `
+		SELECT claim_id FROM evidence_active_claim WHERE evidence_id = ?`,
+		evidenceID,
+	).Scan(&claimID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("active claim for evidence %s: %w", evidenceID, err)
+	}
+	return claimID, nil
+}
+
+// MarkReconciled advances one row to RECONCILED and drops its lock.
+//
+// It is for artifacts that carry no Claim, and for those whose Transaction some
+// other pass already wrote. The ones this pass builds are advanced inside
+// TransactionRepository.Save, in the same transaction as the Transaction
+// itself, because a stage that moved without the row of money it was supposed
+// to produce is an artifact Billy will never revisit and has nothing to show
+// for.
+//
+// Guarded on the row still being at EXTRACTED: a row some other pass already
+// advanced is left alone rather than re-advanced.
+func (q *EvidenceQueue) MarkReconciled(ctx context.Context, evidenceID string, now time.Time) error {
+	if _, err := q.db.ExecContext(ctx, `
+		UPDATE evidence
+		SET processing_stage = ?, locked_until = NULL, last_error = NULL
+		WHERE id = ? AND processing_stage = ?`,
+		stageReconciled, evidenceID, stageExtracted,
+	); err != nil {
+		return fmt.Errorf("mark evidence %s reconciled: %w", evidenceID, err)
 	}
 	return nil
 }

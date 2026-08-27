@@ -203,3 +203,96 @@ type ClaimRepository interface {
 	// property the same way, or it does not have it.
 	Save(ctx context.Context, c domain.Claim, now time.Time) (bool, error)
 }
+
+// PendingReconciliation is one Evidence row claimed for reconciliation,
+// together with the interpretation Billy currently holds of it.
+//
+// It carries the ACTIVE Claim rather than a claim id, because the pass builds a
+// Transaction out of the Claim's own values and a second round trip per row to
+// fetch them would be a query per artifact for no benefit — the store already
+// had to join to find the Claim at all.
+//
+// **HasClaim may be false**, and that is an ordinary row rather than an error.
+// 244 of the 1,044 stored artifacts produced no Claim: contact notifications,
+// card-limit changes, statement notices and marketing. They reached EXTRACTED
+// and will never carry a Transaction, and they still have to leave the queue
+// (D44).
+type PendingReconciliation struct {
+	EvidenceID string
+
+	// ObservedAt is when the Source received the artifact, and it is here for
+	// one reason: DATA_MODEL.md §4.5's fallback. Where the Claim states no
+	// occurred_at — all 90 card payments — the Transaction takes the earliest
+	// observed_at of its supporting Evidence, computed before the write and
+	// never inside a query.
+	ObservedAt time.Time
+
+	Claim    domain.Claim
+	HasClaim bool
+
+	// Attempts is how many times this row has been handed out for
+	// reconciliation, including this time. Same contract as
+	// PendingEvidence.Attempts: the store keeps the count, the use case owns
+	// the backoff policy computed from it.
+	Attempts int
+}
+
+// ReconcileQueue is the third stage's end of the durable work queue
+// (ARCHITECTURE.md §5, DATA_MODEL.md §7).
+//
+// It is a separate port from EvidenceQueue even though one adapter type
+// satisfies both, because they are consumed by different use cases and a port
+// belongs where it is consumed (D6). Merging them would hand the extraction
+// pass a method for advancing rows past a stage it does not own.
+type ReconcileQueue interface {
+	// ClaimForReconciliation locks up to limit Evidence rows at stage
+	// EXTRACTED and returns them with their ACTIVE Claim, where one exists.
+	// The lock lapses at lockedUntil, which is what makes a crashed pass
+	// recoverable without an operator releasing anything by hand.
+	ClaimForReconciliation(ctx context.Context, limit int, now, lockedUntil time.Time) ([]PendingReconciliation, error)
+
+	// MarkReconciled advances one row to stage RECONCILED and releases its
+	// lock.
+	//
+	// It is called for artifacts that carry no Claim as well as for those whose
+	// Transaction failed to be written by someone else. Stage is pipeline
+	// position, not a claim about the data (ARCHITECTURE.md §5): a RECONCILED
+	// row means the pipeline is finished with it, not that a Transaction
+	// exists (D44). Leaving the 244 claimless rows at EXTRACTED would have
+	// every later pass re-read them forever.
+	MarkReconciled(ctx context.Context, evidenceID string, now time.Time) error
+
+	// RecordFailure stores why an attempt failed and backs the row off until
+	// retryAt. The stage does not move — retry is not a processing stage
+	// (DATA_MODEL.md §7). `reason` is already redacted.
+	RecordFailure(ctx context.Context, evidenceID, reason string, retryAt time.Time) error
+
+	// Release drops a lock without advancing the stage and without recording a
+	// failure, for work abandoned before it was attempted.
+	Release(ctx context.Context, evidenceID string, now time.Time) error
+}
+
+// TransactionRepository stores Transactions.
+type TransactionRepository interface {
+	// Save records a Transaction — the row and its provenance links — writes
+	// the TransactionCreated event of DOMAIN.md §8, claims the slot that makes
+	// this idempotent, and advances the Evidence it rests on to stage
+	// RECONCILED. All of it in one transaction, for the reason
+	// ClaimRepository.Save gives: an event describing a change that did not
+	// commit is a lie about the domain, and Evidence marked RECONCILED whose
+	// Transaction rolled back is a worse one.
+	//
+	// `sourceClaimID` is the Claim this Transaction was built from, and it is a
+	// parameter rather than a field on the Transaction on purpose. A
+	// Transaction's provenance is to Evidence (DOMAIN.md §4) and lives in
+	// transaction_evidence; which Claim produced it is an infrastructure fact
+	// about which pass won a race, and it belongs in the slot table
+	// `claim_transaction` and nowhere in the domain (D41).
+	//
+	// It reports whether a Transaction was created. A false with a nil error
+	// means this Claim already has one and nothing was written — the same
+	// contract EvidenceRepository.Insert and ClaimRepository.Save offer, and it
+	// comes from the same place: a constraint, not a check the code remembered
+	// to perform.
+	Save(ctx context.Context, t domain.Transaction, sourceClaimID string, now time.Time) (bool, error)
+}

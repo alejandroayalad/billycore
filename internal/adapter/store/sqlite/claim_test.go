@@ -279,21 +279,35 @@ func TestMarkExtractedAdvancesAndReleaseDoesNot(t *testing.T) {
 	}
 }
 
-// Migration 003's tables are not this slice's business, and there is a test
-// asserting their absence. This is the other half of that: nothing here creates
-// them by accident.
-func TestExtractionCreatesNoTransactionTables(t *testing.T) {
+// Extraction writes no Transaction. The tables exist now — migration 004
+// brought them with the reconciliation pass — so the assertion moved from
+// "these tables are absent" to the thing it was always protecting: extraction
+// is one stage, it produces a Claim, and a financial event is the next stage's
+// to record.
+//
+// The distinction is not academic. A Claim is an interpretation and may be
+// wrong, superseded or rejected; a Transaction is Billy asserting that money
+// moved. Collapsing the two would put an unreviewed parse straight into the
+// table the success criterion is about.
+func TestExtractionWritesNoTransaction(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
 	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
-	for _, table := range []string{"transactions", "transaction_evidence"} {
-		var name string
-		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`, table).Scan(&name)
-		if err == nil {
-			t.Errorf("%s exists; it belongs to migration 003", table)
+	for _, table := range []string{"transactions", "transaction_evidence", "claim_transaction"} {
+		var rows int
+		if err := db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&rows); err != nil {
+			t.Fatalf("count %s: %v", table, err)
 		}
+		if rows != 0 {
+			t.Errorf("%s holds %d rows after extraction; a Transaction is the reconciliation pass's to write", table, rows)
+		}
+	}
+	// And the stage stops at EXTRACTED. Advancing further here would hand the
+	// reconciliation pass an artifact it never saw.
+	if stage := readStage(t, db, "ev-1"); stage != stageExtracted {
+		t.Errorf("stage = %q, want EXTRACTED", stage)
 	}
 }
 

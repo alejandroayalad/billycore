@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -194,4 +195,144 @@ func appendClaimActivated(ctx context.Context, tx *sql.Tx, c domain.Claim, now t
 		return fmt.Errorf("%s: %w", eventClaimActivated, err)
 	}
 	return nil
+}
+
+// querier is what loadClaim needs: the read half of *sql.DB and *sql.Tx alike,
+// so a Claim can be read inside someone else's transaction or outside one.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// loadClaim reads one Claim back into the domain: the row, its provenance and
+// its fields.
+//
+// **It rehydrates through the domain constructor and the ordinary transition,**
+// rather than assembling a Claim struct directly — which the domain does not
+// permit anyway, and should not. Everything in the database was validated on
+// the way in, but a schema with no CHECK constraints (migration 002, by design)
+// means the database is not what makes it valid; domain.NewClaim is. A row hand-
+// edited to say `direction = 'SIDEWAYS'` fails here instead of becoming a
+// Transaction.
+//
+// PROPOSED and then Activate rather than constructing at ACTIVE, so that
+// created_at and updated_at both survive the round trip. Constructing at ACTIVE
+// would set updated_at to created_at and quietly lose the difference for any
+// Claim that was activated later than it was proposed — which a Claim arriving
+// through POST /v1/claims may well be (D11, D12).
+//
+// It reads only ACTIVE Claims, because the only caller finds them through
+// `evidence_active_claim`, and it says so rather than assuming it.
+func loadClaim(ctx context.Context, q querier, claimID string) (domain.Claim, error) {
+	var state, createdAt, updatedAt string
+	err := q.QueryRowContext(ctx, `
+		SELECT state, created_at, updated_at FROM claims WHERE id = ?`,
+		claimID,
+	).Scan(&state, &createdAt, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The foreign key from evidence_active_claim makes this unreachable
+		// short of corruption, which is exactly when a clear error matters.
+		return domain.Claim{}, fmt.Errorf("load claim %s: no such claim", claimID)
+	}
+	if err != nil {
+		return domain.Claim{}, fmt.Errorf("load claim %s: %w", claimID, err)
+	}
+	if domain.ClaimState(state) != domain.ClaimActive {
+		return domain.Claim{}, fmt.Errorf("load claim %s: state is %s, and only an ACTIVE claim is loaded here", claimID, state)
+	}
+
+	created, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return domain.Claim{}, fmt.Errorf("load claim %s: created_at: %w", claimID, err)
+	}
+	updated, err := time.Parse(time.RFC3339, updatedAt)
+	if err != nil {
+		return domain.Claim{}, fmt.Errorf("load claim %s: updated_at: %w", claimID, err)
+	}
+
+	evidenceIDs, err := loadClaimProvenance(ctx, q, claimID)
+	if err != nil {
+		return domain.Claim{}, err
+	}
+	fields, err := loadClaimFields(ctx, q, claimID)
+	if err != nil {
+		return domain.Claim{}, err
+	}
+
+	proposed, err := domain.NewClaim(claimID, domain.ClaimProposed, evidenceIDs, fields, created)
+	if err != nil {
+		return domain.Claim{}, fmt.Errorf("load claim %s: %w", claimID, err)
+	}
+	active, err := proposed.Activate(updated)
+	if err != nil {
+		return domain.Claim{}, fmt.Errorf("load claim %s: activate: %w", claimID, err)
+	}
+	return active, nil
+}
+
+func loadClaimProvenance(ctx context.Context, q querier, claimID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT evidence_id FROM claim_evidence WHERE claim_id = ? ORDER BY evidence_id`,
+		claimID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load claim %s: provenance: %w", claimID, err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("load claim %s: provenance: %w", claimID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load claim %s: provenance: %w", claimID, err)
+	}
+	return ids, nil
+}
+
+func loadClaimFields(ctx context.Context, q querier, claimID string) (map[domain.FieldName]domain.ClaimField, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT field_name, value_int, value_text, confidence
+		FROM claim_fields WHERE claim_id = ?`,
+		claimID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load claim %s: fields: %w", claimID, err)
+	}
+	defer rows.Close()
+
+	fields := map[domain.FieldName]domain.ClaimField{}
+	for rows.Next() {
+		var name, confidence string
+		var valueInt sql.NullInt64
+		var valueText sql.NullString
+		if err := rows.Scan(&name, &valueInt, &valueText, &confidence); err != nil {
+			return nil, fmt.Errorf("load claim %s: fields: %w", claimID, err)
+		}
+		// The CHECK in migration 002 guarantees exactly one of the two is
+		// present. Which one it is decides the field's shape, and NewIntField /
+		// NewTextField re-apply the domain's rules to it.
+		var field domain.ClaimField
+		switch {
+		case valueInt.Valid:
+			field, err = domain.NewIntField(valueInt.Int64, domain.Confidence(confidence))
+		case valueText.Valid:
+			field, err = domain.NewTextField(valueText.String, domain.Confidence(confidence))
+		default:
+			err = errors.New("neither an integer nor a text value")
+		}
+		if err != nil {
+			// The field name is safe to log; the value is not (SECURITY.md §10).
+			return nil, fmt.Errorf("load claim %s: field %s: %w", claimID, name, err)
+		}
+		fields[domain.FieldName(name)] = field
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load claim %s: fields: %w", claimID, err)
+	}
+	return fields, nil
 }
