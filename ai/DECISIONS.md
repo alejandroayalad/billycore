@@ -1,6 +1,6 @@
 # BillyCore — Decisions
 
-**Last updated:** 2026-08-26
+**Last updated:** 2026-08-28
 
 A running log of decisions that are settled. One entry per decision, newest at the
 bottom, never rewritten in place — a decision that stops being true is **superseded** by
@@ -951,6 +951,169 @@ lets `Extractor` and `Reconciler` release rows they claimed and never attempted,
 restart finds them claimable at once instead of waiting out a lease. The wait shares the
 30-second shutdown grace with the HTTP server rather than adding its own.
 **Source.** Author decision, 2026-08-26.
+
+### D46 — One Evidence has one active interpretation containing one or many Claims
+**Status:** Accepted · 2026-08-26 · Reversibility: bounded
+**Supersedes.** D38's one-ACTIVE-Claim-per-Evidence cardinality. D38's actual invariant —
+one interpretation Billy currently uses, selected by a database constraint rather than a
+code-path check — remains.
+**Decision.** Deterministic extraction produces one complete interpretation of an
+Evidence artifact. That interpretation contains one or many Claims, and every Claim still
+describes exactly one financial movement. An email interpretation normally contains one
+Claim; a statement interpretation contains one Claim per statement movement. At most one
+complete interpretation of an Evidence artifact is ACTIVE at a time.
+**Closes.** The blocker exposed when statement ingestion reached D38: one PDF is one
+immutable Evidence artifact and may contain tens of movements, while
+`evidence_active_claim (evidence_id PRIMARY KEY, claim_id)` permits only one of them to be
+active.
+**Why.** The unit received from the Source and the unit of financial meaning are not the
+same thing. Evidence preserves the source artifact verbatim; a Claim states one belief
+about one movement. Making either pretend to be the other loses a property BillyCore
+depends on: splitting a PDF into invented Evidence weakens provenance, while putting a
+whole statement into one Claim requires repeated values in a vocabulary deliberately
+shaped as one amount, one direction and one event time.
+**Rejected — one Claim for the complete statement.** It avoids a schema change and breaks
+the Claim aggregate: `amount_minor`, `direction`, `merchant` and `occurred_at` would need
+arrays, and one Claim would then produce many Transactions despite D42's one-movement
+meaning.
+**Rejected — independently activate Claims under `(evidence_id, row_key)`.** Smaller than
+an interpretation boundary, but it makes a parser's row numbering part of identity and
+allows a corrected extraction to leave a mixture of old and new rows active. A line
+number is not stable when a parser begins ignoring a heading, joins a wrapped row, or
+splits a row it previously misread.
+**Consequence — activation is atomic at the interpretation boundary.** Extraction
+validates and writes the complete Claim set, activates it, and advances the Evidence to
+`EXTRACTED` in one database transaction. If any Claim fails, no partial interpretation is
+active and the Evidence remains retryable. Re-extraction replaces the complete active
+interpretation rather than updating Claims in place.
+**Consequence — D38's table and the extraction port must change.**
+`evidence_active_claim` cannot be widened with a composite primary key and called done;
+the database needs an explicit interpretation boundary, and `Interpreter` and
+`ClaimRepository.Save` must carry a set rather than one field map and one Claim. The
+constraint selecting one active interpretation remains the authority on idempotency.
+**Consequence — Transaction construction remains Claim-shaped.** D41 and D42 survive:
+each ACTIVE Claim still owns one Transaction slot and produces one Transaction. The
+reconciliation queue must enumerate all Claims in the active interpretation rather than
+joining an Evidence row to a singular Claim.
+**Open — set-level supersession must not invent row lineage.** The existing
+`superseded_by_claim_id` points one old Claim at one replacement. Two interpretation sets
+may have different sizes after a parser fix, so there is not necessarily an honest
+one-to-one mapping. The schema slice must decide how set-level supersession is recorded
+before changing that column or assigning replacement Claims by position.
+**Source.** Author decision, 2026-08-26.
+
+### D47 — An interpretation carries explicit supersession lineage
+**Status:** Accepted · 2026-08-28 · Reversibility: bounded — it is a schema change
+**Decision.** Migration 005 replaces `evidence_active_claim` with three tables:
+`interpretations (id, evidence_id, superseded_by_interpretation_id, created_at)`,
+`interpretation_claims (interpretation_id, claim_id)` as membership, and
+`evidence_active_interpretation (evidence_id PRIMARY KEY, interpretation_id)`.
+`superseded_by_interpretation_id` points from the old set to the new one, the same
+direction `claims.superseded_by_claim_id` already reads.
+**Closes.** The item D46 left open — how set-level supersession is recorded without
+inventing row lineage.
+**Why.** Two questions have to be answerable from the schema rather than reconstructed:
+*what does Billy believe now* — `evidence_active_interpretation` — and *what did Billy
+believe before* — the `superseded_by_interpretation_id` chain. Recording lineage at the
+set level is honest where per-row lineage is not: two interpretations of one statement may
+contain different numbers of Claims after a parser fix, and there is no truthful one-to-one
+mapping between forty rows and thirty-eight. Without the pointer, an artifact accumulates
+undifferentiated Claim sets whose order has to be inferred from timestamps.
+**Rejected — membership as an `interpretation_id` column on `claims`.** One table fewer,
+and it makes membership a property of the Claim rather than a join. It forces every Claim
+to be born into a set, so `POST /v1/claims` would have to mint an interpretation id for an
+outside proposer offering a single Claim. The join table keeps D38's property intact: a
+`PROPOSED` Claim takes no slot anywhere and collides with nothing until it is activated.
+**Rejected — per-Claim lineage alone, using the existing column.** It needs no new schema.
+Investigated on 2026-08-28 and found to be a reserved seat: `Claim.SupersededByClaim` has
+no call site outside `internal/domain`, and `superseded_by_claim_id` is NULL on every row
+ever written, because D37 means each Claim is born `PROPOSED` and activated in the same
+transaction and nothing transitions one to `SUPERSEDED`. Making it the only lineage would
+require assigning replacements by position, which is exactly the invention D46 forbade.
+**Consequence — `claims.superseded_by_claim_id` stays, and stays unused.** It remains in
+DATA_MODEL.md §4.2 and in API.md's `supersedes` / `superseded_by`. Set-level supersession
+does not write it; a future outside proposer replacing one Claim one-for-one still can.
+**Consequence — the invariant survives unchanged, one level up.** The primary key on
+`evidence_active_interpretation(evidence_id)` is D38's rule restated: at most one live
+reading of one artifact, enforced by a constraint rather than by a code path that remembers
+to check. Idempotency keeps working the way M1's ingestion does.
+**Consequence — three code sites move.** `activeClaimID` (`queue.go:265`) becomes a join
+returning every Claim in the active interpretation, `ClaimRepository.Save` (`claim.go:116`)
+takes a Claim set and claims the interpretation slot once, and `Interpreter.Interpret`
+returns a slice of field maps rather than one. Activation stays atomic at the
+interpretation boundary, as D46 requires.
+**Source.** Author decision, 2026-08-28.
+
+### D48 — Re-extraction reprocesses immutable Evidence by resetting its stage
+**Status:** Accepted · 2026-08-28 · Reversibility: cheap
+**Decision.** Re-extraction resets `processing_stage` from `EXTRACTED` or `RECONCILED`
+back to `RECEIVED`, and does nothing else to the row. `PendingExtraction` then hands the
+artifact out again and the fixed parser produces a new interpretation, which supersedes the
+old one under D47.
+**Closes.** The gap found on 2026-08-28: there was no re-extraction path at all. A parser
+fix left every already-extracted artifact holding its old Claims permanently, with no route
+back short of editing the database by hand — and `ClaimRepository.Save` would have refused
+the better interpretation anyway, rolling it back on the active-slot conflict.
+**Why.** `processing_stage` is pipeline position, not domain state — ARCHITECTURE.md §5
+says so and D44 rests on the same distinction. "Process this artifact again" is the only
+thing that column exists to express, so re-extraction needs no new mechanism. Evidence
+itself is untouched: the bytes are what Billy received (D7, D10, AGENTS.md §3.3), and
+understanding them better is not a claim that something different arrived.
+**Rejected — an extraction job or parser-version system.** A recorded parser version per
+interpretation would make re-extraction selective: reprocess only the artifacts an outdated
+parser touched. It is the right answer once there are several parsers changing at different
+rates, and it is scope the MVP has not earned. The stage reset is reversible into it later,
+because D47's lineage already records which interpretation came from which pass.
+**Consequence — re-extraction is all-or-nothing per artifact set chosen by the operator.**
+There is no parser-version filter, so the selection is whatever query resets the stage.
+Against the present corpus a full re-extraction is 1,044 artifacts.
+**Consequence — the trigger is not yet built.** Nothing exposes this. Whether it is a
+`billycore reextract` subcommand, a `/v1` route, or SQL run by hand is a slice of its own,
+and the constraint on it is SECURITY.md's: resetting a stage must never be reachable
+without the bearer token.
+**Source.** Author decision, 2026-08-28.
+
+### D49 — A Transaction has its own lifecycle; superseded is not a reconciliation state
+**Status:** Accepted · 2026-08-28 · Reversibility: bounded — it is a schema change
+**Decision.** `transactions` gains `transaction_state` — `ACTIVE` or `SUPERSEDED` — and
+`superseded_by_transaction_id`. When an interpretation is superseded, the Transactions
+built from its Claims move to `SUPERSEDED` and point at their replacements.
+`GET /v1/transactions` returns `ACTIVE` rows only.
+**Closes.** What D41 deferred: *"a superseding Claim takes a free slot and builds a second
+Transaction... Retiring it is a decision this slice does not take and does not need."* D48
+makes it needed.
+**Why.** Each column answers one question. `reconciliation_state` answers "have two
+observations been determined to be the same event?"; `financial_status` answers "what
+happened to the money?"; the two were deliberately kept apart, and `ReconciliationState`'s
+own doc comment gives the reason. "Is this still Billy's current representation?" is a
+third question and takes a third column.
+**Rejected — `reconciliation_state = SUPERSEDED`.** No new column, and it reads plausibly.
+It makes `SUPERSEDED` an alternative to `UNRECONCILED` and `RECONCILED`, which it is not: a
+superseded Transaction either had been reconciled or had not, and that stays true after it
+stops being current. It is the same collapse `ReconciliationState` was split from
+`FinancialStatus` to avoid, made a second time in the same table.
+**Rejected — deleting the Transaction.** The rule that governs Claims governs this:
+nothing supporting a financial fact disappears because something better arrived
+(DATA_MODEL.md §6, DOMAIN.md §4). A deleted Transaction also destroys the only record that
+the number in last month's table used to be different.
+**Consequence — the double count D41 predicted is closed.** `claim_transaction` is keyed on
+`claim_id`, so a re-extraction's new Claims take free slots and build a second full set of
+Transactions. Without this column, re-extracting the corpus would show every transfer
+twice — the failure D41's rejected content-key option was guarding against, arriving
+through a different door.
+**Consequence — every Transaction read filters on `transaction_state`.** The API, the
+terminal table and the web page of D32 all show `ACTIVE` only. A row's absence from that
+view is not evidence it never existed, which is the same property `RECONCILED` already has
+under D44.
+**Open — a Transaction supported by several artifacts cannot be retired this way.** Once an
+email and a statement line both support one Transaction, re-extracting the email does not
+make it obsolete: the statement may still support it. The rule that generalises is closer
+to *recompute the affected Transaction from the currently active Claims* rather than
+*supersede one-for-one*. It does not block this entry, because D41 and D42 mean one ACTIVE
+Claim owns exactly one Transaction today, so one-for-one retirement is correct for every
+Transaction Billy can currently build. It has to be answered before reconciliation merges
+anything.
+**Source.** Author decision, 2026-08-28.
 
 ---
 
