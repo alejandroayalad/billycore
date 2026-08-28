@@ -60,52 +60,58 @@ func (q *fakeQueue) RecordFailure(_ context.Context, evidenceID, reason string, 
 }
 
 type fakeClaims struct {
+	// sets holds one entry for each interpretation. saved holds the same Claims
+	// in one list, because most tests here check a Claim.
+	sets  []domain.Interpretation
 	saved []domain.Claim
 	err   error
 
-	// occupied mimics the constraint: an evidence id that already has an active
-	// interpretation cannot get a second one.
-	occupied map[string]bool
+	// occupied copies the constraint. It holds the active interpretation id of
+	// each artifact. A Save that names a different one writes nothing (D47).
+	occupied map[string]string
 }
 
-func (c *fakeClaims) Save(_ context.Context, claim domain.Claim, _ time.Time) (bool, error) {
+func (c *fakeClaims) Save(_ context.Context, in domain.Interpretation, _ time.Time) (bool, error) {
 	if c.err != nil {
 		return false, c.err
 	}
-	for _, evidenceID := range claim.EvidenceIDs() {
-		if c.occupied[evidenceID] {
-			return false, nil
-		}
-	}
 	if c.occupied == nil {
-		c.occupied = map[string]bool{}
+		c.occupied = map[string]string{}
 	}
-	for _, evidenceID := range claim.EvidenceIDs() {
-		c.occupied[evidenceID] = true
+	if c.occupied[in.EvidenceID()] != in.Supersedes() {
+		return false, nil
 	}
-	c.saved = append(c.saved, claim)
+	c.occupied[in.EvidenceID()] = in.ID()
+	c.sets = append(c.sets, in)
+	c.saved = append(c.saved, in.Claims()...)
 	return true, nil
 }
 
-// fakeInterpreter answers per artifact, keyed by the bytes it is handed.
+// fakeInterpreter answers for each artifact, by the bytes that it receives.
+// `answers` is the one-Claim shape of a Nu template, and `readings` is the
+// many-Claim shape of a bank statement (D46).
 type fakeInterpreter struct {
-	answers map[string]map[domain.FieldName]domain.ClaimField
-	errs    map[string]error
-	panics  map[string]any
+	answers  map[string]map[domain.FieldName]domain.ClaimField
+	readings map[string][]map[domain.FieldName]domain.ClaimField
+	errs     map[string]error
+	panics   map[string]any
 }
 
-func (i fakeInterpreter) Interpret(raw []byte) (map[domain.FieldName]domain.ClaimField, error) {
+func (i fakeInterpreter) Interpret(raw []byte) ([]map[domain.FieldName]domain.ClaimField, error) {
 	if v, ok := i.panics[string(raw)]; ok {
 		panic(v)
 	}
 	if err, ok := i.errs[string(raw)]; ok {
 		return nil, err
 	}
+	if sets, ok := i.readings[string(raw)]; ok {
+		return sets, nil
+	}
 	fields, ok := i.answers[string(raw)]
 	if !ok {
 		return nil, app.ErrNoInterpretation
 	}
-	return fields, nil
+	return []map[domain.FieldName]domain.ClaimField{fields}, nil
 }
 
 func newExtractor(q *fakeQueue, c *fakeClaims, i fakeInterpreter) *app.Extractor {
@@ -139,6 +145,98 @@ func moneyFields(t *testing.T) map[domain.FieldName]domain.ClaimField {
 }
 
 // --- tests ------------------------------------------------------------------
+
+// The shape of D46 at the use case: one artifact, one reading, many Claims,
+// activated together.
+func TestOneArtifactCanYieldManyClaimsInOneInterpretation(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{{ID: "ev-1", RawContent: []byte("statement")}}}
+	claims := &fakeClaims{}
+	x := newExtractor(queue, claims, fakeInterpreter{
+		readings: map[string][]map[domain.FieldName]domain.ClaimField{
+			"statement": {moneyFields(t), moneyFields(t), moneyFields(t)},
+		},
+	})
+
+	result, err := x.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// One artifact and three movements. The two counts differ, which is why
+	// ClaimsCreated and InterpretationsCreated are separate.
+	if result.EvidenceProcessed != 1 || result.InterpretationsCreated != 1 || result.ClaimsCreated != 3 {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(claims.sets) != 1 {
+		t.Fatalf("wrote %d interpretations, want 1", len(claims.sets))
+	}
+	set := claims.sets[0]
+	if set.EvidenceID() != "ev-1" || len(set.Claims()) != 3 {
+		t.Errorf("set = %s with %d claims, want ev-1 with 3", set.EvidenceID(), len(set.Claims()))
+	}
+	// Each member is ACTIVE and rests on the artifact that it comes from.
+	seen := map[string]bool{}
+	for _, c := range set.Claims() {
+		if c.State() != domain.ClaimActive {
+			t.Errorf("claim %s is %s, want ACTIVE", c.ID(), c.State())
+		}
+		if ids := c.EvidenceIDs(); len(ids) != 1 || ids[0] != "ev-1" {
+			t.Errorf("claim %s provenance = %v, want [ev-1]", c.ID(), ids)
+		}
+		if seen[c.ID()] {
+			t.Errorf("claim id %s was issued twice", c.ID())
+		}
+		seen[c.ID()] = true
+	}
+}
+
+// A re-extraction names the reading that it replaces (D47, D48). The store can
+// then swap one for the other, and not overwrite what it finds.
+func TestAReExtractionNamesTheInterpretationItReplaces(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{
+		{ID: "ev-1", RawContent: []byte("outflow"), ActiveInterpretationID: "interp-1"},
+	}}
+	// The artifact has interp-1. Only a Save that names interp-1 replaces it.
+	claims := &fakeClaims{occupied: map[string]string{"ev-1": "interp-1"}}
+	x := newExtractor(queue, claims, fakeInterpreter{
+		answers: map[string]map[domain.FieldName]domain.ClaimField{"outflow": moneyFields(t)},
+	})
+
+	result, err := x.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.InterpretationsCreated != 1 {
+		t.Fatalf("result = %+v, want the replacement written", result)
+	}
+	if got := claims.sets[0].Supersedes(); got != "interp-1" {
+		t.Errorf("supersedes = %q, want interp-1", got)
+	}
+}
+
+// The other part of the same mechanism. A pass that expects no interpretation
+// loses to the one that exists, and the row still leaves the queue.
+func TestAFirstReadingOfAnAlreadyInterpretedArtifactWritesNothing(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{{ID: "ev-1", RawContent: []byte("outflow")}}}
+	claims := &fakeClaims{occupied: map[string]string{"ev-1": "interp-1"}}
+	x := newExtractor(queue, claims, fakeInterpreter{
+		answers: map[string]map[domain.FieldName]domain.ClaimField{"outflow": moneyFields(t)},
+	})
+
+	result, err := x.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Skipped != 1 || result.ClaimsCreated != 0 {
+		t.Fatalf("result = %+v, want one skip and nothing written", result)
+	}
+	if len(claims.sets) != 0 {
+		t.Errorf("wrote %d interpretations, want none", len(claims.sets))
+	}
+	// Another pass extracted the artifact, so this row still advances.
+	if len(queue.extracted) != 1 || queue.extracted[0] != "ev-1" {
+		t.Errorf("advanced = %v, want [ev-1]", queue.extracted)
+	}
+}
 
 func TestExtractionProducesAnActiveClaimWithProvenance(t *testing.T) {
 	queue := &fakeQueue{pending: []app.PendingEvidence{{ID: "ev-1", RawContent: []byte("outflow")}}}

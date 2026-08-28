@@ -73,18 +73,24 @@ type fakeTransactions struct {
 	occupied map[string]bool
 }
 
-func (r *fakeTransactions) Save(_ context.Context, t domain.Transaction, sourceClaimID string, _ time.Time) (bool, error) {
+func (r *fakeTransactions) Save(_ context.Context, built []app.BuiltTransaction, _ time.Time) (bool, error) {
 	if r.err != nil {
 		return false, r.err
-	}
-	if r.occupied[sourceClaimID] {
-		return false, nil
 	}
 	if r.occupied == nil {
 		r.occupied = map[string]bool{}
 	}
-	r.occupied[sourceClaimID] = true
-	r.saved = append(r.saved, savedTransaction{t, sourceClaimID})
+	// The set is all-or-nothing: one taken slot means the artifact was already
+	// built, and nothing is written.
+	for _, b := range built {
+		if r.occupied[b.SourceClaimID] {
+			return false, nil
+		}
+	}
+	for _, b := range built {
+		r.occupied[b.SourceClaimID] = true
+		r.saved = append(r.saved, savedTransaction{b.Transaction, b.SourceClaimID})
+	}
 	return true, nil
 }
 
@@ -174,8 +180,7 @@ func work(claim domain.Claim, evidenceID string) app.PendingReconciliation {
 	return app.PendingReconciliation{
 		EvidenceID: evidenceID,
 		ObservedAt: seenAt,
-		Claim:      claim,
-		HasClaim:   true,
+		Claims:     []domain.Claim{claim},
 		Attempts:   1,
 	}
 }
@@ -260,7 +265,7 @@ func TestAClaimWithNoFinancialStatusBecomesUnknown(t *testing.T) {
 // them for the life of the database.
 func TestAnArtifactWithNoClaimAdvancesAndProducesNothing(t *testing.T) {
 	queue := &fakeReconcileQueue{pending: []app.PendingReconciliation{
-		{EvidenceID: "ev-1", ObservedAt: seenAt, HasClaim: false, Attempts: 1},
+		{EvidenceID: "ev-1", ObservedAt: seenAt, Attempts: 1},
 	}}
 	transactions := &fakeTransactions{}
 
@@ -368,7 +373,7 @@ func TestAStatedOccurredAtIsNeverReplacedByTheFallback(t *testing.T) {
 func TestTheFallbackDoesNotSubstituteTheZeroTime(t *testing.T) {
 	claim := claimWithout(t, "claim-a", "ev-1", domain.FieldOccurredAt)
 	queue := &fakeReconcileQueue{pending: []app.PendingReconciliation{
-		{EvidenceID: "ev-1", Claim: claim, HasClaim: true, Attempts: 1},
+		{EvidenceID: "ev-1", Claims: []domain.Claim{claim}, Attempts: 1},
 	}}
 	transactions := &fakeTransactions{}
 
@@ -435,7 +440,7 @@ func TestOneUnbuildableClaimDoesNotStopThePass(t *testing.T) {
 	queue := &fakeReconcileQueue{pending: []app.PendingReconciliation{
 		work(claimWithout(t, "claim-a", "ev-1", domain.FieldDirection), "ev-1"),
 		work(activeClaim(t, "claim-b", "ev-2", nil), "ev-2"),
-		{EvidenceID: "ev-3", ObservedAt: seenAt, HasClaim: false},
+		{EvidenceID: "ev-3", ObservedAt: seenAt},
 	}}
 	transactions := &fakeTransactions{}
 

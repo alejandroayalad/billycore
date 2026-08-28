@@ -10,14 +10,10 @@ import (
 	"github.com/alejandroayalad/billycore/internal/app"
 )
 
-// EvidenceQueue moves Evidence rows through the pipeline.
-//
-// It writes the four infrastructure columns DATA_MODEL.md §7 names —
-// processing_stage, attempts, last_error, locked_until — and it is a separate
-// type from EvidenceRepository for the reason §7 gives: those columns are not
-// part of the Evidence domain object, and a repository that returns Evidence
-// must not hand them out as if they were. The artifact itself stays immutable;
-// only its position in the pipeline moves.
+// EvidenceQueue moves Evidence rows through the pipeline. It writes the four
+// columns in DATA_MODEL.md §7: processing_stage, attempts, last_error and
+// locked_until. It is separate from EvidenceRepository, because those columns
+// are not part of the Evidence domain object.
 type EvidenceQueue struct {
 	db *sql.DB
 }
@@ -27,15 +23,9 @@ func NewEvidenceQueue(db *sql.DB) *EvidenceQueue {
 }
 
 // ClaimForExtraction locks up to limit rows at stage RECEIVED and returns them.
-//
-// The claim and the read are one transaction, so two passes cannot take the
-// same row: the UPDATE is what reserves it, and a second pass arriving mid-flight
-// finds locked_until in the future and skips it.
-//
-// A lock that has lapsed is claimable again. That is what makes a killed
-// process recoverable without anyone releasing anything by hand — the row was
-// never modified, only reserved, and Evidence is immutable so there is nothing
-// half-written to repair.
+// The lock and the read are one transaction, so two passes cannot take one row.
+// A lock that ended is available again, which makes a stopped process
+// recoverable without an operator.
 func (q *EvidenceQueue) ClaimForExtraction(ctx context.Context, limit int, now, lockedUntil time.Time) ([]app.PendingEvidence, error) {
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -43,24 +33,11 @@ func (q *EvidenceQueue) ClaimForExtraction(ctx context.Context, limit int, now, 
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
-	// RETURNING gives the claim and the read in one statement, which removes
-	// the window a SELECT-then-UPDATE would leave open between choosing rows
-	// and reserving them.
-	//
-	// The ORDER BY matches idx_evidence_pipeline_scan
-	// (processing_stage, observed_at, id), so this is an index scan rather than
-	// a sort of the whole table (DATA_MODEL.md §5).
-	//
-	// `attempts` increments here — at the moment the row is handed out, not at
-	// the moment something fails. DATA_MODEL.md §7 names "mark processing
-	// attempt" as its own operation; folding it into the claim makes it atomic
-	// with the lock, and it is the only version that survives the failure worth
-	// surviving. A row whose parser takes the whole process down with it — an
-	// OOM, a SIGKILL — never reaches any code that could record a failure, and
-	// if attempts only counted handled ones it would come back at zero forever,
-	// retried on every pass for the rest of the database's life. Counting
-	// hand-outs makes a poisonous artifact visible even when it is never
-	// politely reported.
+	// RETURNING does the lock and the read in one statement. The ORDER BY
+	// matches idx_evidence_pipeline_scan (DATA_MODEL.md §5). The count in
+	// attempts increases when the queue gives out the row, not when work fails:
+	// an artifact that stops the process never reaches code that reports a
+	// failure, and it would return to each pass for ever.
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE evidence
 		SET locked_until = ?, attempts = attempts + 1
@@ -95,21 +72,29 @@ func (q *EvidenceQueue) ClaimForExtraction(ctx context.Context, limit int, now, 
 		return nil, fmt.Errorf("claim evidence: close: %w", err)
 	}
 
+	// Read what Billy believes about each row after the cursor closes, because
+	// SQLite allows one statement at a time on a connection. The value is empty
+	// for a row that no parser has read. It has a value for a row that an
+	// operator reset for re-extraction (D48).
+	for i := range pending {
+		interpretationID, err := activeInterpretationID(ctx, tx, pending[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		pending[i].ActiveInterpretationID = interpretationID
+	}
+
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("claim evidence: commit: %w", err)
 	}
 	return pending, nil
 }
 
-// MarkExtracted advances one row to EXTRACTED and drops its lock.
-//
-// It is for artifacts that produced no Claim. The ones that did are advanced
-// inside ClaimRepository.Save, in the same transaction as the Claim itself,
-// because a stage that moved without the Claim it was supposed to produce is a
-// row Billy will never revisit and has nothing to show for.
-//
-// Guarded on the row still being at RECEIVED: a row some other pass already
-// advanced is left alone rather than re-advanced.
+// MarkExtracted advances one row to stage EXTRACTED and drops its lock. It is
+// for an artifact that gave no Claim: ClaimRepository.Save advances the others
+// with their interpretation, because a row that advances without its Claims is
+// a row that Billy never reads again. The guard on RECEIVED prevents a second
+// advance.
 func (q *EvidenceQueue) MarkExtracted(ctx context.Context, evidenceID string, now time.Time) error {
 	if _, err := q.db.ExecContext(ctx, `
 		UPDATE evidence
@@ -122,17 +107,10 @@ func (q *EvidenceQueue) MarkExtracted(ctx context.Context, evidenceID string, no
 	return nil
 }
 
-// RecordFailure stores a redacted reason and backs the row off until retryAt.
-//
-// The stage is untouched and the artifact is untouched. All that moves is
-// last_error and locked_until — attempts already moved when the row was claimed.
-// DATA_MODEL.md §7: retry is not a processing stage, and Evidence that failed
-// extraction stays exactly where and what it was.
-//
-// `reason` arrives already redacted and is stored verbatim. Nothing here adds to
-// it: this layer holds the artifact, and a store that enriched a diagnostic with
-// what it knows about the row is how raw_content ends up in a column it was
-// never supposed to reach (SECURITY.md §10).
+// RecordFailure stores a redacted reason and delays the row until retryAt. The
+// stage and the artifact do not change, because retry is not a processing stage
+// (DATA_MODEL.md §7). It stores `reason` without change: a store that added
+// what it knows would put raw_content in a column (SECURITY.md §10).
 func (q *EvidenceQueue) RecordFailure(ctx context.Context, evidenceID, reason string, retryAt time.Time) error {
 	if _, err := q.db.ExecContext(ctx, `
 		UPDATE evidence
@@ -140,18 +118,16 @@ func (q *EvidenceQueue) RecordFailure(ctx context.Context, evidenceID, reason st
 		WHERE id = ?`,
 		reason, formatTime(retryAt), evidenceID,
 	); err != nil {
-		// The reason is redacted, but it is not this function's to re-emit —
-		// the caller already has it and the row now holds it.
+		// Do not repeat the reason here. The caller has it, and the row holds
+		// it.
 		return fmt.Errorf("record failure for evidence %s: %w", evidenceID, err)
 	}
 	return nil
 }
 
-// Release drops a lock without advancing the stage.
-//
-// The row stays at RECEIVED. Retry is not a processing stage (DATA_MODEL.md
-// §7): a failed extraction leaves the artifact exactly where it was, and
-// attempts, last_error and locked_until carry the retry behaviour instead.
+// Release drops a lock and does not advance the stage. The row stays at
+// RECEIVED, because retry is not a processing stage (DATA_MODEL.md §7). The
+// columns attempts, last_error and locked_until hold the retry state.
 func (q *EvidenceQueue) Release(ctx context.Context, evidenceID string, now time.Time) error {
 	if _, err := q.db.ExecContext(ctx, `
 		UPDATE evidence SET locked_until = NULL WHERE id = ?`,
@@ -163,16 +139,10 @@ func (q *EvidenceQueue) Release(ctx context.Context, evidenceID string, now time
 }
 
 // ClaimForReconciliation locks up to limit rows at stage EXTRACTED and returns
-// them with their ACTIVE Claim, where one exists.
-//
-// The lock and the read are one transaction, for the reason
-// ClaimForExtraction gives: the UPDATE is what reserves the row, and a second
-// pass arriving mid-flight finds locked_until in the future and skips it.
-//
-// **A row with no Claim is returned, not filtered out.** 244 of the 1,044
-// stored artifacts carry none, and they still have to leave the queue (D44) —
-// filtering them here would leave them at EXTRACTED and have every later pass
-// re-read them for the life of the database.
+// each with the Claims of its active interpretation. The lock and the read are
+// one transaction, for the reason that ClaimForExtraction gives. It returns a
+// row that has no Claims: 244 artifacts have none, and they must leave the
+// queue (D44).
 func (q *EvidenceQueue) ClaimForReconciliation(ctx context.Context, limit int, now, lockedUntil time.Time) ([]app.PendingReconciliation, error) {
 	tx, err := q.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -180,18 +150,10 @@ func (q *EvidenceQueue) ClaimForReconciliation(ctx context.Context, limit int, n
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
-	// The same claim-and-read in one statement as ClaimForExtraction, against
-	// the next stage. observed_at comes back with the row because
-	// DATA_MODEL.md §4.5's fallback needs it and a second query per artifact to
-	// fetch a column this statement already touched would be 90 round trips for
-	// nothing.
-	//
-	// `attempts` increments here, at the moment the row is handed out. It is the
-	// same counter extraction used and it is deliberately not reset between
-	// stages: it counts how many times the pipeline has picked this row up, and
-	// a row that took four attempts to extract and one to reconcile has been
-	// picked up five times. Resetting it would hide a row that is expensive at
-	// both ends, which is the row worth seeing.
+	// The same lock and read as ClaimForExtraction, for the next stage. The row
+	// carries observed_at, because the fallback in DATA_MODEL.md §4.5 needs it.
+	// The count in attempts does not reset between stages: it counts how many
+	// times the pipeline gave out this row, at any stage.
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE evidence
 		SET locked_until = ?, attempts = attempts + 1
@@ -232,22 +194,21 @@ func (q *EvidenceQueue) ClaimForReconciliation(ctx context.Context, limit int, n
 		return nil, fmt.Errorf("claim for reconciliation: close: %w", err)
 	}
 
-	// The Claims, after the cursor is closed rather than during it: SQLite
-	// allows one statement at a time on a connection, and reading a Claim
-	// mid-RETURNING would deadlock against the cursor still holding it.
+	// Read the Claims after the cursor closes. SQLite allows one statement at a
+	// time on a connection, so a read during RETURNING would block against the
+	// open cursor.
 	for i := range pending {
-		claimID, err := activeClaimID(ctx, tx, pending[i].EvidenceID)
+		claimIDs, err := activeClaimIDs(ctx, tx, pending[i].EvidenceID)
 		if err != nil {
 			return nil, err
 		}
-		if claimID == "" {
-			continue // an artifact nothing recognised; HasClaim stays false
+		for _, claimID := range claimIDs {
+			claim, err := loadClaim(ctx, tx, claimID)
+			if err != nil {
+				return nil, err
+			}
+			pending[i].Claims = append(pending[i].Claims, claim)
 		}
-		claim, err := loadClaim(ctx, tx, claimID)
-		if err != nil {
-			return nil, err
-		}
-		pending[i].Claim, pending[i].HasClaim = claim, true
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -256,38 +217,61 @@ func (q *EvidenceQueue) ClaimForReconciliation(ctx context.Context, limit int, n
 	return pending, nil
 }
 
-// activeClaimID returns the id of the Claim Billy currently uses for one
-// artifact, or "" where there is none.
-//
-// `evidence_active_claim` is the whole answer: D38 made its primary key the
-// invariant that there is at most one, so this cannot return two and does not
-// need a rule for choosing between them.
-func activeClaimID(ctx context.Context, q querier, evidenceID string) (string, error) {
-	var claimID string
+// activeInterpretationID returns the reading that Billy uses for one artifact,
+// or "" if no parser has read it. The primary key of
+// evidence_active_interpretation allows one row for each artifact (D38, D47),
+// so this function needs no rule to choose between two readings.
+func activeInterpretationID(ctx context.Context, q querier, evidenceID string) (string, error) {
+	var interpretationID string
 	err := q.QueryRowContext(ctx, `
-		SELECT claim_id FROM evidence_active_claim WHERE evidence_id = ?`,
+		SELECT interpretation_id FROM evidence_active_interpretation WHERE evidence_id = ?`,
 		evidenceID,
-	).Scan(&claimID)
+	).Scan(&interpretationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("active claim for evidence %s: %w", evidenceID, err)
+		return "", fmt.Errorf("active interpretation for evidence %s: %w", evidenceID, err)
 	}
-	return claimID, nil
+	return interpretationID, nil
 }
 
-// MarkReconciled advances one row to RECONCILED and drops its lock.
-//
-// It is for artifacts that carry no Claim, and for those whose Transaction some
-// other pass already wrote. The ones this pass builds are advanced inside
-// TransactionRepository.Save, in the same transaction as the Transaction
-// itself, because a stage that moved without the row of money it was supposed
-// to produce is an artifact Billy will never revisit and has nothing to show
-// for.
-//
-// Guarded on the row still being at EXTRACTED: a row some other pass already
-// advanced is left alone rather than re-advanced.
+// activeClaimIDs returns each Claim in the active interpretation of the
+// artifact. It returns one row for an email, and one row for each movement of a
+// statement (D46). No code depends on the order by claim id, but a stable order
+// makes a test fail in the same way each time.
+func activeClaimIDs(ctx context.Context, q querier, evidenceID string) ([]string, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT ic.claim_id
+		FROM evidence_active_interpretation eai
+		JOIN interpretation_claims ic ON ic.interpretation_id = eai.interpretation_id
+		WHERE eai.evidence_id = ?
+		ORDER BY ic.claim_id`,
+		evidenceID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("active claims for evidence %s: %w", evidenceID, err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("active claims for evidence %s: %w", evidenceID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("active claims for evidence %s: %w", evidenceID, err)
+	}
+	return ids, nil
+}
+
+// MarkReconciled advances one row to stage RECONCILED and drops its lock. It is
+// for an artifact with no Claims, and for one whose Transactions another pass
+// wrote. TransactionRepository.Save advances the others with their
+// Transactions. The guard on EXTRACTED prevents a second advance.
 func (q *EvidenceQueue) MarkReconciled(ctx context.Context, evidenceID string, now time.Time) error {
 	if _, err := q.db.ExecContext(ctx, `
 		UPDATE evidence

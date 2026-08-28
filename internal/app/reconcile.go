@@ -12,22 +12,16 @@ import (
 
 // DefaultReconcileBatch and DefaultReconcileLease size one reconciliation pass.
 //
-// The same numbers extraction uses, chosen the same way: the batch is a lock
-// bound rather than a memory bound — a pass that claimed all 800 rows and then
-// crashed would hold every one of them locked until the lease lapsed — and the
-// lease is sized for the crash rather than for the work. Building a Transaction
-// from an already-validated Claim is arithmetic; it is nothing like parsing.
+// They are the numbers that extraction uses, for the same reasons. The batch is
+// a lock bound, and the lease is sized for a stopped process.
 const (
 	DefaultReconcileBatch = 100
 	DefaultReconcileLease = time.Minute
 )
 
-// classTransaction — the Claim's fields did not make a valid Transaction.
-//
-// It is the Transaction-shaped sibling of classClaim, and it means the same
-// kind of thing: the domain rejected Billy's own construction, which is a bug
-// in the mapping rather than a bad artifact. A Claim asserting an amount and no
-// direction lands here.
+// classTransaction means that the fields of the Claim did not make a valid
+// Transaction. The domain rejected Billy's own construction, so this is a
+// defect in the mapping and not a bad artifact.
 const classTransaction = "TRANSACTION"
 
 // ReconcileResult is the summary of one reconciliation pass.
@@ -35,53 +29,31 @@ type ReconcileResult struct {
 	EvidenceProcessed   int
 	TransactionsCreated int
 
-	// Claimless counts artifacts that reached EXTRACTED carrying no Claim and
-	// will never carry a Transaction — 244 of the 1,044 stored artifacts. They
-	// are advanced, not failed: extraction looked and the answer was that there
-	// is no financial event here (D44).
+	// Claimless counts the artifacts that reached EXTRACTED with no Claim and
+	// that will never carry a Transaction. The pass advances them and does not
+	// fail them (D44).
 	Claimless int
 
-	// Skipped counts Claims that already had a Transaction, so this pass built
-	// none. It is the reconciliation half of the number M1's second sync
-	// printed, and it means the same thing: the work was already done, and
-	// doing it again changed nothing.
+	// Skipped counts the artifacts whose Claims already had Transactions, so
+	// this pass built none. It means that the work was already done.
 	Skipped int
 
-	// DatedFromEvidence counts Transactions whose occurred_at came from
-	// DATA_MODEL.md §4.5's fallback rather than from the artifact — the Claim
-	// stated no event time, so the Transaction took the earliest observed_at of
-	// its supporting Evidence.
-	//
-	// It is a subset of TransactionsCreated, not a separate outcome. The count
-	// is here because the difference matters to anyone reading the table: a
-	// fallback date is when Billy *received* the artifact, which for the 90 Nu
-	// card payments is minutes after the payment and could in principle be days.
-	// Expected to be 90 against the live corpus.
+	// DatedFromEvidence counts the Transactions whose occurred_at came from the
+	// fallback in DATA_MODEL.md §4.5. A fallback date is when Billy received
+	// the artifact, not when the event happened. Expect 90 for the corpus.
 	DatedFromEvidence int
 
-	// Failed counts Claims that were attempted and produced no Transaction
-	// because something went wrong. A pass with failures still succeeds: one
-	// bad row must not stop the pipeline.
+	// Failed counts the artifacts that the pass attempted and that produced no
+	// Transaction because of an error. A pass with failures still succeeds.
 	Failed int
 
 	CompletedAt time.Time
 }
 
-// Reconciler turns ACTIVE Claims into Transactions.
-//
-// It is the third stage of ARCHITECTURE.md §5: it reads the interpretation
-// Billy currently holds of an artifact and records the financial event that
-// interpretation describes, advancing EXTRACTED → RECONCILED.
-//
-// **It parses nothing.** A Claim has already been through
-// domain.NewClaim — every value in it was validated when it was written, and
-// none of the raw artifact reaches this pass. That is why, unlike Extractor,
-// there is no per-row panic recovery here: the hostile input is two stages
-// upstream and was never let through. A panic in this pass would be a bug in
-// Billy's own arithmetic, and swallowing it would hide it.
-//
-// Like Extractor and Ingestor, it owns no clock and no randomness. Both are
-// injected, so the whole use case runs in a test with neither.
+// Reconciler turns the Claims of an active interpretation into Transactions. It
+// is the third stage of ARCHITECTURE.md §5 and advances a row from EXTRACTED to
+// RECONCILED, with one Transaction for each Claim (D42). It parses nothing, so
+// it recovers no panic: no part of the raw artifact reaches this pass.
 type Reconciler struct {
 	Queue        ReconcileQueue
 	Transactions TransactionRepository
@@ -104,17 +76,9 @@ func NewReconciler(queue ReconcileQueue, transactions TransactionRepository) *Re
 	}
 }
 
-// Run claims one batch of Evidence at EXTRACTED and builds Transactions from
-// the Claims it holds.
-//
-// It returns when the batch is exhausted rather than looping until the queue is
-// empty, for the reason Extractor.Run gives: the caller decides whether to run
-// again, which keeps "how much work happens" a scheduling question rather than
-// something buried in here.
-//
-// A failing row does not stop the pass. The error Run returns is reserved for
-// what genuinely ends one — the queue being unreachable, or the context being
-// cancelled.
+// Run claims one batch of Evidence at stage EXTRACTED and builds Transactions
+// from the Claims that each row holds. It returns at the end of the batch, and
+// the caller decides if it runs again. One failed row does not stop the pass.
 func (r *Reconciler) Run(ctx context.Context) (ReconcileResult, error) {
 	now := r.Now().UTC()
 	pending, err := r.Queue.ClaimForReconciliation(ctx, r.batch(), now, now.Add(r.lease()))
@@ -131,12 +95,11 @@ func (r *Reconciler) Run(ctx context.Context) (ReconcileResult, error) {
 			r.releaseUnattempted(ctx, pending[i:])
 			return result, err
 		}
-		switch r.reconcileOne(ctx, work) {
+		outcome, created, dated := r.reconcileOne(ctx, work)
+		switch outcome {
 		case outcomeTransacted:
-			result.TransactionsCreated++
-		case outcomeTransactedFromEvidenceDate:
-			result.TransactionsCreated++
-			result.DatedFromEvidence++
+			result.TransactionsCreated += created
+			result.DatedFromEvidence += dated
 		case outcomeClaimless:
 			result.Claimless++
 		case outcomeAlreadyBuilt:
@@ -151,92 +114,76 @@ func (r *Reconciler) Run(ctx context.Context) (ReconcileResult, error) {
 	return result, nil
 }
 
-// reconcileOutcome is what happened to one row. Only the queue being
-// unreachable ends a pass; everything here belongs on its own row.
+// reconcileOutcome is what happened to one row. Only an unavailable queue ends
+// a pass.
 type reconcileOutcome int
 
 const (
 	outcomeTransacted reconcileOutcome = iota
-
-	// outcomeTransactedFromEvidenceDate is outcomeTransacted with the
-	// occurred_at fallback applied. It is a separate outcome only so the count
-	// survives to the result; both mean a Transaction was written.
-	outcomeTransactedFromEvidenceDate
-
 	outcomeClaimless
 	outcomeAlreadyBuilt
 	outcomeBuildFailed
 )
 
-// reconcileOne builds the Transaction for a single row and records what
-// happened to it.
-//
-// It returns no error, for the reason extractOne does not: every failure it can
-// encounter belongs on the row rather than to the caller, including a failure
-// to record the failure. At that point the queue is unreachable, the lease
-// lapses on its own, and the row returns to a later pass with its Evidence and
-// its Claim both still there.
-func (r *Reconciler) reconcileOne(ctx context.Context, work PendingReconciliation) reconcileOutcome {
-	if !work.HasClaim {
-		// Extraction looked and found no financial event. The row is finished
-		// with the pipeline even though it carries nothing (D44); leaving it at
-		// EXTRACTED would have every later pass re-read all 244 of them.
+// reconcileOne builds each Transaction that the interpretation of one row
+// describes. It reports how many it wrote, and how many used the date fallback.
+// It returns no error, because each failure belongs on the row. It builds the
+// complete interpretation or none of it: one bad Claim fails the artifact.
+func (r *Reconciler) reconcileOne(ctx context.Context, work PendingReconciliation) (reconcileOutcome, int, int) {
+	if len(work.Claims) == 0 {
+		// Extraction found no financial event. The row leaves the pipeline
+		// although it carries nothing (D44). If it stayed at EXTRACTED, each
+		// later pass would read all 244 again.
 		if err := r.Queue.MarkReconciled(ctx, work.EvidenceID, r.Now()); err != nil {
-			return r.fail(ctx, work, classStore, err)
+			return r.fail(ctx, work, classStore, err), 0, 0
 		}
-		return outcomeClaimless
+		return outcomeClaimless, 0, 0
 	}
 
-	transaction, derived, err := r.buildTransaction(work)
-	if err != nil {
-		return r.fail(ctx, work, classTransaction, err)
+	built := make([]BuiltTransaction, 0, len(work.Claims))
+	dated := 0
+	for _, claim := range work.Claims {
+		transaction, derived, err := r.buildTransaction(claim, work.ObservedAt)
+		if err != nil {
+			return r.fail(ctx, work, classTransaction, err), 0, 0
+		}
+		if derived {
+			dated++
+		}
+		built = append(built, BuiltTransaction{Transaction: transaction, SourceClaimID: claim.ID()})
 	}
 
-	created, err := r.Transactions.Save(ctx, transaction, work.Claim.ID(), r.Now())
+	created, err := r.Transactions.Save(ctx, built, r.Now())
 	if err != nil {
-		return r.fail(ctx, work, classStore, err)
+		return r.fail(ctx, work, classStore, err), 0, 0
 	}
 	if !created {
-		// This Claim already has a Transaction — another pass reached it first,
-		// or this one is a re-run over work already done. Nothing was written,
-		// so nothing rolled back, and the row still needs advancing: it *has*
-		// been reconciled, just not by this pass.
+		// These Claims already have their Transactions. Another pass reached
+		// the artifact first, or the work was already done. The store wrote
+		// nothing, and the row still advances.
 		if err := r.Queue.MarkReconciled(ctx, work.EvidenceID, r.Now()); err != nil {
-			return r.fail(ctx, work, classStore, err)
+			return r.fail(ctx, work, classStore, err), 0, 0
 		}
-		return outcomeAlreadyBuilt
+		return outcomeAlreadyBuilt, 0, 0
 	}
-	if derived {
-		return outcomeTransactedFromEvidenceDate
-	}
-	return outcomeTransacted
+	return outcomeTransacted, len(built), dated
 }
 
 // buildTransaction maps one ACTIVE Claim onto the Transaction aggregate, and
-// reports whether its date came from the fallback rather than from the artifact.
-//
-// It reads the Claim's fields and hands them to domain.NewTransaction, which is
-// the only thing that decides whether they make a valid Transaction. Nothing is
-// invented here: a field the Claim does not assert becomes an absent value, not
-// a plausible-looking default — with the two exceptions below, and both are
-// exceptions DATA_MODEL.md writes down rather than conveniences taken here.
-func (r *Reconciler) buildTransaction(work PendingReconciliation) (domain.Transaction, bool, error) {
-	claim := work.Claim
+// reports if the date came from the fallback. domain.NewTransaction decides if
+// the fields make a valid Transaction. A field that the Claim does not state
+// stays absent, except for the two cases below that DATA_MODEL.md specifies.
+func (r *Reconciler) buildTransaction(claim domain.Claim, observedAt time.Time) (domain.Transaction, bool, error) {
+	occurredAt, derived := occurredAtFor(claim, observedAt)
 
-	occurredAt, derived := occurredAtFor(claim, work.ObservedAt)
-
-	// Money is optional and comes as a validated pair or not at all — Claim
-	// guarantees an amount never loses its currency, so this cannot produce
-	// half of one. A Claim asserting no amount yields the zero Money, which is
-	// how TransactionDraft spells absence.
+	// Money is optional and arrives as a validated pair, or not at all. Claim
+	// guarantees that an amount keeps its currency. A Claim with no amount
+	// gives the zero Money, which is how TransactionDraft shows absence.
 	money, _ := claim.Money()
 
-	// UNKNOWN where the Claim asserts no status (D43). 101 of 800 Claims assert
-	// none: the card payments and the service payments state nothing about
-	// settlement. DOMAIN.md §5 makes UNKNOWN a legitimate state precisely for
-	// this — Evidence often does not reveal whether an event is an
-	// authorization or a settlement — so recording it is a fact rather than a
-	// gap dressed up as one.
+	// Use UNKNOWN where the Claim states no status (D43). 101 of 800 Claims
+	// state none. DOMAIN.md §5 makes UNKNOWN a valid state, because Evidence
+	// often does not show if an event is an authorization or a settlement.
 	status := domain.StatusUnknown
 	if stated := textField(claim, domain.FieldFinancialStatus); stated != "" {
 		status = domain.FinancialStatus(stated)
@@ -255,10 +202,14 @@ func (r *Reconciler) buildTransaction(work PendingReconciliation) (domain.Transa
 		Direction:         domain.TransactionDirection(textField(claim, domain.FieldDirection)),
 		FinancialStatus:   status,
 
-		// Every Transaction is born UNRECONCILED. One Claim makes one
-		// Transaction (D42); whether two of them describe the same event is
-		// DOMAIN.md §6's question, and nothing has asked it yet.
+		// Each Transaction starts UNRECONCILED. One Claim makes one Transaction
+		// (D42). DOMAIN.md §6 decides if two of them describe one event, and no
+		// code asks that question yet.
 		ReconciliationState: domain.Unreconciled,
+
+		// The Transaction starts ACTIVE. It is Billy's current record of the
+		// event until a better reading of the artifact replaces it (D49).
+		State: domain.TransactionActive,
 
 		OccurredAt:  occurredAt,
 		EvidenceIDs: claim.EvidenceIDs(),
@@ -270,50 +221,23 @@ func (r *Reconciler) buildTransaction(work PendingReconciliation) (domain.Transa
 	return transaction, derived, nil
 }
 
-// occurredAtFor answers when the event happened, and whether the answer came
-// from the artifact or from the fallback.
-//
-// DATA_MODEL.md §4.5: `occurred_at` is always populated. Where Billy knows the
-// event time it uses that time; where it does not, it uses the earliest
-// observed_at of the supporting Evidence. **The fallback is computed here,
-// before the write, and never inside a SQL query** — that is what makes the
-// column trustworthy as the cursor `GET /v1/transactions` paginates on, with no
-// COALESCE anywhere and no query that has to remember to apply the same rule.
-//
-// It fires for 90 of the 800 Claims: every `¡Recibimos tu pago!` card payment,
-// whose body carries no date at all. D33 put occurred_at in the Claim
-// vocabulary precisely so that absence would still be absence at this point —
-// those Claims have no field rather than a midnight, and this is the one place
-// that decides what to do about it.
-//
-// **The substitution is honest but lossy**, and worth naming: observed_at is
-// when Gmail received the notification, not when the payment happened. For Nu's
-// card payments those are minutes apart; for a Source that batches, they need
-// not be. Billy has no better answer, and DATA_MODEL.md §4.5 chose a stable
-// value over a null. Nothing in the schema records which of the two a given row
-// got — that would be a column §4.5 does not have, and adding one is a
-// decision, not an implementation detail. The count lives in ReconcileResult
-// instead.
-//
-// "Earliest" is not yet a choice between values: D38 gives one ACTIVE Claim per
-// artifact and every Claim today rests on exactly one, so there is exactly one
-// observed_at to take. It becomes a real minimum when a Claim may draw on
-// several artifacts — DOMAIN.md open question 13, still open — and the port
-// hands over one row's timestamp because that is all one row has.
+// occurredAtFor reports when the event happened, and if that time came from the
+// artifact or from the fallback. DATA_MODEL.md §4.5 requires a value, so Billy
+// uses the earliest observed_at of the Evidence where the artifact states none.
+// This code computes the fallback before the write and never in a query.
 func occurredAtFor(claim domain.Claim, observedAt time.Time) (time.Time, bool) {
 	if stated, ok := claim.OccurredAt(); ok {
 		return stated, false
 	}
-	// A zero observedAt is not substituted for silently. It would be a bug in
-	// the queue — `evidence.observed_at` is NOT NULL — and domain.NewTransaction
-	// rejects the zero time, so the row fails visibly instead of acquiring a
-	// date in the year 1.
+	// A zero observedAt would be a defect in the queue, because
+	// evidence.observed_at is NOT NULL. domain.NewTransaction rejects the zero
+	// time, so the row fails and does not take a date in the year 1.
 	return observedAt, true
 }
 
-// textField reads one text-valued field, or "" where the Claim does not assert
-// it. Empty is absence everywhere in this codebase — NewTextField rejects it as
-// a value — so one return suffices.
+// textField reads one text field, or "" if the Claim does not state it. An
+// empty string always means absence, because NewTextField rejects it as a
+// value.
 func textField(c domain.Claim, name domain.FieldName) string {
 	f, ok := c.Field(name)
 	if !ok {
@@ -322,11 +246,10 @@ func textField(c domain.Claim, name domain.FieldName) string {
 	return f.Text()
 }
 
-// fail records one failed attempt against its row.
+// fail records one failed attempt on its row.
 //
-// The stage does not move. Retry is not a processing stage (DATA_MODEL.md §7):
-// the artifact stays at EXTRACTED with its Claim intact, and attempts,
-// last_error and locked_until carry everything about the retry.
+// The stage does not move. Retry is not a processing stage (DATA_MODEL.md §7).
+// The artifact stays at EXTRACTED with its Claims.
 func (r *Reconciler) fail(ctx context.Context, work PendingReconciliation, class string, cause error) reconcileOutcome {
 	retryAt := r.Now().UTC().Add(retryAfter(work.Attempts))
 	if err := r.Queue.RecordFailure(ctx, work.EvidenceID, reason(class, cause), retryAt); err != nil {
@@ -338,12 +261,10 @@ func (r *Reconciler) fail(ctx context.Context, work PendingReconciliation, class
 	return outcomeBuildFailed
 }
 
-// releaseUnattempted hands back rows claimed by a pass that is shutting down.
+// releaseUnattempted returns the rows that a pass claimed during a shutdown.
 //
-// Detached from the cancelled context on purpose: the whole point is to run
-// these statements after the caller has given up, and inheriting the
-// cancellation would make every one of them fail and strand the rows for the
-// rest of their lease.
+// It uses a context that is detached from the cancelled one. A cancelled
+// context would fail each statement and hold the rows until the lease ends.
 func (r *Reconciler) releaseUnattempted(ctx context.Context, pending []PendingReconciliation) {
 	detached := context.WithoutCancel(ctx)
 	for _, work := range pending {

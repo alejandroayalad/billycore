@@ -33,6 +33,7 @@ func validDraft(t *testing.T) domain.TransactionDraft {
 		Direction:           domain.Outflow,
 		FinancialStatus:     domain.StatusSettled,
 		ReconciliationState: domain.Unreconciled,
+		State:               domain.TransactionActive,
 		OccurredAt:          txOccurred,
 		EvidenceIDs:         []string{"ev-1"},
 		CreatedAt:           txCreated,

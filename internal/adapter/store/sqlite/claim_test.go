@@ -71,14 +71,31 @@ func newTestClaim(t *testing.T, id, evidenceID string) domain.Claim {
 	return active
 }
 
-// The whole point of D25 applied to Claims: the row, its provenance, its
-// fields, the event and the stage advance either all happen or none do.
+// oneClaim is the shape that each Nu artifact gives: an interpretation with one
+// Claim. It does not supersede another reading.
+func oneClaim(t *testing.T, interpretationID, claimID, evidenceID string) domain.Interpretation {
+	t.Helper()
+	return interpretationOf(t, interpretationID, evidenceID, "", newTestClaim(t, claimID, evidenceID))
+}
+
+func interpretationOf(t *testing.T, interpretationID, evidenceID, supersedes string, claims ...domain.Claim) domain.Interpretation {
+	t.Helper()
+	in, err := domain.NewInterpretation(interpretationID, evidenceID, claims, supersedes, claimedAt)
+	if err != nil {
+		t.Fatalf("NewInterpretation: %v", err)
+	}
+	return in
+}
+
+// D25 applied to Claims. The row, its provenance, its fields, the event and the
+// stage advance all happen, or none of them happen.
 func TestSaveWritesTheClaimItsFieldsItsProvenanceAndItsEvent(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
 	claim := newTestClaim(t, "claim-1", "ev-1")
+	in := interpretationOf(t, "interp-1", "ev-1", "", claim)
 
-	if created, err := claims.Save(context.Background(), claim, claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), in, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 
@@ -153,7 +170,7 @@ func TestSaveAdvancesTheEvidenceItInterpreted(t *testing.T) {
 	if stage := readStage(t, db, "ev-1"); stage != stageReceived {
 		t.Fatalf("stage before = %q, want RECEIVED", stage)
 	}
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 	if stage := readStage(t, db, "ev-1"); stage != stageExtracted {
@@ -166,7 +183,7 @@ func TestSaveAdvancesTheEvidenceItInterpreted(t *testing.T) {
 func TestAClaimCitingEvidenceThatDoesNotExistIsRejectedWhole(t *testing.T) {
 	claims, _, _, db := newClaimTestRepo(t)
 
-	_, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-missing"), claimedAt)
+	_, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-missing"), claimedAt)
 	if err == nil {
 		t.Fatal("Save accepted a claim with no such Evidence")
 	}
@@ -187,7 +204,7 @@ func TestExtractionDoesNotRewriteTheArtifact(t *testing.T) {
 	claims, _, evidence, _ := newClaimTestRepo(t)
 	stored := storeEvidence(t, evidence, "ev-1", "msg-1")
 
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 	after, err := evidence.GetByID(context.Background(), "ev-1")
@@ -292,7 +309,7 @@ func TestMarkExtractedAdvancesAndReleaseDoesNot(t *testing.T) {
 func TestExtractionWritesNoTransaction(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 	for _, table := range []string{"transactions", "transaction_evidence", "claim_transaction"} {
@@ -407,7 +424,7 @@ func TestASuccessfulExtractionClearsAnEarlierError(t *testing.T) {
 		t.Fatalf("RecordFailure: %v", err)
 	}
 
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 	if err := queue.MarkExtracted(context.Background(), "ev-2", claimedAt); err != nil {
@@ -487,14 +504,14 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
 
-	created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt)
+	created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), claimedAt)
 	if err != nil || !created {
 		t.Fatalf("first Save: created=%v err=%v", created, err)
 	}
 
-	// A different Claim id, the same artifact — what a second pass produces
-	// after a lease lapses, since ids come from crypto/rand.
-	created, err = claims.Save(context.Background(), newTestClaim(t, "claim-2", "ev-1"), claimedAt)
+	// A different Claim id and the same artifact. A second pass gives this
+	// result after a lease ends, because each id comes from crypto/rand.
+	created, err = claims.Save(context.Background(), oneClaim(t, "interp-2", "claim-2", "ev-1"), claimedAt)
 	if err != nil {
 		t.Fatalf("second Save: %v — losing the race is an outcome, not an error", err)
 	}
@@ -502,9 +519,8 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 		t.Error("a second active claim was created for one artifact")
 	}
 
-	// Nothing of the losing Claim survives. A half-written interpretation — the
-	// claim row without its fields, or an event describing a Claim that is not
-	// there — would be worse than the duplicate it was preventing.
+	// Nothing from the losing Claim stays. A part-written interpretation is
+	// worse than the duplicate that the constraint prevents.
 	var claimCount int
 	if err := db.QueryRow(`SELECT count(*) FROM claims`).Scan(&claimCount); err != nil {
 		t.Fatalf("count claims: %v", err)
@@ -535,10 +551,13 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 		}
 	}
 
-	// The pointer still names the winner.
+	// The pointer names the winner.
 	var activeClaim string
-	if err := db.QueryRow(
-		`SELECT claim_id FROM evidence_active_claim WHERE evidence_id = ?`, "ev-1").Scan(&activeClaim); err != nil {
+	if err := db.QueryRow(`
+		SELECT ic.claim_id
+		FROM evidence_active_interpretation eai
+		JOIN interpretation_claims ic ON ic.interpretation_id = eai.interpretation_id
+		WHERE eai.evidence_id = ?`, "ev-1").Scan(&activeClaim); err != nil {
 		t.Fatalf("read active claim: %v", err)
 	}
 	if activeClaim != "claim-1" {
@@ -546,9 +565,8 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 	}
 }
 
-// The duplicate this prevents does not need a crash. Two passes overlap when a
-// lease lapses under a slow one, both interpret the same artifact, and both
-// try to write. Exactly one may win.
+// The duplicate that this prevents needs no crash. Two passes overlap when a
+// lease ends under a slow pass, and only one of them can win.
 func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
@@ -564,7 +582,7 @@ func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 			defer wg.Done()
 			<-start
 			created, err := claims.Save(context.Background(),
-				newTestClaim(t, fmt.Sprintf("claim-%d", i), "ev-1"), claimedAt)
+				oneClaim(t, fmt.Sprintf("interp-%d", i), fmt.Sprintf("claim-%d", i), "ev-1"), claimedAt)
 			if err != nil {
 				errs <- err
 				return
@@ -597,7 +615,7 @@ func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 	if claimCount != 1 {
 		t.Errorf("claims = %d for one artifact, want 1", claimCount)
 	}
-	// One artifact, one interpretation, one activation event.
+	// One artifact, one interpretation, and one activation event.
 	var events int
 	if err := db.QueryRow(
 		`SELECT count(*) FROM domain_event WHERE type = ?`, eventClaimActivated).Scan(&events); err != nil {
@@ -608,34 +626,30 @@ func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 	}
 }
 
-// A PROPOSED Claim takes no active slot, which is what keeps the proposal
-// endpoints of D11/D12 working: an outside proposer may offer a competing
-// interpretation of an artifact Billy has already interpreted.
-func TestAProposedClaimDoesNotTakeTheActiveSlot(t *testing.T) {
+// An interpretation is a set of ACTIVE Claims, so this port refuses a PROPOSED
+// Claim. The proposal endpoint of D11 therefore has no writer: before D46 this
+// port took one Claim and accepted a PROPOSED one. POST /v1/claims needs its
+// own writer, and that endpoint does not exist yet.
+func TestAnInterpretationRefusesAProposedClaim(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
 
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 
 	proposed := newProposedClaim(t, "claim-2", "ev-1")
-	created, err := claims.Save(context.Background(), proposed, claimedAt)
-	if err != nil {
-		t.Fatalf("Save proposed: %v", err)
-	}
-	if !created {
-		t.Error("a proposed claim was refused; it competes for no slot")
+	if _, err := domain.NewInterpretation("interp-2", "ev-1", []domain.Claim{proposed}, "", claimedAt); err == nil {
+		t.Fatal("a proposed claim was accepted into an interpretation")
 	}
 
 	var claimCount int
 	if err := db.QueryRow(`SELECT count(*) FROM claims`).Scan(&claimCount); err != nil {
 		t.Fatalf("count claims: %v", err)
 	}
-	if claimCount != 2 {
-		t.Errorf("claims = %d, want 2 — one active, one proposed", claimCount)
+	if claimCount != 1 {
+		t.Errorf("claims = %d, want 1 — nothing was written for the refused set", claimCount)
 	}
-	// And no ClaimActivated for it: nothing became anyone's interpretation.
 	var events int
 	if err := db.QueryRow(
 		`SELECT count(*) FROM domain_event WHERE type = ?`, eventClaimActivated).Scan(&events); err != nil {

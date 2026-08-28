@@ -160,6 +160,7 @@ func (w *pipelineWorker) drainExtraction(ctx context.Context) error {
 		}
 		slog.Info("extracted",
 			"evidence", result.EvidenceProcessed,
+			"interpretations", result.InterpretationsCreated,
 			"claims", result.ClaimsCreated,
 			"unrecognised", result.Unrecognised,
 			"skipped", result.Skipped,

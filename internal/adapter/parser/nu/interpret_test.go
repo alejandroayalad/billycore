@@ -22,11 +22,16 @@ func interpretFixture(t *testing.T, fixture, subject string) map[domain.FieldNam
 	}
 	raw := []byte("Subject: " + subject + "\r\nContent-Type: text/html; charset=utf-8\r\n\r\n" + string(body))
 
-	fields, err := nu.Interpreter{}.Interpret(raw)
+	sets, err := nu.Interpreter{}.Interpret(raw)
 	if err != nil {
 		t.Fatalf("Interpret(%s): %v", fixture, err)
 	}
-	return fields
+	// Each Nu template is a receipt for one movement, so a reading holds one
+	// Claim. The port uses a slice for the statement Source (D46).
+	if len(sets) != 1 {
+		t.Fatalf("Interpret(%s) returned %d claims, want 1", fixture, len(sets))
+	}
+	return sets[0]
 }
 
 func text(t *testing.T, fields map[domain.FieldName]domain.ClaimField, name domain.FieldName) (string, domain.Confidence) {

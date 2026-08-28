@@ -43,6 +43,11 @@ type TransactionDraft struct {
 	FinancialStatus     FinancialStatus
 	ReconciliationState ReconciliationState
 
+	// State tells you if this is Billy's current record of the event (D49).
+	// The pipeline builds every Transaction as ACTIVE. It is required, so a
+	// caller that forgets it gets an error here.
+	State TransactionState
+
 	// OccurredAt is when the event happened, and it is required. Where the
 	// artifact stated no time, the caller has already substituted the earliest
 	// observed_at of the supporting Evidence — DATA_MODEL.md §4.5's fallback,
@@ -80,6 +85,7 @@ type Transaction struct {
 	direction           TransactionDirection
 	financialStatus     FinancialStatus
 	reconciliationState ReconciliationState
+	state               TransactionState
 	occurredAt          time.Time
 	evidenceIDs         []string
 	createdAt           time.Time
@@ -131,6 +137,11 @@ func NewTransaction(d TransactionDraft) (Transaction, error) {
 	if err := d.ReconciliationState.Validate(); err != nil {
 		return Transaction{}, err
 	}
+	// There is no default, for the same reason that FinancialStatus has none:
+	// a zero value that becomes a real state hides a caller that forgot it.
+	if err := d.State.Validate(); err != nil {
+		return Transaction{}, err
+	}
 
 	if d.OccurredAt.IsZero() {
 		return Transaction{}, ErrTransactionNoOccurredAt
@@ -153,6 +164,7 @@ func NewTransaction(d TransactionDraft) (Transaction, error) {
 		direction:           d.Direction,
 		financialStatus:     d.FinancialStatus,
 		reconciliationState: d.ReconciliationState,
+		state:               d.State,
 		occurredAt:          d.OccurredAt.UTC(),
 		evidenceIDs:         provenance,
 		createdAt:           d.CreatedAt.UTC(),
@@ -210,6 +222,7 @@ func (t Transaction) AccountIdentifier() string                { return t.accoun
 func (t Transaction) Direction() TransactionDirection          { return t.direction }
 func (t Transaction) FinancialStatus() FinancialStatus         { return t.financialStatus }
 func (t Transaction) ReconciliationState() ReconciliationState { return t.reconciliationState }
+func (t Transaction) State() TransactionState                  { return t.state }
 func (t Transaction) OccurredAt() time.Time                    { return t.occurredAt }
 func (t Transaction) CreatedAt() time.Time                     { return t.createdAt }
 func (t Transaction) UpdatedAt() time.Time                     { return t.updatedAt }

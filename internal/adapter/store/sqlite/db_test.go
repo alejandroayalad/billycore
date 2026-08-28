@@ -43,8 +43,8 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if userVersion != 4 {
-		t.Errorf("user_version = %d, want 4 after migration 004", userVersion)
+	if userVersion != 5 {
+		t.Errorf("user_version = %d, want 5 after migration 005", userVersion)
 	}
 
 	for _, table := range []string{"evidence", "domain_event"} {
@@ -332,9 +332,10 @@ func TestOpenTightensAWidenedFile(t *testing.T) {
 	}
 }
 
-// Migration 003 creates the constraint that makes extraction idempotent. The
-// primary key is the whole point: it is what a second pass collides with.
-func TestMigration003CreatesTheActiveClaimConstraint(t *testing.T) {
+// Migration 005 moves the constraint one level higher. The artifact points at
+// one interpretation, and that interpretation holds one or many Claims (D46,
+// D47).
+func TestMigration005CreatesTheActiveInterpretationConstraint(t *testing.T) {
 	db, err := Open(testDBPath(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -346,23 +347,101 @@ func TestMigration003CreatesTheActiveClaimConstraint(t *testing.T) {
 	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
 		t.Fatalf("seed evidence: %v", err)
 	}
+	for _, id := range []string{"i-1", "i-2"} {
+		if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+			VALUES (?, 'ev-1', '2026-08-26T00:00:00.000Z')`, id); err != nil {
+			t.Fatalf("seed interpretation %s: %v", id, err)
+		}
+	}
+
+	if _, err := db.Exec(`INSERT INTO evidence_active_interpretation (evidence_id, interpretation_id) VALUES ('ev-1', 'i-1')`); err != nil {
+		t.Fatalf("first active interpretation: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO evidence_active_interpretation (evidence_id, interpretation_id) VALUES ('ev-1', 'i-2')`); err == nil {
+		t.Error("the database accepted two active interpretations for one artifact")
+	}
+
+	// The pointer cannot name an interpretation or an artifact that does not
+	// exist.
+	if _, err := db.Exec(`INSERT INTO evidence_active_interpretation (evidence_id, interpretation_id) VALUES ('ev-missing', 'i-2')`); err == nil {
+		t.Error("the database accepted an active interpretation for evidence that does not exist")
+	}
+
+	// Many Claims in one interpretation. Migration 003 could not do this.
 	for _, id := range []string{"c-1", "c-2"} {
 		if _, err := db.Exec(`INSERT INTO claims (id, state, created_at, updated_at)
 			VALUES (?, 'ACTIVE', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z')`, id); err != nil {
 			t.Fatalf("seed claim %s: %v", id, err)
 		}
+		if _, err := db.Exec(`INSERT INTO interpretation_claims (interpretation_id, claim_id) VALUES ('i-1', ?)`, id); err != nil {
+			t.Fatalf("membership for %s: %v — one interpretation must hold many claims", id, err)
+		}
 	}
 
-	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-1', 'c-1')`); err != nil {
-		t.Fatalf("first active claim: %v", err)
+	// The table from 003 is gone, so a query that still reads it fails.
+	var name string
+	if err := db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_active_claim'`).Scan(&name); err == nil {
+		t.Error("evidence_active_claim survived migration 005")
 	}
-	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-1', 'c-2')`); err == nil {
-		t.Error("the database accepted two active claims for one artifact")
+}
+
+// The lineage that D47 needs: what Billy believes now, and what Billy believed
+// before.
+func TestMigration005RecordsInterpretationLineage(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	for _, id := range []string{"i-1", "i-2"} {
+		if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+			VALUES (?, 'ev-1', '2026-08-26T00:00:00.000Z')`, id); err != nil {
+			t.Fatalf("seed interpretation %s: %v", id, err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE interpretations SET superseded_by_interpretation_id = 'i-2' WHERE id = 'i-1'`); err != nil {
+		t.Fatalf("record lineage: %v", err)
+	}
+	// The value must be an interpretation that exists, and not any string.
+	if _, err := db.Exec(`UPDATE interpretations SET superseded_by_interpretation_id = 'i-missing' WHERE id = 'i-1'`); err == nil {
+		t.Error("the database accepted lineage pointing at an interpretation that does not exist")
+	}
+}
+
+// D49 — a Transaction's own lifecycle, separate from its reconciliation state.
+func TestMigration005AddsTheTransactionLifecycle(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	for _, column := range []string{"transaction_state", "superseded_by_transaction_id"} {
+		var n int
+		if err := db.QueryRow(
+			`SELECT count(*) FROM pragma_table_info('transactions') WHERE name = ?`, column).Scan(&n); err != nil {
+			t.Fatalf("read table info: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("transactions has no %s column", column)
+		}
 	}
 
-	// Provenance is a real reference, not a promise: the pointer cannot name a
-	// Claim or an artifact that does not exist.
-	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-missing', 'c-2')`); err == nil {
-		t.Error("the database accepted an active claim for evidence that does not exist")
+	// reconciliation_state keeps its three values. The two columns answer
+	// different questions, which is the argument in D49.
+	var notNull int
+	if err := db.QueryRow(
+		`SELECT "notnull" FROM pragma_table_info('transactions') WHERE name = 'transaction_state'`).Scan(&notNull); err != nil {
+		t.Fatalf("read table info: %v", err)
+	}
+	if notNull != 1 {
+		t.Error("transaction_state is nullable; a row that is neither current nor superseded is not a state")
 	}
 }

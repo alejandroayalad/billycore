@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alejandroayalad/billycore/internal/app"
 	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
@@ -25,23 +26,29 @@ func newTransactionTestRepo(t *testing.T) (*TransactionRepository, *ClaimReposit
 	return NewTransactionRepository(db), NewClaimRepository(db), NewEvidenceQueue(db), NewEvidenceRepository(db), db
 }
 
-// extractedArtifact walks one artifact through ingestion and extraction, so the
-// reconciliation tests below start where the pipeline actually hands over: an
-// Evidence row at EXTRACTED with one ACTIVE Claim.
+// extractedArtifact moves one artifact through ingestion and extraction. The
+// reconciliation tests below then start at an Evidence row at stage EXTRACTED
+// with one ACTIVE Claim.
 func extractedArtifact(t *testing.T, claims *ClaimRepository, evidence *EvidenceRepository, evidenceID, reference, claimID string) domain.Claim {
 	t.Helper()
 	storeEvidence(t, evidence, evidenceID, reference)
 	claim := newTransactionalClaim(t, claimID, evidenceID)
-	created, err := claims.Save(context.Background(), claim, claimedAt)
+	in := interpretationOf(t, "interp-"+evidenceID, evidenceID, "", claim)
+	created, err := claims.Save(context.Background(), in, claimedAt)
 	if err != nil || !created {
-		t.Fatalf("Save claim: created=%v err=%v", created, err)
+		t.Fatalf("Save interpretation: created=%v err=%v", created, err)
 	}
 	return claim
 }
 
-// newTransactionalClaim is the interpretation of an outflow receipt, carrying
-// everything a Transaction needs — including the direction that claim_test.go's
-// newTestClaim deliberately omits.
+// one puts a Transaction and the id of its Claim into the set that Save takes.
+func one(tx domain.Transaction, sourceClaimID string) []app.BuiltTransaction {
+	return []app.BuiltTransaction{{Transaction: tx, SourceClaimID: sourceClaimID}}
+}
+
+// newTransactionalClaim is the interpretation of an outflow receipt. It holds
+// each field that a Transaction needs, and newTestClaim in claim_test.go
+// omits the direction.
 func newTransactionalClaim(t *testing.T, id, evidenceID string) domain.Claim {
 	t.Helper()
 	amount, err := domain.NewIntField(100000, domain.High)
@@ -91,6 +98,7 @@ func newTestTransaction(t *testing.T, id, evidenceID string) domain.Transaction 
 		Direction:           domain.Outflow,
 		FinancialStatus:     domain.StatusSettled,
 		ReconciliationState: domain.Unreconciled,
+		State:               domain.TransactionActive,
 		OccurredAt:          observed,
 		EvidenceIDs:         []string{evidenceID},
 		CreatedAt:           builtAt,
@@ -107,7 +115,7 @@ func TestSaveWritesTheTransactionItsProvenanceAndItsEvent(t *testing.T) {
 	transactions, claims, _, evidence, db := newTransactionTestRepo(t)
 	claim := extractedArtifact(t, claims, evidence, "ev-1", "msg-1", "claim-1")
 
-	created, err := transactions.Save(context.Background(), newTestTransaction(t, "tx-1", "ev-1"), claim.ID(), builtAt)
+	created, err := transactions.Save(context.Background(), one(newTestTransaction(t, "tx-1", "ev-1"), claim.ID()), builtAt)
 	if err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
@@ -183,7 +191,7 @@ func TestSaveWritesTheTransactionItsProvenanceAndItsEvent(t *testing.T) {
 func TestTheTransactionEventCarriesNoMoney(t *testing.T) {
 	transactions, claims, _, evidence, db := newTransactionTestRepo(t)
 	claim := extractedArtifact(t, claims, evidence, "ev-1", "msg-1", "claim-1")
-	if _, err := transactions.Save(context.Background(), newTestTransaction(t, "tx-1", "ev-1"), claim.ID(), builtAt); err != nil {
+	if _, err := transactions.Save(context.Background(), one(newTestTransaction(t, "tx-1", "ev-1"), claim.ID()), builtAt); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
@@ -205,10 +213,10 @@ func TestASecondTransactionForOneClaimIsRefused(t *testing.T) {
 	claim := extractedArtifact(t, claims, evidence, "ev-1", "msg-1", "claim-1")
 	ctx := context.Background()
 
-	if created, err := transactions.Save(ctx, newTestTransaction(t, "tx-1", "ev-1"), claim.ID(), builtAt); err != nil || !created {
+	if created, err := transactions.Save(ctx, one(newTestTransaction(t, "tx-1", "ev-1"), claim.ID()), builtAt); err != nil || !created {
 		t.Fatalf("first Save: created=%v err=%v", created, err)
 	}
-	created, err := transactions.Save(ctx, newTestTransaction(t, "tx-2", "ev-1"), claim.ID(), builtAt)
+	created, err := transactions.Save(ctx, one(newTestTransaction(t, "tx-2", "ev-1"), claim.ID()), builtAt)
 	if err != nil {
 		t.Fatalf("second Save: %v", err)
 	}
@@ -237,7 +245,7 @@ func TestConcurrentPassesProduceExactlyOneTransaction(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			tx := newTestTransaction(t, fmt.Sprintf("tx-%d", i), "ev-1")
-			created, err := transactions.Save(context.Background(), tx, claim.ID(), builtAt)
+			created, err := transactions.Save(context.Background(), one(tx, claim.ID()), builtAt)
 			if err != nil {
 				t.Errorf("Save: %v", err)
 				return
@@ -268,7 +276,7 @@ func TestSaveRefusesATransactionWithNoOriginatingClaim(t *testing.T) {
 	transactions, claims, _, evidence, db := newTransactionTestRepo(t)
 	extractedArtifact(t, claims, evidence, "ev-1", "msg-1", "claim-1")
 
-	if _, err := transactions.Save(context.Background(), newTestTransaction(t, "tx-1", "ev-1"), "", builtAt); err == nil {
+	if _, err := transactions.Save(context.Background(), one(newTestTransaction(t, "tx-1", "ev-1"), ""), builtAt); err == nil {
 		t.Error("Save accepted a Transaction with no originating Claim")
 	}
 	assertCount(t, db, `SELECT count(*) FROM transactions`, 0)
@@ -289,25 +297,26 @@ func TestClaimForReconciliationReturnsTheActiveClaim(t *testing.T) {
 		t.Fatalf("claimed %d rows, want 1", len(pending))
 	}
 	work := pending[0]
-	if work.EvidenceID != "ev-1" || !work.HasClaim {
-		t.Fatalf("work = %+v, want ev-1 with a Claim", work)
+	if work.EvidenceID != "ev-1" || len(work.Claims) != 1 {
+		t.Fatalf("work = %+v, want ev-1 with one Claim", work)
 	}
-	if work.Claim.ID() != "claim-1" || work.Claim.State() != domain.ClaimActive {
-		t.Errorf("claim = %s/%s, want claim-1/ACTIVE", work.Claim.ID(), work.Claim.State())
+	claim := work.Claims[0]
+	if claim.ID() != "claim-1" || claim.State() != domain.ClaimActive {
+		t.Errorf("claim = %s/%s, want claim-1/ACTIVE", claim.ID(), claim.State())
 	}
 	if !work.ObservedAt.Equal(observed) {
 		t.Errorf("observed_at = %s, want %s — DATA_MODEL.md §4.5's fallback needs it", work.ObservedAt, observed)
 	}
-	// Rehydration goes through the domain constructor, so the values survive it
-	// intact rather than arriving as raw columns.
-	money, ok := work.Claim.Money()
+	// The store reads the Claim through the domain constructor, so the values
+	// do not change.
+	money, ok := claim.Money()
 	if !ok || money.Minor() != 100000 || money.Currency() != "MXN" {
 		t.Errorf("money = %s (present=%v)", money, ok)
 	}
-	if got, ok := work.Claim.OccurredAt(); !ok || !got.Equal(observed) {
+	if got, ok := claim.OccurredAt(); !ok || !got.Equal(observed) {
 		t.Errorf("occurred_at = %s (present=%v)", got, ok)
 	}
-	if field, ok := work.Claim.Field(domain.FieldMerchant); !ok || field.Confidence() != domain.Medium {
+	if field, ok := claim.Field(domain.FieldMerchant); !ok || field.Confidence() != domain.Medium {
 		t.Errorf("merchant confidence did not survive rehydration: %v/%v", field.Confidence(), ok)
 	}
 }
@@ -326,7 +335,7 @@ func TestClaimForReconciliationReturnsRowsWithNoClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimForReconciliation: %v", err)
 	}
-	if len(pending) != 1 || pending[0].HasClaim {
+	if len(pending) != 1 || len(pending[0].Claims) != 0 {
 		t.Fatalf("pending = %+v, want one row with no Claim", pending)
 	}
 
@@ -392,7 +401,7 @@ func TestTheSecondReconciliationPassCreatesNothing(t *testing.T) {
 	claim := extractedArtifact(t, claims, evidence, "ev-1", "msg-1", "claim-1")
 	ctx := context.Background()
 
-	if created, err := transactions.Save(ctx, newTestTransaction(t, "tx-1", "ev-1"), claim.ID(), builtAt); err != nil || !created {
+	if created, err := transactions.Save(ctx, one(newTestTransaction(t, "tx-1", "ev-1"), claim.ID()), builtAt); err != nil || !created {
 		t.Fatalf("first Save: created=%v err=%v", created, err)
 	}
 

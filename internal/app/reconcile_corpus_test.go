@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -64,25 +66,28 @@ func TestReconcileCorpus(t *testing.T) {
 		}
 		item := app.PendingReconciliation{EvidenceID: evidenceID, ObservedAt: observed, Attempts: 1}
 
-		fields, err := nu.Interpreter{}.Interpret(raw)
+		sets, err := nu.Interpreter{}.Interpret(raw)
 		switch {
 		case errors.Is(err, app.ErrNoInterpretation):
-			// No Claim. The row still has to leave the queue (D44).
+			// No Claims. The row still has to leave the queue (D44).
 		case err != nil:
 			t.Errorf("%s: %v", evidenceID, err)
 			continue
 		default:
-			proposed, err := domain.NewClaim("claim-"+evidenceID, domain.ClaimProposed, []string{evidenceID}, fields, at)
-			if err != nil {
-				t.Errorf("%s: not a valid claim: %v", evidenceID, err)
-				continue
+			for n, fields := range sets {
+				claimID := fmt.Sprintf("claim-%s-%d", evidenceID, n)
+				proposed, err := domain.NewClaim(claimID, domain.ClaimProposed, []string{evidenceID}, fields, at)
+				if err != nil {
+					t.Errorf("%s: not a valid claim: %v", evidenceID, err)
+					continue
+				}
+				active, err := proposed.Activate(at)
+				if err != nil {
+					t.Errorf("%s: cannot activate: %v", evidenceID, err)
+					continue
+				}
+				item.Claims = append(item.Claims, active)
 			}
-			active, err := proposed.Activate(at)
-			if err != nil {
-				t.Errorf("%s: cannot activate: %v", evidenceID, err)
-				continue
-			}
-			item.Claim, item.HasClaim = active, true
 		}
 		pending = append(pending, item)
 	}
@@ -145,8 +150,8 @@ func TestReconcileCorpus(t *testing.T) {
 	)
 	for _, item := range pending {
 		observedByEvidence[item.EvidenceID] = item.ObservedAt
-		if item.HasClaim {
-			claimByID[item.Claim.ID()] = item.Claim
+		for _, claim := range item.Claims {
+			claimByID[claim.ID()] = claim
 		}
 	}
 	for _, saved := range transactions.saved {
@@ -155,7 +160,7 @@ func TestReconcileCorpus(t *testing.T) {
 		// DOMAIN.md §4's hard invariant: provenance to at least one piece of
 		// Evidence, and it is the artifact the Claim came from.
 		provenance := tx.EvidenceIDs()
-		if len(provenance) != 1 || "claim-"+provenance[0] != saved.sourceClaimID {
+		if len(provenance) != 1 || !strings.HasPrefix(saved.sourceClaimID, "claim-"+provenance[0]+"-") {
 			t.Errorf("%s: provenance = %v, source claim = %s", tx.ID(), provenance, saved.sourceClaimID)
 		}
 		// Every Transaction is born UNRECONCILED (D42).
@@ -276,17 +281,20 @@ func TestReconcilingTheCorpusTwiceCreatesNothingTheSecondTime(t *testing.T) {
 		}
 		observed, _ := time.Parse(time.RFC3339, observedAt)
 		item := app.PendingReconciliation{EvidenceID: evidenceID, ObservedAt: observed, Attempts: 1}
-		fields, err := nu.Interpreter{}.Interpret(raw)
+		sets, err := nu.Interpreter{}.Interpret(raw)
 		if err == nil {
-			proposed, err := domain.NewClaim("claim-"+evidenceID, domain.ClaimProposed, []string{evidenceID}, fields, at)
-			if err != nil {
-				continue
+			for n, fields := range sets {
+				claimID := fmt.Sprintf("claim-%s-%d", evidenceID, n)
+				proposed, err := domain.NewClaim(claimID, domain.ClaimProposed, []string{evidenceID}, fields, at)
+				if err != nil {
+					continue
+				}
+				active, err := proposed.Activate(at)
+				if err != nil {
+					continue
+				}
+				item.Claims = append(item.Claims, active)
 			}
-			active, err := proposed.Activate(at)
-			if err != nil {
-				continue
-			}
-			item.Claim, item.HasClaim = active, true
 		}
 		pending = append(pending, item)
 	}

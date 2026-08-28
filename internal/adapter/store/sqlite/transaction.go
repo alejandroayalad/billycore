@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/alejandroayalad/billycore/internal/app"
 	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
@@ -26,39 +28,73 @@ func NewTransactionRepository(db *sql.DB) *TransactionRepository {
 	return &TransactionRepository{db: db}
 }
 
-// Save writes a Transaction, its provenance, its TransactionCreated event, the
-// slot that makes it idempotent, and the Evidence stage advance — all in one
-// transaction — and reports whether a Transaction was created.
-//
-// One commit, for the reason ClaimRepository.Save gives and D25 argued first: an
-// event describing a change that did not commit is a lie about the domain, and
-// Evidence advanced to RECONCILED whose Transaction rolled back is a worse one —
-// an artifact the pipeline will never look at again, with nothing to show for
-// it, and this time the thing missing is a row of money.
-//
-// **A false with a nil error means this Claim already has a Transaction**, and
-// this one was not written. Same contract as EvidenceRepository.Insert and
-// ClaimRepository.Save, from the same place: `claim_transaction`'s primary key
-// is what makes re-running reconciliation idempotent, not a check this function
-// remembered to perform (D41, migration 004).
-//
-// `now` is passed in rather than read from the clock, so the caller owns time.
-func (r *TransactionRepository) Save(ctx context.Context, t domain.Transaction, sourceClaimID string, now time.Time) (bool, error) {
-	if sourceClaimID == "" {
-		// Without it there is no slot to claim, and without a slot there is no
-		// idempotency — a second pass would write a second row of money.
-		return false, fmt.Errorf("save transaction %s: the originating claim is required", t.ID())
+// Save writes each Transaction of one artifact in one database transaction: the
+// rows, their provenance, one event for each, the slot for each Claim, and the
+// stage advance. The set is the unit, because the stage advance is in this
+// commit. A false with a nil error means that one Claim already has a
+// Transaction, and claim_transaction makes that idempotent (D41).
+func (r *TransactionRepository) Save(ctx context.Context, built []app.BuiltTransaction, now time.Time) (bool, error) {
+	if len(built) == 0 {
+		// An artifact with no Claims does not reach this code, because
+		// MarkReconciled advances it (D44). An empty set would commit a stage
+		// advance for work that does not exist.
+		return false, errors.New("save transactions: nothing to save")
+	}
+	for _, b := range built {
+		if b.SourceClaimID == "" {
+			// Without the Claim id there is no slot, and without a slot there
+			// is no idempotency. A second pass would write a second row of
+			// money.
+			return false, fmt.Errorf("save transaction %s: the originating claim is required", b.Transaction.ID())
+		}
 	}
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("save transaction: begin: %w", err)
+		return false, fmt.Errorf("save transactions: begin: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
-	// Money's two halves are written together or not at all. The domain has
-	// already guaranteed the pair; nullableAmount is what keeps "no amount"
-	// from arriving as a zero that reads like one.
+	for _, b := range built {
+		took, err := insertTransaction(ctx, tx, b, now)
+		if err != nil {
+			return false, err
+		}
+		if !took {
+			// Another pass wrote first. The deferred Rollback discards each
+			// Transaction, its provenance and its event.
+			return false, nil
+		}
+	}
+
+	// The stage advance. The guard on EXTRACTED prevents a second advance, and
+	// the same statement drops the lock and clears last_error. This code reads
+	// the artifacts from the Transactions: a parameter would let a caller
+	// advance a row that this commit did not write about.
+	for _, evidenceID := range evidenceOf(built) {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE evidence
+			SET processing_stage = ?, locked_until = NULL, last_error = NULL
+			WHERE id = ? AND processing_stage = ?`,
+			stageReconciled, evidenceID, stageExtracted,
+		); err != nil {
+			return false, fmt.Errorf("save transactions: advance evidence %s: %w", evidenceID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("save transactions: commit: %w", err)
+	}
+	return true, nil
+}
+
+// insertTransaction writes one Transaction, its provenance and its event. It
+// takes the slot that prevents a second write, and reports if it took it.
+func insertTransaction(ctx context.Context, tx *sql.Tx, b app.BuiltTransaction, now time.Time) (bool, error) {
+	t := b.Transaction
+
+	// Write both parts of Money, or neither part. The domain guarantees the
+	// pair. A nil pair keeps "no amount" different from an amount of zero.
 	var amountMinor, currency any
 	if money, ok := t.Money(); ok {
 		amountMinor, currency = money.Minor(), string(money.Currency())
@@ -67,22 +103,22 @@ func (r *TransactionRepository) Save(ctx context.Context, t domain.Transaction, 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO transactions (
 			id, amount_minor, currency, merchant, account_identifier,
-			direction, financial_status, reconciliation_state,
+			direction, financial_status, reconciliation_state, transaction_state,
 			occurred_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID(), amountMinor, currency,
 		nullableText(t.Merchant()), nullableText(t.AccountIdentifier()),
 		string(t.Direction()), string(t.FinancialStatus()), string(t.ReconciliationState()),
+		string(t.State()),
 		formatTime(t.OccurredAt()), formatTime(t.CreatedAt()), formatTime(t.UpdatedAt()),
 	); err != nil {
-		// The id is safe to log; the merchant is a person's name and the amount
-		// is someone's money (SECURITY.md §10).
+		// The id is safe to log. The merchant can be the name of a person, and
+		// the amount is the money of a person (SECURITY.md §10).
 		return false, fmt.Errorf("save transaction %s: %w", t.ID(), err)
 	}
 
-	// Provenance first among the children: a Transaction without it is invalid
-	// (DOMAIN.md §4), and the foreign key to evidence is what makes that
-	// unfakeable rather than merely asserted.
+	// Write the provenance first. A Transaction without provenance is invalid
+	// (DOMAIN.md §4), and the foreign key to evidence enforces that.
 	for _, evidenceID := range t.EvidenceIDs() {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO transaction_evidence (transaction_id, evidence_id) VALUES (?, ?)`,
@@ -96,64 +132,46 @@ func (r *TransactionRepository) Save(ctx context.Context, t domain.Transaction, 
 		return false, err
 	}
 
-	// The constraint. Claiming the slot is what makes this Save the one that
-	// counts, and losing the race is an ordinary outcome rather than an error:
-	// the Claim already has a Transaction, and a second identical one is not
-	// additional knowledge — it is the same money counted twice.
-	//
-	// ON CONFLICT DO NOTHING rather than catching a violation, so idempotency
-	// never depends on matching the text of a driver's error message.
+	// The constraint. The pass that takes the slot is the pass that counts, and
+	// to lose is an ordinary result: a second Transaction for one Claim is the
+	// same money two times. ON CONFLICT DO NOTHING keeps idempotency
+	// independent of the text of a driver error message.
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO claim_transaction (claim_id, transaction_id)
 		VALUES (?, ?)
 		ON CONFLICT (claim_id) DO NOTHING`,
-		sourceClaimID, t.ID(),
+		b.SourceClaimID, t.ID(),
 	)
 	if err != nil {
-		return false, fmt.Errorf("save transaction %s: claim the slot for claim %s: %w", t.ID(), sourceClaimID, err)
+		return false, fmt.Errorf("save transaction %s: claim the slot for claim %s: %w", t.ID(), b.SourceClaimID, err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
 		return false, fmt.Errorf("save transaction %s: rows affected: %w", t.ID(), err)
 	}
-	if affected == 0 {
-		// Another pass got there first. Nothing written here survives: the
-		// deferred Rollback discards the Transaction, its provenance and its
-		// event together, so there is no half-recorded financial event and no
-		// event describing one.
-		return false, nil
-	}
-
-	// The stage advance, guarded on the row still being at EXTRACTED so that a
-	// row already advanced by another pass is not silently re-advanced. The
-	// lock is dropped in the same statement, because work that committed is
-	// work nobody needs to retry, and last_error is cleared with it — a row
-	// that failed on Monday and succeeded on Tuesday must not keep Monday's
-	// diagnostic beside a perfectly good Transaction.
-	for _, evidenceID := range t.EvidenceIDs() {
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE evidence
-			SET processing_stage = ?, locked_until = NULL, last_error = NULL
-			WHERE id = ? AND processing_stage = ?`,
-			stageReconciled, evidenceID, stageExtracted,
-		); err != nil {
-			return false, fmt.Errorf("save transaction %s: advance evidence %s: %w", t.ID(), evidenceID, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("save transaction %s: commit: %w", t.ID(), err)
-	}
-	return true, nil
+	return affected == 1, nil
 }
 
-// appendTransactionCreated writes the event described in DOMAIN.md §8: Billy
-// now believes a financial event exists.
-//
-// The payload carries ids, not amounts. It is a fact about a Transaction, not a
-// second copy of one — a consumer that wants the money reads the Transaction,
-// and the event log does not become a place someone's finances leak from
-// (SECURITY.md §10).
+// evidenceOf returns the artifacts that a set of Transactions rests on. It
+// removes duplicates and keeps a stable order.
+func evidenceOf(built []app.BuiltTransaction) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, b := range built {
+		for _, evidenceID := range b.Transaction.EvidenceIDs() {
+			if seen[evidenceID] {
+				continue
+			}
+			seen[evidenceID] = true
+			out = append(out, evidenceID)
+		}
+	}
+	return out
+}
+
+// appendTransactionCreated writes the event in DOMAIN.md §8. The payload holds
+// ids and no amounts, so the event log does not hold the finances of a person
+// (SECURITY.md §10). A reader that needs the money reads the Transaction.
 func appendTransactionCreated(ctx context.Context, tx *sql.Tx, t domain.Transaction, now time.Time) error {
 	payload, err := json.Marshal(struct {
 		TransactionID string   `json:"transactionId"`

@@ -30,9 +30,13 @@ type Interpreter struct{}
 
 // Interpret reads one stored artifact and reports what Billy believes about it.
 //
-// It returns app.ErrNoInterpretation for the 244 artifacts no template
-// recognises, which is an ordinary outcome and not a failure.
-func (Interpreter) Interpret(raw []byte) (map[domain.FieldName]domain.ClaimField, error) {
+// It returns app.ErrNoInterpretation for the 244 artifacts that no template
+// recognises. That is an ordinary result and not a failure.
+//
+// The slice holds one element. Each of the four Nu templates is a receipt for
+// one movement. The port uses a slice because a bank statement is one artifact
+// with many movements (D46).
+func (Interpreter) Interpret(raw []byte) ([]map[domain.FieldName]domain.ClaimField, error) {
 	extraction, err := Parse(raw)
 	if errors.Is(err, parser.ErrNoTemplate) {
 		// Translated at the boundary. The use case knows "nothing recognised
@@ -47,7 +51,7 @@ func (Interpreter) Interpret(raw []byte) (map[domain.FieldName]domain.ClaimField
 	if err != nil {
 		return nil, classify(err)
 	}
-	return fields, nil
+	return []map[domain.FieldName]domain.ClaimField{fields}, nil
 }
 
 // interpretError carries a failure together with a rendering of it that holds
