@@ -1,6 +1,6 @@
 # BillyCore — Context
 
-**Last updated:** 2026-08-25
+**Last updated:** 2026-08-28
 
 Orientation for anyone — human or agent — starting work on BillyCore. `docs/` describes
 the system as designed. This file describes where the project actually *is*, which is a
@@ -10,69 +10,103 @@ Read this first, then [docs/PRODUCT.md](../docs/PRODUCT.md).
 
 ---
 
-## 1. State: M1 is done — real Evidence, from the real mailbox
+## 1. State: the email half of M2 is done — real Transactions, from the real mailbox
 
-The pipeline exists as far as Evidence, and stops there deliberately.
+The pipeline runs end to end. Email goes in at one end and financial facts come out
+at the other.
 
-On **2026-08-25** `POST /v1/sources/gmail_primary/sync` ran twice against the live
-mailbox:
+On **2026-08-28** `billycore serve` drained the whole stored corpus in about three
+seconds:
 
-| Run | Discovered | Created | Skipped | Wall clock |
-|---|---|---|---|---|
-| First | 1,044 | 1,044 | 0 | 3m 36s |
-| Second | 1,044 | 0 | 1,044 | **1.1s** |
+| | |
+|---|---|
+| Evidence | 1,044 — every row at `RECONCILED` |
+| Interpretations | 800 |
+| Claims | 800, all `ACTIVE` |
+| Transactions | 800, all `ACTIVE` |
+| Unrecognised | 244 |
+| **Failed** | **0** |
 
-The second line is the milestone. Ingestion is idempotent on the Gmail message id, and
-it is idempotent because `UNIQUE (source_id, source_reference)` says so — not because
-the code remembered to check. `~/.billy/billy.db` now holds **1,044 Evidence rows and
-1,044 `EvidenceIngested` events**: 51 MB of verbatim RFC 822 reaching back to
-2023-08-23, every row at stage `RECEIVED`, every row with its content.
+A second start wrote nothing: no row was claimable, and the counts were identical
+afterwards. Extraction and reconciliation are idempotent the way ingestion is — because
+a constraint says so, not because a code path remembered to check.
+
+**Every number the design predicted, it predicted correctly.** These were written down
+before the code ran, which is the only thing that makes the agreement worth anything:
+
+| Predicted | Where | Measured |
+|---|---|---|
+| 800 transaction-bearing, 244 not | §3.1 below | 800 / 244 |
+| 345 inflows | §3.1 | 345 |
+| 455 outflows — 354 + 90 + 11 | §3.1 | 455 |
+| 101 Transactions at `UNKNOWN` | D43 | 101 |
+| 90 dated from the `observed_at` fallback | DATA_MODEL.md §4.5, D33 | 90 |
+| 16 artifacts carrying a `tracking_key` | D42 | 16 |
+
+The derived data is sane: one currency (MXN, D30); no null, zero or negative amount;
+no date in the future; `occurred_at` spanning 2024-01-24 to 2026-08-19. The 90
+Transactions with no merchant are exactly the card payments, whose template carries no
+counterparty — which is also why they are the 90 taking the date fallback. Recognition
+holds at 76–77% across 2024, 2025 and 2026, so no template has drifted by era.
+
+**Last 30 days: 37 Transactions, 21 in, 16 out.** §3.1 predicted 37, measured on
+2026-08-25 against Gmail's received date; this counts `occurred_at` on 2026-08-28. They
+are different windows over different clocks, so the totals agreeing is closer to
+coincidence than to confirmation. The number to trust is the shape, not the match.
 
 What runs today: `billycore auth`, `billycore peek`, and `billycore serve` — `GET
-/healthz`, `POST /v1/sources/{id}/sync`, and `GET /v1/evidence/{id}`, the last two behind
-a bearer token compared in constant time.
+/healthz`, `POST /v1/sources/{id}/sync`, `GET /v1/evidence/{id}`, the last two behind a
+bearer token compared in constant time — plus one background pipeline worker draining
+extraction and then Transaction construction (D45).
 
-What does not exist: **no Claim, no parser, no Transaction**, no reconciliation, no AI,
-no HSBC, and no way to see any of this that is not `curl | jq`. Nothing in that mailbox
-has been *interpreted*. Evidence is bytes Billy is certain it received; it is not yet a
-single financial fact, and the success criterion in §2 is about facts.
+What does not exist: **no way to see any of this that is not SQL**, no bank statements,
+no reconciliation between Sources, no AI, and no HSBC. The success criterion in §2 is a
+*table*, and 800 rows nobody can look at do not satisfy it. That is now the whole gap
+for the email half, and §8 item 1 is the critical path.
 
-`docs/` is no longer entirely unvalidated — the ingestion half has met real email, and
-§3.1 records where the design was already wrong about it. Everything from Claims onward
-remains a well-reasoned hypothesis that has never run.
+Two things the code can do that nothing has yet asked it to do: re-extraction (D48) has
+never run against the live database — `superseded_by_interpretation_id` is NULL on all
+800 rows — and no trigger exposes it. `superseded_by_transaction_id` exists and is never
+written (D49, open).
 
 ### Code
 
-| Path | Lines | State |
-|---|---|---|
-| `go.mod` | — | Go 1.26.2, one direct dependency: `modernc.org/sqlite` (D5) |
-| `cmd/billycore/main.go` | 338 | `serve`, `auth`, `peek`; data dir, token, bind-address checks |
-| `internal/domain/` | 259 | `Money`, `Currency`, `Evidence`, and the D6 import-graph assertion |
-| `internal/app/ports.go` | 74 | `EvidenceRepository`, `SourceFetcher`, `Artifact` |
-| `internal/app/ingest.go` | 132 | Fetch → Evidence → stop. No clock, no randomness, no I/O of its own |
-| `internal/adapter/store/sqlite/` | 451 | Open, pragmas, migrations, Evidence repository |
-| `internal/adapter/source/gmail/` | 282 + OAuth | `ListIDs`, `GetMetadata`, `GetRaw`, `Fetcher` |
-| `internal/adapter/api/` | 377 | Error envelope, bearer auth, the two `/v1` routes |
-| `internal/adapter/config/sources.go` | 92 | `sources.json` (D26) |
-| `internal/id/uuid.go` | 38 | UUID v4 from `crypto/rand`; outside the domain because randomness is I/O |
-| **Total** | **≈2,410 code · 1,878 test** | `make check` green, and green under `-race` |
+| Path | Code | Test | State |
+|---|---|---|---|
+| `cmd/billycore/` | 597 | 387 | `serve`, `auth`, `peek`; the background pipeline worker (D45) |
+| `internal/domain/` | 1,229 | 1,026 | `Money`, `Evidence`, `Claim`, `Interpretation`, `Transaction`, the D6 assertion |
+| `internal/app/` | 1,061 | 1,851 | Ingest, extract, reconcile; the ports each consumes |
+| `internal/adapter/store/sqlite/` | 1,338 | 2,391 | Five migrations, four repositories, the pipeline queue |
+| `internal/adapter/parser/` | 1,686 | 1,663 | MIME, HTML, money, dates; the four Nu templates |
+| `internal/adapter/source/gmail/` | 680 | 234 | OAuth, `ListIDs`, `GetMetadata`, `GetRaw`, `Fetcher` |
+| `internal/adapter/api/` | 402 | 509 | Error envelope, bearer auth, the `/v1` routes |
+| `internal/adapter/config/` | 92 | 93 | `sources.json` (D26) |
+| `internal/id/` | 38 | 32 | UUID v4; outside the domain because randomness is I/O |
+| **Total** | **7,123** | **8,186** | `make check` green, and green under `-race` |
 
-The ratio of design prose to code is no longer 600:1. It is roughly 2:1, which is the
-first time this table has been worth reading.
+More test than code, for the first time. Schema: `001_initial`, `002_claims`,
+`003_active_claim`, `004_transactions`, `005_interpretations` — the live database is at
+`user_version = 5`.
 
 ### Documents
 
 | Document | State |
 |---|---|
+| `ai/DECISIONS.md` | Written · D1–D49 |
+| `AGENTS.md` | Written · §8 now carries the ASD-STE100 comment rule |
+| `ai/CONTEXT.md` | This file |
 | `docs/PRODUCT.md` | Written |
-| `docs/ARCHITECTURE.md` | Written |
-| `docs/DOMAIN.md` | Written · worked example does not match the mailbox (§3.1) |
-| `docs/DATA_MODEL.md` | Written · §4.1 is one column behind the schema (D24) |
-| `docs/API.md` | Written · §5 and §6 now have running implementations |
+| `docs/ARCHITECTURE.md` | Written · §5's stages now exist in code |
+| `docs/DOMAIN.md` | Written · **behind**: no Interpretation, and §8 does not list the two new `ClaimActivated` fields |
+| `docs/DATA_MODEL.md` | Written · **behind**: no `interpretations`, `interpretation_claims`, `evidence_active_interpretation`; no `transaction_state` |
+| `docs/API.md` | Written · §5 and §6 have running implementations |
 | `docs/SECURITY.md` | Written |
-| `ai/CONTEXT.md`, `ai/DECISIONS.md` | Written · D1–D26 |
 | `ai/CONVENTIONS.md`, `ai/CONSTRAINTS.md`, `ai/WORKFLOW.md`, `ai/GLOSSARY.md` | **Empty** |
 | BillySat, BillyAgent | Docs-only scaffolds, no code. Do not start them. |
+
+`docs/` is where the drift is, and it is drift of exactly one kind: the schema and the
+domain grew a concept — the Interpretation — that the documents describing them have
+never heard of. Correcting them is the author's (AGENTS.md §5).
 
 ---
 
@@ -81,73 +115,65 @@ first time this table has been worth reading.
 | | |
 |---|---|
 | Started | 2026-08-22 |
-| MVP target | 2026-09-22 — **a target, no longer hard** (D28) |
-| Realistic landing | early-to-mid October |
+| MVP target | 2026-09-22 — a target, no longer hard (D28) |
 | Budget | 2 h/weekday + 4 h Saturday + 4 h Sunday ≈ **18 h/week** |
-| Remaining to the target | ≈ 72 hours |
-| Estimated to finish the scope | **≈ 80–90 hours** |
+| Remaining to the target | ≈ **64 hours** |
+| Estimated to finish the scope | ≈ **50–60 hours** |
 
-Those last two lines are the most important fact in this document, and they do not
-agree. D27 put bank statements and reconciliation into the MVP; D28 answered the
-collision by moving the date rather than cutting the scope. The number to watch is no
-longer "hours left" but the gap between the two.
+**Those two lines agree for the first time.** They have not agreed since D27 put bank
+statements and reconciliation into the MVP, and the reason they agree now is that the
+largest single item is done: M2's email half was scoped at ~45 h and it has landed and
+run against real data.
 
-The deadline having moved once, the honest risk is that it stops constraining anything.
-What holds it in place is that D27 wrote the scope down: the date moves for *that* list,
-and adding to the list is a new decision, not an adjustment.
+Do not read that as slack. What remains is statements (~25 h), reconciliation (~20 h),
+and the viewing surface D32 specified but nobody has estimated. Statement parsing is
+still the piece most likely to blow its estimate, and it is still the only one whose
+input format has never been seen — the same sentence this file has carried since M2 was
+scoped, now with fewer hours behind it.
 
 The success criterion has not moved (PRODUCT.md):
 
 > I can see my last month of transactions, well classified, in a good table with good
 > financial information.
 
-**Nothing that does not serve that sentence gets built.** That rule survives D28 intact
-— it applies with more force now, not less, because the scope grew rather than the
-discipline loosening.
+**Nothing that does not serve that sentence gets built.** Note which word is now the
+binding one: *see*. Billy holds 37 well-classified Transactions for the last 30 days and
+can show them to nobody.
 
 ---
 
 ## 3. Next step
 
-**Read the 1,044 emails Billy now holds, and turn four templates into Claims.**
+**Make the 800 Transactions visible.** D32 already decided the shape — a terminal table
+and a plain web page — and neither exists.
 
-The first vertical slice, in order — M1 is closed:
+That is the whole recommendation, and it is a change from the order this file carried
+through M2. Statements and reconciliation are larger and more interesting; the viewing
+surface is the one that converts work already done into the success criterion. It is
+also the fastest way to find out whether the 800 rows are *right*, because a table a
+human reads is a better parser test than any assertion in `nu_test.go`.
 
-1. ~~`go mod init`, one binary that starts and serves `/healthz`~~ — **done**
-2. ~~SQLite open, embedded migration, `evidence` table~~ — **done**, migration 001
-3. ~~Gmail OAuth — read-only scopes, token to `credentials.json` at `0600`~~ — **done**
-4. ~~Fetch → persist Evidence at stage `RECEIVED`, stop there~~ — **done**, 1,044 rows
-5. ~~Look at real Nubank and HSBC emails~~ — **done**, and §3.1 is what they said
+The slices, in order:
 
-M1 was Gmail → Evidence → SQLite, idempotent on the Gmail message id: no Claims, no
-transaction extraction, no reconciliation, no AI, no HSBC. All of it now exists, runs
-against the live mailbox, and is provably idempotent without a network.
+1. ~~`go mod init`, one binary that serves `/healthz`~~ — **done**
+2. ~~SQLite, embedded migrations, `evidence`~~ — **done**
+3. ~~Gmail OAuth, read-only, token at `0600`~~ — **done**
+4. ~~Fetch → Evidence at `RECEIVED`~~ — **done**, 1,044 rows
+5. ~~Look at real Nu and HSBC email~~ — **done**, §3.1 is what it said
+6. ~~Per-template parsers, Claims with field-level confidence, `EXTRACTED`~~ — **done**
+7. ~~Transactions from active Claims; the background worker~~ — **done**, 800 rows
+8. **`GET /v1/transactions`, a `billycore tx` table, and one static page (D32)**
+9. Statements: intake by hand through `POST /v1/evidence`, then PDF text extraction
+10. Reconciliation: DOMAIN.md §6's six signals, and transfers that appear in both Sources
 
-**M2 is where the design stops being about plumbing**, and D27 made it bigger than
-parsers. The scope is now three things that have to land together:
+**The order still matters.** 9 before 10, because reconciliation cannot be tested until
+there are two kinds of Transaction to reconcile. 8 first because it is cheap, it is on
+the critical path for the criterion, and it audits everything 6 and 7 produced.
 
-1. **Email → Transactions.** Per-template parsers for the Nu templates
-   (`internal/adapter/parser`, D11, D16), Claims with field-level confidence, and the
-   `EXTRACTED` stage that produces Transactions. ~45 h.
-2. **Statements.** Intake by hand through `POST /v1/evidence` — measured 2026-08-25, the
-   statement emails carry no PDF and BillyCore may not follow the links to fetch one
-   (D16, D27). PDF text extraction is the open problem: Go has no standard library for
-   it, so this is either a dependency the author approves (SECURITY.md §11) or an
-   external extractor posting to `POST /v1/claims`, which is the escape hatch D11
-   designed for exactly this. ~25 h.
-3. **Reconciliation.** DOMAIN.md §6's six signals, and the transfers that appear in both
-   Sources collapsing into one Transaction. ~20 h, and it drags six open questions onto
-   the path with it.
-
-**The order matters more than the estimates.** 1 before 3, because reconciliation cannot
-be tested until there are two kinds of Transaction to reconcile — and 2 before 3 for the
-same reason. Statement parsing is the piece most likely to blow its estimate, and it is
-the only one whose input format has never been seen.
-
-The criterion has not moved: a table of last month's transactions. From email that is
-**37 rows** — 22 inflows, 15 outflows, measured, not estimated. The statement adds the
-card purchases that no email contains, which is the difference between a table of money
-moving and a table of what was bought.
+Two smaller things that are logged and unbuilt, either of which can be picked up in an
+hour when it becomes annoying: the re-extraction trigger (D48 — the mechanism is written
+and tested, nothing calls it) and a writer for `POST /v1/claims`, which D46 took away
+when the unit of activation became a set.
 
 ---
 
@@ -157,6 +183,12 @@ Step 5 happened. `billycore peek` reached the live mailbox and these are counts
 from it, not estimates. **Do not use Gmail's `resultSizeEstimate`** — it returned
 201 for every query asked of it, including ones with three real hits. Every number
 below comes from paginating message ids.
+
+> **Confirmed by the pipeline on 2026-08-28.** Every count in this section survived
+> contact with the parsers: 800 transaction-bearing, 244 not, 345 inflows, 455 outflows.
+> The section was written from message ids and subject lines; the run read the bodies.
+> They agree, which is the strongest evidence this file holds that the design was
+> reasoning about the real mailbox rather than about itself.
 
 ### Volume
 
@@ -263,13 +295,20 @@ step 1 has since shipped. They are kept here because M1 depends on both.
 - **ARCHITECTURE.md Q2** — credential storage. **Closed** by SECURITY.md §5 / D14: a
   separate `credentials.json`, `0600`, beside the database — now `~/.billy/credentials.json`.
 
-These do *not* block step 1 and must not be argued about yet:
+Three were parked here as "not yet". Two of them are now next:
 
-- DATA_MODEL.md Q1 — what a reconciliation candidate references. Blocks reconciliation,
-  which is week three at the earliest.
-- API.md Q8 — the currency minor-unit exponent. Blocks rendering amounts, not storing
-  them.
-- Everything in DOMAIN.md §10.
+- **API.md Q8 — the currency minor-unit exponent. This blocks §3 step 8.** It was filed
+  as blocking *rendering* amounts rather than storing them, which was correct and is no
+  longer a reason to defer it: rendering amounts is precisely what the terminal table
+  and the web page do. 800 rows hold `amount_minor` and `MXN`, and nothing yet knows
+  that MXN divides by 100. Answer it before the table, not during it.
+- **DATA_MODEL.md Q1 — what a reconciliation candidate references.** Blocks
+  reconciliation, now the last slice rather than "week three at the earliest". D42 made
+  it answerable and deliberately did not answer it: a candidate referencing Transaction
+  ids is the reading the code supports.
+- Everything in DOMAIN.md §10 — still not urgent, with one exception now visible from
+  the code: Q13, whether a Claim may draw on several artifacts, is the question standing
+  between one-for-one supersession and D49's recompute rule.
 
 ---
 
@@ -281,6 +320,14 @@ refuse to invent answers that no requirement has forced yet.
 **Protocol when work hits one:** stop, ask, and log the answer in `ai/DECISIONS.md`.
 Do not pick silently, and do not code around it. A decision made in passing inside an
 implementation is exactly what these documents exist to prevent.
+
+**M2 is the evidence that this works.** Twenty-one entries — D29 through D49 — were
+logged while the email half was built, each before the code that depended on it. Two of
+them are the protocol catching something expensive: D46, where statement ingestion ran
+into a cardinality D38 had settled three days earlier and the schema had to change
+before a line of statement code was written; and D47, where the question *"has
+`superseded_by_claim_id` ever been used?"* turned a speculative lineage design into a
+one-paragraph answer. Neither would have surfaced from writing the code first.
 
 ### Found while scoping M1 — 2026-08-24
 
@@ -363,11 +410,13 @@ real parsers, real transactions in a table — not more design.
 
 ## 8. Open — project level
 
-1. **How is the result actually seen?** The success criterion requires a table, and
-   PRODUCT.md says a UI is not Core's job. Preference stated: something *techy*. Likely
-   candidates: `curl | jq`, a `billycore tx` CLI table, or a single static HTML page fed
-   by `GET /v1/transactions`. Undecided, and it is on the critical path — the MVP is not
-   demonstrable without it.
+1. ~~**How is the result actually seen?**~~ **Decided by D32** — a `billycore tx`
+   terminal table and a plain web page fed by `GET /v1/transactions` — and **built by
+   nothing.** This has moved from the hardest open question in this section to the
+   shortest path on the board: the decision is made, the data exists, and 800
+   Transactions are sitting in SQLite where only SQL can reach them. It is §3 step 8 and
+   it is the critical path. The MVP is not demonstrable without it, and everything else
+   in M2 now depends on it less than it depends on being *seen*.
 2. ~~**What gets cut?**~~ **Closed by D28: nothing.** The question was put directly on
    2026-08-25 with four options on the table — ship late, statement-only, reconcile by
    hand, or drop history — and the answer was to hold the scope and move the date. The
