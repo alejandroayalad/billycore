@@ -1115,6 +1115,45 @@ Transaction Billy can currently build. It has to be answered before reconciliati
 anything.
 **Source.** Author decision, 2026-08-28.
 
+### D50 — BillyCore hardcodes the currencies it supports, with their exponents
+**Status:** Accepted · 2026-08-28 · Reversibility: cheap
+**Decision.** `internal/domain/currency.go` holds a map from each supported currency to
+its ISO 4217 minor-unit exponent. It holds one entry today: `MXN` at 2. `Currency
+.Validate` rejects a code that is not in it, and `Money.Decimal` renders an amount with
+the exponent of its currency.
+**Closes.** API.md open question 8 — where the minor-unit exponent per currency comes
+from. The three options it named were a currency table, hardcoding the supported set, or
+leaving the exponent to the consumer.
+**Why.** BillyCore supports exactly one currency (D30) and has 800 stored Transactions in
+it. A currency table is data to maintain and refresh for a problem nobody has: adding a
+currency is a line in a map and a test. Leaving the exponent to the consumer contradicts
+the success criterion, which asks for *good financial information* rather than an integer
+the reader has to know how to scale.
+**Rejected — ship a currency table.** The general answer, and the right one for a service
+with many currencies. It buys nothing here and has to be sourced, stored and kept
+current, which is a supply chain for a fact that changes about once a decade.
+**Rejected — leave the exponent to the consumer.** Cheapest in Core. It moves the one
+piece of knowledge that turns `100000` into `1000.00` outside the system that owns the
+number, so every consumer reimplements it and one of them gets it wrong.
+**Consequence — the currency vocabulary is now closed.** Before this, any three uppercase
+letters validated. A parser that produces `USD` now fails at the domain boundary rather
+than storing an amount nothing can render. That is the intended behaviour and it is a
+narrowing: it is the same discipline `TransactionDirection` and `FinancialStatus` already
+keep.
+**Consequence — a weakened test was found and repaired.** `TestAddRejectsMixedCurrency`
+built its second value with `NewMoney(100, "USD")` and discarded the error. Once USD
+stopped validating, that call returned the zero Money and the test began asserting that
+an empty currency does not add to MXN — still green, no longer about mixed currencies. It
+now builds the value directly. A closed vocabulary can silently defang any test that
+discards a constructor error.
+**Consequence — `Money.String` and `Money.Decimal` are different renderings on purpose.**
+`String` keeps the exact stored integer for a log or an error. `Decimal` is the form a
+person reads. API.md question 9 warns against two amount formats in one contract; these
+are not in a contract, and the wire format is unchanged.
+**Open — this does not answer API.md question 9.** Whether `POST /v1/claims` accepts a
+decimal string and converts it server-side is still open, and it is now cheaper to say
+yes, because Core holds the exponent that such a conversion needs.
+**Source.** Author decision, 2026-08-28.
 ---
 
 ## Template

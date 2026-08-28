@@ -297,11 +297,11 @@ step 1 has since shipped. They are kept here because M1 depends on both.
 
 Three were parked here as "not yet". Two of them are now next:
 
-- **API.md Q8 — the currency minor-unit exponent. This blocks §3 step 8.** It was filed
-  as blocking *rendering* amounts rather than storing them, which was correct and is no
-  longer a reason to defer it: rendering amounts is precisely what the terminal table
-  and the web page do. 800 rows hold `amount_minor` and `MXN`, and nothing yet knows
-  that MXN divides by 100. Answer it before the table, not during it.
+- ~~**API.md Q8 — the currency minor-unit exponent.**~~ **Closed by D50**: BillyCore
+  hardcodes the currencies it supports with their exponents, one entry today — MXN at 2 —
+  and `Money.Decimal` renders with it. The currency vocabulary is now closed, which is a
+  narrowing: a parser that produces `USD` fails at the domain boundary rather than
+  storing an amount nothing can render. §3 step 8 is unblocked.
 - **DATA_MODEL.md Q1 — what a reconciliation candidate references.** Blocks
   reconciliation, now the last slice rather than "week three at the earliest". D42 made
   it answerable and deliberately did not answer it: a candidate referencing Transaction

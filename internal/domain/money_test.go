@@ -28,7 +28,10 @@ func TestNewMoneyAccepts(t *testing.T) {
 
 func TestAddRejectsMixedCurrency(t *testing.T) {
 	mxn, _ := NewMoney(100, "MXN")
-	usd, _ := NewMoney(100, "USD")
+	// Built directly, because NewMoney refuses USD: BillyCore supports one
+	// currency today (D50). The invariant is about two currencies, not about
+	// which two, so it must stay tested while the table holds one entry.
+	usd := Money{minor: 100, currency: "USD"}
 	if _, err := mxn.Add(usd); err == nil {
 		t.Fatal("added USD to MXN")
 	}
@@ -46,9 +49,57 @@ func TestAddSameCurrency(t *testing.T) {
 	}
 }
 
-func TestStringDoesNotRenderDecimal(t *testing.T) {
+func TestStringRendersTheRawMinorAmount(t *testing.T) {
 	m, _ := NewMoney(89993, "MXN")
 	if got := m.String(); got != "89993 MXN" {
-		t.Fatalf("got %q; the minor-unit exponent is API.md open question 8", got)
+		t.Fatalf("got %q, want the exact stored integer for a log", got)
+	}
+}
+
+// D50 — the exponent is known now, so a person can read the amount.
+func TestDecimalRendersWithTheCurrencyExponent(t *testing.T) {
+	for _, tc := range []struct {
+		minor int64
+		want  string
+	}{
+		{89993, "899.93 MXN"},
+		{100000, "1000.00 MXN"},
+		{5, "0.05 MXN"},
+		{1, "0.01 MXN"},
+		{0, "0.00 MXN"},
+	} {
+		m, err := NewMoney(tc.minor, "MXN")
+		if err != nil {
+			t.Fatalf("NewMoney(%d): %v", tc.minor, err)
+		}
+		if got := m.Decimal(); got != tc.want {
+			t.Errorf("Decimal(%d) = %q, want %q", tc.minor, got, tc.want)
+		}
+	}
+}
+
+// The set is closed (D50). A currency Billy cannot render must not reach a
+// column, because a stored amount nothing can display is a fact Billy cannot
+// answer for.
+func TestCurrencyIsAClosedSet(t *testing.T) {
+	if err := Currency("MXN").Validate(); err != nil {
+		t.Errorf("MXN was rejected: %v", err)
+	}
+	for _, code := range []Currency{"USD", "EUR", "JPY", "XXX"} {
+		if err := code.Validate(); err == nil {
+			t.Errorf("%s was accepted; BillyCore does not support it", code)
+		}
+	}
+	// A malformed code reports its shape, not its absence from the table.
+	for _, code := range []Currency{"", "mx", "mxn", "MXNN"} {
+		if err := code.Validate(); err == nil {
+			t.Errorf("%q was accepted as a currency", code)
+		}
+	}
+	if _, ok := Currency("MXN").Exponent(); !ok {
+		t.Error("MXN has no exponent")
+	}
+	if _, ok := Currency("USD").Exponent(); ok {
+		t.Error("an unsupported currency reported an exponent")
 	}
 }
