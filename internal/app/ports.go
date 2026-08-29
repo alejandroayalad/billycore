@@ -190,3 +190,39 @@ type TransactionRepository interface {
 	// The set is the unit, because the stage advance is in this transaction.
 	Save(ctx context.Context, built []BuiltTransaction, now time.Time) (bool, error)
 }
+
+// TransactionCursor is the stable ordering key for a Transaction page.
+type TransactionCursor struct {
+	OccurredAt time.Time
+	ID         string
+}
+
+// TransactionQuery contains the filters from GET /v1/transactions.
+type TransactionQuery struct {
+	From                 *time.Time
+	To                   *time.Time
+	Directions           []domain.TransactionDirection
+	FinancialStatuses    []domain.FinancialStatus
+	ReconciliationStates []domain.ReconciliationState
+	Currency             domain.Currency
+	After                *TransactionCursor
+	Limit                int
+}
+
+// ListedTransaction adds Claim support to a Transaction list row.
+type ListedTransaction struct {
+	Transaction        domain.Transaction
+	MerchantConfidence domain.Confidence
+	AccountConfidence  domain.Confidence
+}
+
+// TransactionPage is one deterministic page and whether another page exists.
+type TransactionPage struct {
+	Transactions []ListedTransaction
+	HasMore      bool
+}
+
+// TransactionReader reads the ACTIVE Transactions Billy currently uses.
+type TransactionReader interface {
+	List(ctx context.Context, query TransactionQuery) (TransactionPage, error)
+}

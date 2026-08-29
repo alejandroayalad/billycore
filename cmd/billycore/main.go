@@ -132,11 +132,12 @@ func runServe(args []string) error {
 	// through one table.
 	queue := sqlite.NewEvidenceQueue(db)
 	extractor := app.NewExtractor(queue, sqlite.NewClaimRepository(db), nu.Interpreter{})
-	reconciler := app.NewReconciler(queue, sqlite.NewTransactionRepository(db))
+	transactions := sqlite.NewTransactionRepository(db)
+	reconciler := app.NewReconciler(queue, transactions)
 	pipelineWake, wakePipeline := newWakeSignal()
 	worker := newPipelineWorker(extractor, reconciler, pipelineWake)
 
-	server := api.NewServer(app.NewIngestor(evidence), evidence, targets, db, wakePipeline)
+	server := api.NewServer(app.NewIngestor(evidence), evidence, transactions, targets, db, wakePipeline)
 
 	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(targets))
 

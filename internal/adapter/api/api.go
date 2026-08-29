@@ -43,10 +43,11 @@ type SyncTarget struct {
 
 // Server holds what the handlers need. One per process.
 type Server struct {
-	ingestor *app.Ingestor
-	evidence app.EvidenceRepository
-	sources  map[string]SyncTarget
-	storage  Pinger
+	ingestor     *app.Ingestor
+	evidence     app.EvidenceRepository
+	transactions app.TransactionReader
+	sources      map[string]SyncTarget
+	storage      Pinger
 
 	// onEvidenceAvailable is called after Evidence has been recorded, and it is
 	// how the pipeline learns there is something to do. Deliberately unnamed
@@ -65,10 +66,11 @@ type Server struct {
 	syncing map[string]bool
 }
 
-func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, sources map[string]SyncTarget, storage Pinger, onEvidenceAvailable func()) *Server {
+func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, transactions app.TransactionReader, sources map[string]SyncTarget, storage Pinger, onEvidenceAvailable func()) *Server {
 	return &Server{
 		ingestor:            ingestor,
 		evidence:            evidence,
+		transactions:        transactions,
 		sources:             sources,
 		storage:             storage,
 		onEvidenceAvailable: onEvidenceAvailable,
@@ -85,6 +87,7 @@ func (s *Server) Handler(token string) http.Handler {
 	v1 := http.NewServeMux()
 	v1.HandleFunc("POST /v1/sources/{id}/sync", s.handleSync)
 	v1.HandleFunc("GET /v1/evidence/{id}", s.handleGetEvidence)
+	v1.HandleFunc("GET /v1/transactions", s.handleListTransactions)
 	mux.Handle("/v1/", authenticate(token, v1))
 
 	return recoverPanics(logRequests(mux))

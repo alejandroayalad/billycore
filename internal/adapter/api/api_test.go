@@ -132,7 +132,7 @@ func serverWith(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFet
 			},
 		},
 	}
-	return NewServer(ingestor, repo, sources, stubPinger{}, notify).Handler(testToken)
+	return NewServer(ingestor, repo, &stubTransactionReader{}, sources, stubPinger{}, notify).Handler(testToken)
 }
 
 func request(t *testing.T, handler http.Handler, method, path, token string) *httptest.ResponseRecorder {
@@ -203,7 +203,7 @@ func TestHealthzNeedsNoToken(t *testing.T) {
 }
 
 func TestHealthzReportsUnreachableStorage(t *testing.T) {
-	server := NewServer(nil, newStubRepo(), nil, stubPinger{err: errors.New("database is locked")}, nil)
+	server := NewServer(nil, newStubRepo(), &stubTransactionReader{}, nil, stubPinger{err: errors.New("database is locked")}, nil)
 	w := request(t, server.Handler(testToken), http.MethodGet, "/healthz", "")
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)

@@ -17,4 +17,5 @@ var (
 var (
 	_ app.ReconcileQueue        = (*EvidenceQueue)(nil)
 	_ app.TransactionRepository = (*TransactionRepository)(nil)
+	_ app.TransactionReader     = (*TransactionRepository)(nil)
 )
