@@ -1154,6 +1154,75 @@ are not in a contract, and the wire format is unchanged.
 decimal string and converts it server-side is still open, and it is now cheaper to say
 yes, because Core holds the exponent that such a conversion needs.
 **Source.** Author decision, 2026-08-28.
+### D51 — PDF text extraction shells out to `pdftotext`
+**Status:** Accepted · 2026-08-28 · Reversibility: bounded — a runtime dependency and one adapter
+**Decision.** BillyCore extracts text from a PDF statement by running the external
+`pdftotext` executable through `os/exec`, conceptually
+`exec.CommandContext(ctx, "pdftotext", "-layout", inputPath, "-")`, taking stdout as the
+input to the statement parser and stderr as diagnostics. **No Go PDF parsing library, and
+no Python.** The pipeline is: PDF Evidence → `pdftotext -layout` → plain text →
+deterministic Go statement parser → Claim set → the existing Transaction and
+reconciliation stages.
+**Closes.** The open problem CONTEXT.md §3 named when M2 was scoped: Go has no standard
+library for PDF text extraction, so this was "either a dependency the author approves
+(SECURITY.md §11) or an external extractor posting to `POST /v1/claims`". It is neither of
+those two.
+**Why.** The real Nu July 2026 statement is text-based, and its transaction structure
+survives text extraction well — regular purchase rows, SPEI transfers with times and
+tracking keys, deposits, card payments, and other movement types all come through. The
+architecture fit is the other half: D5 chose Go partly to avoid cgo, and a short-lived
+external process puts PDF decoding — the most exploit-prone category of code in this
+project, pointed at bytes D16 treats as hostile — outside the address space that holds a
+live Gmail refresh token and the whole financial database.
+**Rejected — a Go PDF parsing library.** One `go.mod` entry, everything in-process, no
+runtime dependency for the user. It links the parser of hostile input into the process
+that holds every secret in SECURITY.md §1, and §11 is explicit that anything linked in
+inherits that access and that parsing libraries get the most scrutiny. The cgo-backed
+options also contradict D5.
+**Rejected — Python.** It has the strongest extraction ecosystem and it introduces a
+second language, a second toolchain and a second dependency manager into a project whose
+delivery shape is a single statically linked Go binary (D3, D5).
+**Rejected — D11's external proposer as the PDF path.** It remains the escape hatch it was
+designed to be, and it is not the MVP path. It would also need a writer for
+`POST /v1/claims` that D46 removed when the unit of activation became a set, so choosing
+it would add work before any statement could be read at all.
+**Consequence — the boundary is bytes to text, and nothing else.** `pdftotext` performs no
+financial interpretation. Every Nu-specific rule stays in BillyCore's Go parser, beside
+the four email templates. A subprocess that started deciding what a row means would put
+interpretation outside the system that validates it.
+**Consequence — D4's "one binary" narrows.** BillyCore is still one process the user
+starts, and it now expects `pdftotext` on `PATH`. It is launched only when a PDF is
+extracted, never as a daemon. Poppler is not bundled in the MVP.
+**Consequence — a dependency that `go.sum` cannot see.** `govulncheck` does not scan it
+and SECURITY.md §11's review procedure assumes a package manager's tree. The trust
+boundary moved rather than disappeared: the cost is accepted in exchange for the process
+boundary, and the host's package manager owns the patching.
+**Consequence — a missing `pdftotext` fails the extraction, not the startup.** BillyCore
+starts, serves, and ingests email without it. The failure names the missing runtime
+dependency plainly, so the user can install it.
+**Consequence — the domain learns nothing about any of this.** The integration sits behind
+an application port with an adapter beneath it. `internal/domain` never sees `os/exec`,
+Poppler, PDFs, filesystem paths or subprocesses (D6).
+**Consequence — the safety controls ship with the first line, not after it.** An execution
+timeout; a bounded output size; no shell; arguments passed directly through
+`exec.CommandContext`; a controlled environment; a non-zero exit status treated as an
+extraction failure; and the original PDF Evidence preserved unchanged (D7, D10).
+**Consequence — two earlier decisions are confirmed by the artifact.** One statement is
+one immutable Evidence holding many movements, which is exactly the shape D46 restructured
+the schema for. And the statement carries SPEI tracking keys, which is where D36 said the
+`tracking_key` field would earn its place — it reaches only 16 of the 1,044 email
+artifacts, and D42 rejected merging on it against that corpus for that reason.
+**Consequence — the first slice is a probe, not a parser.** Prove the smallest vertical
+path first: a real Nu PDF → `pdftotext` → deterministic rows → Claims. Test the extractor
+against several real statements from different months before writing the full parser. **If
+the extracted structure is not stable across months, stop and report the difference rather
+than adding heuristics silently.** That instruction is part of this decision: a parser that
+absorbs template drift quietly is how a table acquires rows nobody can account for.
+**Open — how the PDF becomes Evidence.** `POST /v1/evidence` with a `content_type` of
+`application/pdf` (D24, D27), by hand, because the statement is behind an app login and
+D16 forbids Core from fetching it. The size bound on that endpoint and the shape of the
+upload are not settled here.
+**Source.** Author decision, 2026-08-28.
 ---
 
 ## Template
