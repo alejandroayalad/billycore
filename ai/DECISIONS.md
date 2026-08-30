@@ -1223,6 +1223,342 @@ absorbs template drift quietly is how a table acquires rows nobody can account f
 D16 forbids Core from fetching it. The size bound on that endpoint and the shape of the
 upload are not settled here.
 **Source.** Author decision, 2026-08-28.
+
+### D52 — A Source names an extraction profile, and each reading snapshots it
+**Status:** Accepted · 2026-08-29 · Reversibility: bounded — configuration and schema
+**Decision.** Every configured Source names one extraction profile from a closed
+vocabulary: `NU_EMAIL_V1`, `NU_STATEMENT_V1`, or `HSBC_STATEMENT_V1`. Ingestion copies
+the profile onto the Evidence queue row. Each Interpretation records the profile that
+produced it. A profile name follows `<ISSUER>_<DOCUMENT FAMILY>_V<n>`; its version is
+BillyCore's reading contract, not the issuer's document version.
+**Closes.** The dispatch question introduced by adding statement Evidence: content type
+cannot select a parser when two issuers both submit `application/pdf`, and current Source
+configuration cannot explain a historical Interpretation after it changes.
+**Why.** Dispatch must be deterministic and auditable. The Evidence row must keep the
+profile selected when the artifact arrived, so a restart drains the durable queue without
+consulting mutable configuration. The Interpretation must keep the profile that made its
+Claims, so re-extraction can replace a reading without rewriting its history (D47, D48).
+**Rejected — infer the parser from content.** MIME type separates email from PDF but
+cannot separate two statement layouts. Inspecting issuer text before dispatch makes an
+unrecorded parser guess about hostile input.
+**Rejected — read the current Source profile during extraction.** It avoids a column and
+makes queued work change meaning when `sources.json` changes. It also cannot explain an
+old Interpretation after the Source is reconfigured or removed.
+**Consequence — configuration has no default.** A missing or unknown profile stops
+startup with the supported vocabulary. A known profile may exist before its parser; its
+Evidence stays retryable and fails extraction with a bounded diagnostic that names the
+profile but not the artifact.
+**Consequence — format validation precedes interpretation.** The registry checks the
+declared media type and a bounded signature where one exists. A mismatch is a dispatch
+failure, not an unrecognised financial template.
+**Consequence — the domain Evidence remains unchanged.** A profile is configuration, not
+a fact contained in the artifact. The database stores it beside immutable Evidence as
+pipeline input; the domain object continues to contain only source identity, artifact
+identity, content, and timestamps.
+**Consequence — migration 006 backfills the live corpus.** All 1,044 existing Evidence
+rows and 800 Interpretations came from the Nu Gmail Source and become `NU_EMAIL_V1`.
+Future writes always state their profile explicitly.
+**Source.** Author decision, 2026-08-29.
+
+### D53 — Direct Evidence uploads are bounded JSON for configured direct Sources
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** `POST /v1/evidence` accepts one JSON object with base64-encoded
+`raw_content`. The decoded artifact is limited to **10 MiB**, and the complete HTTP body
+is limited to **14 MiB**. An oversized request returns `413 Payload Too Large` with
+error type `payload_too_large`.
+**Decision.** `source_id` must name a configured Source of type `MANUAL` or
+`BANK_STATEMENT`. The Source configuration supplies `source_type` and
+`extraction_profile`; the request cannot select either. The decoder accepts one object,
+rejects unknown fields and trailing JSON, and requires a non-empty artifact, artifact
+key, content type, and RFC 3339 observation time.
+**Decision.** The first recording returns `201` with the Evidence representation. A
+repeat of `(source_id, source_artifact_key)` returns the immutable existing Evidence and
+`200`, regardless of the repeated body. Neither response includes `raw_content`; that
+remains exclusive to `GET /v1/evidence/{id}`. Only a new row wakes the pipeline.
+**Why.** JSON matches the existing `/v1` contract and avoids adding a multipart parser.
+Base64 expands a 10 MiB artifact to just under 13.34 MiB, so 14 MiB bounds the decoder
+while leaving room for the other fields. Ten MiB is ample for a text-based statement and
+small enough that the request, decoded bytes, and immutable copy can coexist in memory.
+**Rejected — let the request name its profile.** It makes parser selection a mutable
+claim by the uploader and breaks D52's rule that the Source owns the reading contract.
+**Rejected — accept uploads for a fetchable Source.** An upload into a Gmail Source can
+forge an artifact inside the identity namespace owned by its adapter. Direct recording
+belongs only to Sources configured for it.
+**Consequence.** Configured Sources and fetchable sync targets are separate. A statement
+Source can start without a fetcher. Asking `/sync` to fetch such a Source returns `409`,
+because the Source exists but its configured kind does not support that operation.
+**Source.** Author decision, 2026-08-29.
+
+### D54 — Nu statement extraction preserves PDF coordinates
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** Nu statement extraction runs `pdftotext -bbox-layout`. The adapter returns
+bounded coordinate XHTML/XML for a later deterministic Go parser. That parser will use
+the standard `encoding/xml` package; BillyCore adds no Go dependency for this path.
+**Supersedes.** Only D51's `-layout` to plain-text representation. D51's subprocess
+boundary and every safety requirement remain in force.
+**Why.** The May, June, and July 2026 probe found 548 dated rows. Plain `-layout`
+misplaced five wrapped descriptions. `-bbox-layout` paired every date and amount on
+identical coordinates and supplied a description candidate for every row.
+**Consequence.** PDF extraction preserves layout evidence rather than flattening it.
+Financial interpretation remains in BillyCore's deterministic Go statement parser, and
+the original PDF Evidence remains immutable.
+**Source.** Author decision, 2026-08-29.
+
+### D55 — A Cajita movement is a Transaction between the user's own accounts
+**Status:** Accepted · 2026-08-29 · Reversibility: bounded — domain field and schema
+**Decision.** A Cajita is a savings sub-account of the same user. Money goes into it and
+comes out of it. BillyCore records each movement as a Transaction with its true
+direction, and marks the counterparty as the user. An internal Transaction appears in
+the table and is excluded from income and spending totals.
+**Closes.** Whether the 61 Cajita rows in the May, June and July 2026 statements are
+Transactions.
+**Why.** The movement happened and Evidence describes it, so refusing to record it
+discards a fact BillyCore holds. The money did not enter or leave the user's control, so
+counting it as income or spending inflates both sides of a table whose purpose is to say
+where money went. Recording the row and excluding it from the totals answers both.
+**Rejected — a third direction, `INTERNAL`.** Direction carries the sign of unsigned
+Money and has exactly two members by design (`direction.go`). A deposit into a Cajita
+still leaves the spending balance, so its direction is real. Internal describes the
+counterparty, not the direction.
+**Rejected — do not record a Cajita movement.** It is the cheapest reading and it loses
+the user's saving behaviour, which the statement states plainly and nothing else holds.
+**Consequence — the domain needs a new field.** Neither Claim nor Transaction can say
+that the counterparty is the user. `FieldMerchant` is the wrong place: a Cajita is not a
+merchant. This is a DOMAIN.md change and belongs to the author.
+**Consequence — reconciliation.** An internal movement must never reconcile with an
+external one. Two Cajita movements of equal amount on one day are two real movements,
+not one seen twice.
+**Source.** Author, 2026-08-29: "a cajita basically means that you save that money in a
+sub account, you can put there or extract from there." The author confirmed the same day
+that an internal movement is excluded from income and spending totals.
+
+### D56 — A foreign-currency purchase is recorded in the pesos that Nu settled
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** BillyCore converts no currency. A foreign purchase is recorded with the
+MXN amount the statement prints in its amount column. The origin amount and the rate are
+kept as Claim fields for context, and never as Money.
+**Closes.** The conflict found on 2026-08-29 between D50, which closed the currency
+vocabulary to MXN, and the four USD purchases in the May and July 2026 statements.
+**Why.** The statement already carries the conversion. `WHOOP Compra` reads `-$522.83`
+on the row, and `USD 30` with `USD 1.00 = MXN 17.4277` below it; 30 × 17.4277 = 522.83.
+The peso figure is what left the account. Converting again would introduce a float and a
+rounding rule for an amount the issuer already settled exactly. Money stays integer
+minor units (AGENTS.md §3 rule 2) and the vocabulary stays closed at MXN (D50).
+**Rejected — convert the USD amount inside BillyCore.** It computes a number the
+document already states, and it can disagree with the user's own bank by a centavo.
+**Rejected — a second Money in USD.** It reopens the currency vocabulary D50 closed, to
+carry an amount that never moved through the account.
+**Consequence — the exchange line is not a row.** It sits about 23 points below its
+purchase, as a description block and an amount-column block with no date block. The row
+assembler must attach it to the purchase above it. A rule of "the nearest date above"
+invents a Transaction of `USD 30`; the rule of "a date and an amount on one y" leaves it
+unmatched, which is correct.
+**Consequence.** A purchase abroad is a peso Transaction in the table, and the origin
+amount explains it without changing it.
+**Source.** Author decision, 2026-08-29.
+
+### D57 — The Interpreter port takes a context
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** `app.Interpreter` becomes
+`Interpret(ctx context.Context, raw []byte)`. The use case hands over the context it
+already holds. A parser that works in memory accepts the context and ignores it.
+**Closes.** How a statement parser, which runs `pdftotext` outside the process, receives
+the cancellation that D51 and D54 require of it.
+**Why.** The extractor is `Extract(ctx, pdf)`, and its timeout, its caller cancellation
+and its stop-on-oversized-output all travel in that context. The old port had nowhere to
+put one, so a statement parser would have had to invent `context.Background()`: a
+shutdown would no longer stop a running child, and the caller-cancellation path of the
+extractor would become code that nothing reaches. The context is already present one
+frame above the call, in `extractOne`.
+**Rejected — extract before dispatch.** The use case runs `pdftotext` and gives the
+coordinate XHTML to `Interpret` as `raw`. It keeps the port pure and it moves knowledge
+of PDF into the use case, against D52's rule that the profile owns the reading contract.
+It also makes `raw` something other than the Evidence bytes, which is a change of meaning
+next to an immutable artifact (D7).
+**Rejected — `context.Background()` inside the statement parser.** The cheapest change,
+and it discards a guarantee that is built and tested.
+**Consequence.** One implementation, one call site and seven test call sites changed. The
+Nu email parser names the parameter `_`. `TestTheInterpreterReceivesTheCallersContext`
+fails if the use case ever passes a context of its own.
+**Source.** Author decision, 2026-08-29, choosing between the three options above.
+
+### D58 — A statement field is High when two geometric facts agree
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** A value that the right column **and** a partner on the same y both confirm
+is `HIGH`. A value that only its column places is `MEDIUM`. A value that carries its own
+label keeps D34 unchanged.
+**Closes.** How D34 applies to a document that labels nothing.
+**Why.** D34 separates a labelled value from a positional one, and a statement has no
+label on a date or an amount. Read literally, D34 rates the issuer's settled record
+below a notification email, which is backwards. The positional case D34 guarded against
+was a brittle one — "the fourth line of the body" — and a column cross-checked by a
+partner is not that. The date and amount of a row sit on one y in 548 of 548 rows across
+three statements. Two independent facts agree, and neither is a guess.
+**Consequence.** In a statement row the date and the amount are `HIGH`, because each has
+a column and a partner. The merchant is `MEDIUM`, because only its column places it. In
+a SPEI detail block the tracking key and the counterparty are `HIGH` by D34, because the
+document names them.
+**Consequence.** Confidence now answers "how did Billy find this", not "which document
+was it in". A parser that pairs a date with an amount by nearness rather than by an equal
+y must not report `HIGH`.
+**Source.** Author decision, 2026-08-29.
+
+### D59 — A statement reading may be partial, and records how partial
+**Status:** Accepted · 2026-08-29 · Reversibility: bounded — schema
+**Decision.** A row that no shape reads is skipped. The other rows of the statement are
+written together, in one transaction, as one Interpretation. The Interpretation records
+how many rows it could not read.
+**Closes.** What D46's "the set is the unit" means when the set is one statement of about
+180 Claims instead of one email of one.
+**Why.** D46 makes a set atomic so that a half-written reading cannot exist. That is
+right for an email, where the Claims describe one movement. A statement holds about 180
+movements that have nothing to do with each other, and row 47 being unreadable does not
+make rows 1 to 46 wrong. Discarding 179 good rows for one bad one keeps a whole month out
+of the table.
+**Rejected — keep D46 strict for a statement.** One odd row blocks the month. The failure
+is loud, and the cost is the success criterion.
+**Rejected — skip a row and say nothing.** The table under-reports and nothing shows it.
+PRODUCT.md's rule is that BillyCore may be incomplete and may never be unsupported.
+**Consequence — the write stays atomic.** Partial describes the reading, not the write.
+The rows that were read are still one Interpretation in one transaction (D46).
+**Consequence — a column.** The `interpretations` table needs the count of unread rows,
+which is migration 007. A reading with a count above zero is a reading that asks to be
+looked at, and re-extraction (D48) is how it is corrected.
+**Source.** Author decision, 2026-08-29.
+
+### D60 — A foreign purchase records the settled pesos only, for now
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** The statement parser records the peso amount of a foreign purchase and
+nothing else. The origin amount and the exchange rate are not recorded yet.
+**Closes.** D56 keeps the origin amount and the rate "as Claim fields for context", and
+no name exists for either. This says the context waits.
+**Why.** The peso amount is the whole of what the table needs, and it makes the row
+correct today. Naming two fields is a vocabulary decision under D21, and `claim.go`
+already refuses to take one in passing. Nothing yet asks BillyCore to show "you paid USD
+30", so the decision has no requirement behind it.
+**Consequence.** D56 stands: no conversion, the peso figure is what is recorded. Only its
+context clause waits. The exchange line is still never a row.
+**Consequence.** Adding the context later costs a new reading of the same immutable
+Evidence, which is exactly what re-extraction is for (D48).
+**Source.** Author decision, 2026-08-29.
+
+### D61 — FieldCounterparty names who was on the other side
+**Status:** Accepted · 2026-08-29 · Reversibility: bounded — domain vocabulary
+**Decision.** `FieldCounterparty` joins the Claim field vocabulary. It holds the person
+or the institution on the other side of a transfer. `FieldMerchant` keeps its meaning: a
+place where something was bought.
+**Closes.** The tension CONTEXT.md §3.1 recorded — "transfer counterparties are person
+names and CLABE entities, not merchant descriptors" — now that a statement makes it a
+question of code and not of documentation.
+**Why.** A SPEI detail names a person and an institution, and neither is a merchant. One
+column that holds both reads wrong in the table and blurs the merchant signal DOMAIN.md
+§6 depends on.
+**Rejected — reuse `FieldMerchant`.** It ships sooner and it puts a person's name in a
+column named merchant.
+**Rejected — add the full detail vocabulary now.** `FieldCounterpartyAccount`,
+`FieldConcept` and `FieldReference` are three more decisions with no requirement pushing
+them. The CLABE also needs care: CONTEXT.md §3.1 warns that the counterparty's account
+recorded as the user's poisons the account signal.
+**Consequence.** The SPEI slice emits `FieldCounterparty` and `FieldTrackingKey` and
+leaves the CLABE, the concept and the reference unread. They stay in the immutable
+artifact for a later reading (D48).
+**Consequence — a comment is now wrong.** `FieldTrackingKey` says a tracking key is
+"never an inflow, so the two halves of a transfer can never be matched by it". That was
+true of the mailbox, where 16 of 1,044 artifacts carried one. A statement carries one on
+128 of 130 SPEI movements, in both directions.
+**Source.** Author decision, 2026-08-29.
+
+### D62 — An internal movement records the user as the counterparty
+**Status:** Accepted · 2026-08-29 · Reversibility: bounded — domain vocabulary
+**Decision.** `FieldCounterparty` carries a reserved value that means "the user". A
+movement between the user's own accounts records it. An internal movement appears in the
+table and is excluded from income and spending totals (D55).
+**Closes.** D55's open consequence: neither Claim nor Transaction could say that the
+counterparty is the user.
+**Why.** The fact belongs to the other side of the movement, and `FieldCounterparty`
+(D61) is the field that describes the other side. No new field is added.
+**Rejected — `FieldTransferScope` with `INTERNAL` and `EXTERNAL`.** It keeps the scope
+and the counterparty as two separate facts and adds a field for a distinction that one
+value can carry.
+**Rejected — a boolean `FieldInternal`.** Every other field is a value and not a flag,
+and a flag cannot hold a third scope later.
+**Consequence — the value is a domain constant.** It is declared once in
+`internal/domain/claim.go` and validated there. No parser writes the literal. A reader
+that shows the counterparty as a name must know the value and must not print it raw.
+**Consequence — the value must be one a statement cannot print.** A counterparty named
+the same word would be read as the user. The constant is chosen so that no name Nu
+prints can equal it.
+**Source.** Author decision, 2026-08-29, choosing among three options.
+
+### D63 — Dinero de respaldo is the user's own money
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** A row that reads `Retirado de tu dinero de respaldo` is an internal
+movement, the same as a Cajita movement. It records the user as the counterparty (D62)
+and stays out of income and spending totals (D55).
+**Closes.** What the 44 `respaldo` rows in the May, June and July 2026 statements are.
+**Why.** The backing money is the user's own, held aside. Moving it to the spending
+balance moves nothing into or out of the user's control. Counting it as income would
+report about 44 arrivals of money that was already there.
+**Consequence — one shape family.** Cajita and respaldo are read together: about 105
+internal movements across the three statements.
+**Consequence — the cover page is not a movement.** `Dinero de respaldo` also appears on
+the first page beside `su Cuenta` and `Total`, as an unsigned balance with no date. That
+is a summary figure, and the row assembler must produce nothing from it.
+**Source.** Author decision, 2026-08-29.
+
+### D64 — A statement date with no time is midnight in Mexico City
+**Status:** Accepted · 2026-08-29 · Reversibility: cheap
+**Decision.** A statement row states a day and no time of day. The parser reads it
+as 00:00:00 in `America/Mexico_City` (D29) and stores the UTC instant, so
+`31 MAY 2026` becomes `2026-05-31T06:00:00.000Z`. The confidence stays `HIGH`, because
+D58 rates the day, which the column and its partner both place.
+**Closes.** The gap found on 2026-08-29 while writing the `Compra` shape.
+`parser.Wall` carries `HasTime` and says "midnight is a real time; absence is not
+midnight", so the date handling deliberately refused to choose. Every existing caller
+either had an `Hora:` line or emitted no `occurred_at` at all (D33).
+**Why.** The day is the only fact the row states, and midnight in the user's own zone is
+the reading that keeps that day right for the reader the table is for. Mexico City is
+UTC-6, so reading the wall value as UTC would move each purchase to the day before.
+**Rejected — midday in Mexico City.** It survives a careless re-render in any zone from
+UTC-12 to UTC+11. It loses because it invents a time of day no statement ever prints,
+and it buys robustness against a consumer that is BillyCore's own.
+**Rejected — emit no `occurred_at` and let the fallback fire.** Strictly honest, and
+wrong here: DATA_MODEL.md §4.5 falls back to the artifact's `observed_at`, which is when
+the PDF was uploaded, so about 180 rows of one month would collapse onto one date and
+the row date the document does state would be discarded.
+**Consequence.** The time of day is a convention and not a reading. A statement
+Transaction sorts before every email Transaction of the same day, and reconciliation
+between the two Sources must compare days rather than instants.
+**Source.** Author decision, 2026-08-29, choosing between the three options above.
+
+
+### D65 — The reserved counterparty value is `urn:billy:self`
+**Status:** Accepted · 2026-08-29 · Reversibility: bounded — it is a stored value
+**Decision.** `domain.CounterpartySelf` is the string `urn:billy:self`. It is declared
+once in `internal/domain/claim.go`. `FieldCounterparty` accepts it, and rejects every
+other value that starts with `urn:billy:`, which is the namespace BillyCore owns.
+**Closes.** D62 requires the value to be "one a statement cannot print" and does not name
+it. Choosing a literal in passing inside a parser is what D21 forbids, so it is chosen
+here.
+**Why.** A URN is not a name. A statement prints merchant descriptors, person names and
+institutions, and none of them is a colon-separated URN in a namespace that belongs to
+BillyCore. The namespace also makes room for a second reserved value later without a
+second decision about its shape.
+**Rejected — `__SELF__`.** Shorter, and it reads as a placeholder. It loses because it
+says nothing about who reserved it, and because underscore-wrapped words are a convention
+other systems also use, so a value arriving from a future Source could collide.
+**Rejected — an empty counterparty for an internal movement.** It costs nothing to write
+and it is the one thing DOMAIN.md §7 forbids: absence has to keep meaning "Billy has no
+belief", and an internal movement is a belief.
+**Consequence — the namespace is validated, not only the value.** A near miss such as
+`urn:billy:sef` is rejected at the domain boundary rather than stored as a counterparty
+that reads like a person. This is the same narrowing D50 made for currency.
+**Consequence — a reader must translate it.** `billycore tx` and the web page show the
+user, never the raw value. Nothing shows a counterparty yet, so nothing is broken today.
+**Source.** Agent implementation of D61 and D62, 2026-08-29. Overrule the literal by
+superseding this entry; it is one constant and one test.
+
+
 ---
 
 ## Template
