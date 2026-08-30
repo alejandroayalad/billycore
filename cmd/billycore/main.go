@@ -65,10 +65,12 @@ func run() error {
 			return runAuth(args)
 		case "peek":
 			return runPeek(args)
+		case "tx":
+			return runTx(args)
 		case "serve":
 			return runServe(args)
 		default:
-			return fmt.Errorf("unknown command %q (commands: serve, auth, peek)", cmd)
+			return fmt.Errorf("unknown command %q (commands: serve, auth, peek, tx)", cmd)
 		}
 	}
 	return runServe(os.Args[1:])
