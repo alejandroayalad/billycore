@@ -41,7 +41,7 @@ func apiTransaction(t *testing.T, id string, at time.Time) domain.Transaction {
 
 func transactionHandler(t *testing.T, reader app.TransactionReader) http.Handler {
 	t.Helper()
-	return NewServer(nil, newStubRepo(), reader, nil, stubPinger{}, nil).Handler(testToken)
+	return NewServer(nil, newStubRepo(), reader, nil, nil, stubPinger{}, nil).Handler(testToken)
 }
 
 func TestListTransactionsReturnsTheDocumentedRepresentation(t *testing.T) {

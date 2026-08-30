@@ -21,7 +21,7 @@ import (
 
 	"github.com/alejandroayalad/billycore/internal/adapter/api"
 	"github.com/alejandroayalad/billycore/internal/adapter/config"
-	"github.com/alejandroayalad/billycore/internal/adapter/parser/nu"
+	"github.com/alejandroayalad/billycore/internal/adapter/parser/profile"
 	"github.com/alejandroayalad/billycore/internal/adapter/source/gmail"
 	"github.com/alejandroayalad/billycore/internal/adapter/store/sqlite"
 	"github.com/alejandroayalad/billycore/internal/app"
@@ -116,7 +116,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(targets) == 0 {
+	if len(sources) == 0 {
 		// Not a startup failure: BillyCore serves, and every sync answers 404
 		// until a Source is configured (D26).
 		slog.Warn("no Source is configured: every sync will answer 404",
@@ -131,15 +131,15 @@ func runServe(args []string) error {
 	// are consumed by separate use cases (D6), not because two things move rows
 	// through one table.
 	queue := sqlite.NewEvidenceQueue(db)
-	extractor := app.NewExtractor(queue, sqlite.NewClaimRepository(db), nu.Interpreter{})
+	extractor := app.NewExtractor(queue, sqlite.NewClaimRepository(db), profile.New())
 	transactions := sqlite.NewTransactionRepository(db)
 	reconciler := app.NewReconciler(queue, transactions)
 	pipelineWake, wakePipeline := newWakeSignal()
 	worker := newPipelineWorker(extractor, reconciler, pipelineWake)
 
-	server := api.NewServer(app.NewIngestor(evidence), evidence, transactions, targets, db, wakePipeline)
+	server := api.NewServer(app.NewIngestor(evidence), evidence, transactions, configuredSources(sources), targets, db, wakePipeline)
 
-	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(targets))
+	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(sources))
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -212,7 +212,7 @@ func syncTargets(sources []config.Source, dir string) (map[string]api.SyncTarget
 		case domain.SourceGmail:
 			query := source.Query
 			targets[source.ID] = api.SyncTarget{
-				Source: app.Source{ID: source.ID, Type: source.Type},
+				Source: app.Source{ID: source.ID, Type: source.Type, Profile: source.ExtractionProfile},
 				Fetcher: func(ctx context.Context) (app.SourceFetcher, error) {
 					client, err := gmail.NewClient(ctx, dir)
 					if err != nil {
@@ -221,6 +221,10 @@ func syncTargets(sources []config.Source, dir string) (map[string]api.SyncTarget
 					return gmail.NewFetcher(client, query), nil
 				},
 			}
+		case domain.SourceBankStatement, domain.SourceManual:
+			// Direct Sources are configured so POST /v1/evidence can resolve
+			// their type and profile. They have no fetcher (D53).
+			continue
 		default:
 			// Configuration that names a Source kind BillyCore cannot fetch is
 			// a startup error, not a 404 discovered later.
@@ -228,6 +232,16 @@ func syncTargets(sources []config.Source, dir string) (map[string]api.SyncTarget
 		}
 	}
 	return targets, nil
+}
+
+func configuredSources(sources []config.Source) map[string]app.Source {
+	configured := make(map[string]app.Source, len(sources))
+	for _, source := range sources {
+		configured[source.ID] = app.Source{
+			ID: source.ID, Type: source.Type, Profile: source.ExtractionProfile,
+		}
+	}
+	return configured
 }
 
 // defaultDataDir is ~/.billy — one predictable location the user can name, back

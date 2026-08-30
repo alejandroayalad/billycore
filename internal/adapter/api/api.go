@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/alejandroayalad/billycore/internal/app"
+	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
 // timeLayout is API.md §1's timestamp: RFC 3339, always UTC, always with
@@ -46,7 +47,8 @@ type Server struct {
 	ingestor     *app.Ingestor
 	evidence     app.EvidenceRepository
 	transactions app.TransactionReader
-	sources      map[string]SyncTarget
+	sources      map[string]app.Source
+	syncTargets  map[string]SyncTarget
 	storage      Pinger
 
 	// onEvidenceAvailable is called after Evidence has been recorded, and it is
@@ -66,12 +68,13 @@ type Server struct {
 	syncing map[string]bool
 }
 
-func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, transactions app.TransactionReader, sources map[string]SyncTarget, storage Pinger, onEvidenceAvailable func()) *Server {
+func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, transactions app.TransactionReader, sources map[string]app.Source, syncTargets map[string]SyncTarget, storage Pinger, onEvidenceAvailable func()) *Server {
 	return &Server{
 		ingestor:            ingestor,
 		evidence:            evidence,
 		transactions:        transactions,
 		sources:             sources,
+		syncTargets:         syncTargets,
 		storage:             storage,
 		onEvidenceAvailable: onEvidenceAvailable,
 		syncing:             map[string]bool{},
@@ -86,6 +89,7 @@ func (s *Server) Handler(token string) http.Handler {
 
 	v1 := http.NewServeMux()
 	v1.HandleFunc("POST /v1/sources/{id}/sync", s.handleSync)
+	v1.HandleFunc("POST /v1/evidence", s.handlePostEvidence)
 	v1.HandleFunc("GET /v1/evidence/{id}", s.handleGetEvidence)
 	v1.HandleFunc("GET /v1/transactions", s.handleListTransactions)
 	mux.Handle("/v1/", authenticate(token, v1))
@@ -131,10 +135,15 @@ type syncResponse struct {
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	sourceID := r.PathValue("id")
 
-	target, configured := s.sources[sourceID]
+	_, configured := s.sources[sourceID]
 	if !configured {
 		// The Source is not in sources.json (D26).
 		writeError(w, http.StatusNotFound, typeNotFound, "No such Source is configured.")
+		return
+	}
+	target, fetchable := s.syncTargets[sourceID]
+	if !fetchable {
+		writeError(w, http.StatusConflict, typeConflict, "This Source does not support synchronization.")
 		return
 	}
 	if !s.beginSync(sourceID) {
@@ -229,6 +238,10 @@ func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, evidenceRepresentation(evidence, true))
+}
+
+func evidenceRepresentation(evidence domain.Evidence, includeRaw bool) evidenceResponse {
 	response := evidenceResponse{
 		ID:                evidence.ID(),
 		SourceID:          evidence.SourceID(),
@@ -237,10 +250,10 @@ func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
 		ContentType:       evidence.ContentType(),
 		ContentBytes:      evidence.ContentBytes(),
 	}
-	if evidence.HasRawContent() {
+	if includeRaw && evidence.HasRawContent() {
 		response.RawContent = base64.StdEncoding.EncodeToString(evidence.RawContent())
 	}
-	writeJSON(w, http.StatusOK, response)
+	return response
 }
 
 // logRequests records what was asked and what was answered. Method, path,

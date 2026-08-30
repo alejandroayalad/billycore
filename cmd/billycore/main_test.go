@@ -1,6 +1,12 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/alejandroayalad/billycore/internal/adapter/config"
+	"github.com/alejandroayalad/billycore/internal/adapter/parser/profile"
+	"github.com/alejandroayalad/billycore/internal/domain"
+)
 
 func TestIsLoopback(t *testing.T) {
 	cases := map[string]bool{
@@ -21,5 +27,23 @@ func TestIsLoopback(t *testing.T) {
 		if got := isLoopback(addr); got != want {
 			t.Errorf("isLoopback(%q) = %v, want %v", addr, got, want)
 		}
+	}
+}
+
+func TestStatementSourcesAreConfiguredWithoutSyncTargets(t *testing.T) {
+	sources := []config.Source{{
+		ID: "nu_statements", Type: domain.SourceBankStatement,
+		ExtractionProfile: profile.NuStatementV1,
+	}}
+	targets, err := syncTargets(sources, t.TempDir())
+	if err != nil {
+		t.Fatalf("syncTargets: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Errorf("statement Source created %d sync targets, want 0", len(targets))
+	}
+	configured := configuredSources(sources)
+	if got := configured["nu_statements"]; got.Type != domain.SourceBankStatement || got.Profile != profile.NuStatementV1 {
+		t.Errorf("configured Source = %+v", got)
 	}
 }
