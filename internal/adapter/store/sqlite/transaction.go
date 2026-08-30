@@ -102,12 +102,13 @@ func insertTransaction(ctx context.Context, tx *sql.Tx, b app.BuiltTransaction, 
 
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO transactions (
-			id, amount_minor, currency, merchant, account_identifier,
+			id, amount_minor, currency, merchant, counterparty, account_identifier,
 			direction, financial_status, reconciliation_state, transaction_state,
 			occurred_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID(), amountMinor, currency,
-		nullableText(t.Merchant()), nullableText(t.AccountIdentifier()),
+		nullableText(t.Merchant()), nullableText(t.Counterparty()),
+		nullableText(t.AccountIdentifier()),
 		string(t.Direction()), string(t.FinancialStatus()), string(t.ReconciliationState()),
 		string(t.State()),
 		formatTime(t.OccurredAt()), formatTime(t.CreatedAt()), formatTime(t.UpdatedAt()),

@@ -195,9 +195,16 @@ func (r *Reconciler) buildTransaction(claim domain.Claim, observedAt time.Time) 
 	}
 
 	transaction, err := domain.NewTransaction(domain.TransactionDraft{
-		ID:                transactionID,
-		Money:             money,
-		Merchant:          textField(claim, domain.FieldMerchant),
+		ID:       transactionID,
+		Money:    money,
+		Merchant: textField(claim, domain.FieldMerchant),
+
+		// The counterparty is its own field and never the merchant (D61). It
+		// carries the reserved value where both sides are the user (D62), and
+		// the Transaction keeps that value so a reader can leave the movement
+		// out of the totals (D55).
+		Counterparty: textField(claim, domain.FieldCounterparty),
+
 		AccountIdentifier: textField(claim, domain.FieldAccountIdentifier),
 		Direction:         domain.TransactionDirection(textField(claim, domain.FieldDirection)),
 		FinancialStatus:   status,

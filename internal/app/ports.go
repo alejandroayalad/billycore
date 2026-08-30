@@ -233,9 +233,10 @@ type TransactionQuery struct {
 
 // ListedTransaction adds Claim support to a Transaction list row.
 type ListedTransaction struct {
-	Transaction        domain.Transaction
-	MerchantConfidence domain.Confidence
-	AccountConfidence  domain.Confidence
+	Transaction            domain.Transaction
+	MerchantConfidence     domain.Confidence
+	CounterpartyConfidence domain.Confidence
+	AccountConfidence      domain.Confidence
 }
 
 // TransactionPage is one deterministic page and whether another page exists.

@@ -29,9 +29,18 @@ type TransactionDraft struct {
 	// amount that has lost its currency (DOMAIN.md §4).
 	Money Money
 
-	// Merchant is the counterparty descriptor exactly as the artifact gave it.
-	// Empty means Billy read no counterparty, not a counterparty named nothing.
+	// Merchant is the place where something was bought, exactly as the
+	// artifact gave it. Empty means Billy read no merchant, not a merchant
+	// named nothing.
 	Merchant string
+
+	// Counterparty is the person or the institution on the other side of the
+	// movement (D61). It is not a merchant, and the two do not replace each
+	// other: a SPEI detail names a person and a bank, and a card purchase
+	// names a shop. Empty means Billy read neither.
+	//
+	// It carries CounterpartySelf when both sides are the user (D62).
+	Counterparty string
 
 	// AccountIdentifier is the account or card the Evidence referenced. Empty
 	// means absent. Nothing populates it today: no Nu template states the
@@ -81,6 +90,7 @@ type Transaction struct {
 	money               Money
 	hasMoney            bool
 	merchant            string
+	counterparty        string
 	accountIdentifier   string
 	direction           TransactionDirection
 	financialStatus     FinancialStatus
@@ -155,11 +165,19 @@ func NewTransaction(d TransactionDraft) (Transaction, error) {
 		return Transaction{}, err
 	}
 
+	// Billy owns the reserved namespace, in this aggregate as in the Claim
+	// (D65). A Transaction is a root of its own, so it answers the question
+	// itself rather than trusting the Claim it was built from.
+	if err := validateCounterparty(d.Counterparty); err != nil {
+		return Transaction{}, fmt.Errorf("transaction: %w", err)
+	}
+
 	return Transaction{
 		id:                  d.ID,
 		money:               money,
 		hasMoney:            hasMoney,
 		merchant:            d.Merchant,
+		counterparty:        d.Counterparty,
 		accountIdentifier:   d.AccountIdentifier,
 		direction:           d.Direction,
 		financialStatus:     d.FinancialStatus,
@@ -218,6 +236,7 @@ func cleanTransactionProvenance(ids []string) ([]string, error) {
 
 func (t Transaction) ID() string                               { return t.id }
 func (t Transaction) Merchant() string                         { return t.merchant }
+func (t Transaction) Counterparty() string                     { return t.counterparty }
 func (t Transaction) AccountIdentifier() string                { return t.accountIdentifier }
 func (t Transaction) Direction() TransactionDirection          { return t.direction }
 func (t Transaction) FinancialStatus() FinancialStatus         { return t.financialStatus }

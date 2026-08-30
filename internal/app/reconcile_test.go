@@ -240,6 +240,89 @@ func TestAnActiveClaimBecomesATransactionWithProvenance(t *testing.T) {
 	}
 }
 
+// D61. The counterparty of a Claim reaches the Transaction. A SPEI statement
+// row names a person, and the field would otherwise be read and then dropped.
+func TestACounterpartyClaimBecomesATransactionCounterparty(t *testing.T) {
+	claim := activeClaim(t, "claim-a", "ev-1", map[domain.FieldName]domain.ClaimField{
+		domain.FieldCounterparty: claimField(t, "VIAJE74 COMIDA75 ALVAREZ76", domain.High),
+	})
+	queue := &fakeReconcileQueue{pending: []app.PendingReconciliation{work(claim, "ev-1")}}
+	transactions := &fakeTransactions{}
+
+	if _, err := newReconciler(queue, transactions).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	tx := transactions.saved[0].transaction
+	if tx.Counterparty() != "VIAJE74 COMIDA75 ALVAREZ76" {
+		t.Errorf("counterparty = %q", tx.Counterparty())
+	}
+	// The two fields are separate facts and neither one replaces the other.
+	if tx.Merchant() != "HSBC beneficiary" {
+		t.Errorf("merchant = %q, want the value the Claim states", tx.Merchant())
+	}
+}
+
+// The reserved value travels unchanged, so a reader can leave an internal
+// movement out of the totals (D55, D62, D65).
+func TestTheReservedCounterpartyReachesTheTransaction(t *testing.T) {
+	claim := activeClaim(t, "claim-a", "ev-1", map[domain.FieldName]domain.ClaimField{
+		domain.FieldCounterparty: claimField(t, domain.CounterpartySelf, domain.High),
+	})
+	queue := &fakeReconcileQueue{pending: []app.PendingReconciliation{work(claim, "ev-1")}}
+	transactions := &fakeTransactions{}
+
+	if _, err := newReconciler(queue, transactions).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := transactions.saved[0].transaction.Counterparty(); got != domain.CounterpartySelf {
+		t.Errorf("counterparty = %q, want %q", got, domain.CounterpartySelf)
+	}
+}
+
+// Absence stays absence. No Nu email template states a counterparty, so all 800
+// Transactions of the mailbox carry none.
+func TestAClaimWithNoCounterpartyLeavesTheTransactionWithout(t *testing.T) {
+	queue := &fakeReconcileQueue{pending: []app.PendingReconciliation{
+		work(activeClaim(t, "claim-a", "ev-1", nil), "ev-1"),
+	}}
+	transactions := &fakeTransactions{}
+
+	if _, err := newReconciler(queue, transactions).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	tx := transactions.saved[0].transaction
+	if tx.Counterparty() != "" {
+		t.Errorf("counterparty = %q, want absent", tx.Counterparty())
+	}
+	if tx.Merchant() != "HSBC beneficiary" {
+		t.Errorf("merchant = %q, want unchanged", tx.Merchant())
+	}
+}
+
+// D36 and the answer taken on 2026-08-29: the tracking key stays a Claim field.
+// `transactions` has no column for it, and DATA_MODEL.md §4.5 lists none. The
+// key is not lost — the store keeps it in claim_fields, and `claim_transaction`
+// joins a Transaction back to the Claim that states it.
+func TestTheTrackingKeyStaysOnTheClaim(t *testing.T) {
+	claim := activeClaim(t, "claim-a", "ev-1", map[domain.FieldName]domain.ClaimField{
+		domain.FieldTrackingKey: claimField(t, "SNTH84848484848484848484", domain.High),
+	})
+	queue := &fakeReconcileQueue{pending: []app.PendingReconciliation{work(claim, "ev-1")}}
+	transactions := &fakeTransactions{}
+
+	if _, err := newReconciler(queue, transactions).Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	saved := transactions.saved[0]
+	if saved.sourceClaimID != "claim-a" {
+		t.Fatalf("source claim = %q, want claim-a: it is the route back to the key", saved.sourceClaimID)
+	}
+	field, ok := claim.Field(domain.FieldTrackingKey)
+	if !ok || field.Text() != "SNTH84848484848484848484" {
+		t.Errorf("the claim no longer states the tracking key")
+	}
+}
+
 // D43. 101 of 800 Claims assert no financial_status: the card payments and the
 // service payments state nothing about settlement. UNKNOWN is a domain value
 // meaning "Billy looked and cannot tell" (DOMAIN.md §5), not a gap dressed up.

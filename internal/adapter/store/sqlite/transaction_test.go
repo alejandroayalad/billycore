@@ -34,7 +34,7 @@ func extractedArtifact(t *testing.T, claims *ClaimRepository, evidence *Evidence
 	storeEvidence(t, evidence, evidenceID, reference)
 	claim := newTransactionalClaim(t, claimID, evidenceID)
 	in := interpretationOf(t, "interp-"+evidenceID, evidenceID, "", claim)
-	created, err := claims.Save(context.Background(), in, claimedAt)
+	created, err := claims.Save(context.Background(), in, testProfile, claimedAt)
 	if err != nil || !created {
 		t.Fatalf("Save interpretation: created=%v err=%v", created, err)
 	}

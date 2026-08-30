@@ -267,3 +267,49 @@ func TestMerchantAndAccountAreOptional(t *testing.T) {
 		t.Errorf("merchant %q / account %q, want both empty", tx.Merchant(), tx.AccountIdentifier())
 	}
 }
+
+// Merchant and counterparty are two facts and not one (D61). A shop is a
+// merchant; the person on the other side of a transfer is a counterparty. A
+// Transaction can carry either, both, or neither.
+func TestMerchantAndCounterpartyAreIndependent(t *testing.T) {
+	cases := map[string]struct{ merchant, counterparty string }{
+		"neither":  {"", ""},
+		"merchant": {"PANADERIA65", ""},
+		"transfer": {"", "VIAJE74 COMIDA75 ALVAREZ76"},
+		"both":     {"PANADERIA65", "VIAJE74 COMIDA75 ALVAREZ76"},
+	}
+	for name, want := range cases {
+		t.Run(name, func(t *testing.T) {
+			draft := validDraft(t)
+			draft.Merchant, draft.Counterparty = want.merchant, want.counterparty
+			tx, err := domain.NewTransaction(draft)
+			if err != nil {
+				t.Fatalf("NewTransaction: %v", err)
+			}
+			if tx.Merchant() != want.merchant {
+				t.Errorf("merchant = %q, want %q", tx.Merchant(), want.merchant)
+			}
+			if tx.Counterparty() != want.counterparty {
+				t.Errorf("counterparty = %q, want %q", tx.Counterparty(), want.counterparty)
+			}
+		})
+	}
+}
+
+// Billy owns the reserved namespace in this aggregate too (D65). A Transaction
+// is a root of its own and does not trust the Claim it was built from.
+func TestATransactionRejectsTheReservedNamespaceExceptTheSelfValue(t *testing.T) {
+	self := validDraft(t)
+	self.Counterparty = domain.CounterpartySelf
+	if _, err := domain.NewTransaction(self); err != nil {
+		t.Fatalf("the reserved value was refused: %v", err)
+	}
+
+	for _, value := range []string{"urn:billy:sef", "urn:billy:", "urn:billy:other"} {
+		draft := validDraft(t)
+		draft.Counterparty = value
+		if _, err := domain.NewTransaction(draft); err == nil {
+			t.Errorf("counterparty %q was accepted", value)
+		}
+	}
+}

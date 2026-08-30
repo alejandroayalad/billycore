@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -38,8 +39,8 @@ func (s ClaimState) String() string { return string(s) }
 // ever reads, and it means the answer to "what can Billy claim about a
 // movement?" is in one place.
 //
-// It is eight names: the six from that table, plus occurred_at (D33) and
-// tracking_key (D36). The event time is a fact extracted from Evidence exactly
+// It is nine names: the six from that table, plus occurred_at (D33),
+// tracking_key (D36) and counterparty (D61). The event time is a fact extracted from Evidence exactly
 // like the amount, and giving it a private path to the Transaction would let
 // one interpreted value skip validation, provenance and confidence — three
 // properties every other extracted value has to earn.
@@ -74,15 +75,57 @@ const (
 	//
 	// SPEI tracking keys are globally unique, so two artifacts sharing one are
 	// the same movement with no ambiguity — the strongest reconciliation signal
-	// DOMAIN.md §6 can be given. It is also the rarest: 16 of 1,044 artifacts
-	// carry one, and never an inflow, so the two halves of a transfer can never
-	// be matched by it. It earns its place against the second Source D27 adds,
-	// not against this mailbox.
+	// DOMAIN.md §6 can be given. The mailbox states one on 16 of 1,044
+	// artifacts and only on an outflow. A statement states one on almost every
+	// SPEI movement, in both directions, so the key can match the two Sources
+	// against each other (D61).
 	//
 	// Opaque on purpose. Billy stores what the artifact said and does not
 	// validate the shape of another system's identifier.
 	FieldTrackingKey FieldName = "tracking_key"
+
+	// FieldCounterparty is the person or the institution on the other side of
+	// a movement (D61). FieldMerchant keeps its own meaning: a place where
+	// something was bought.
+	//
+	// A SPEI detail names a person and a bank, and neither is a merchant. One
+	// field holding both reads wrong in the table and blurs the merchant signal
+	// that DOMAIN.md §6 uses to reconcile.
+	//
+	// It carries CounterpartySelf when the two sides of the movement are the
+	// same user (D62).
+	FieldCounterparty FieldName = "counterparty"
 )
+
+// CounterpartySelf is the reserved counterparty value that means "the user"
+// (D62, D65).
+//
+// A Cajita movement and a `dinero de respaldo` movement go between accounts of
+// one user, so they have no other side. They are recorded with their true
+// direction and stay out of income and spending totals (D55, D63).
+//
+// The value is a URN and not a word, because a counterparty named the same text
+// would be read as the user. No statement prints this.
+//
+// A reader shows it as the user and never prints it raw.
+const CounterpartySelf = "urn:billy:self"
+
+// counterpartyReserved is the namespace that CounterpartySelf lives in. Billy
+// owns it, so no artifact can write a value inside it.
+const counterpartyReserved = "urn:billy:"
+
+// validateCounterparty rejects a value inside Billy's reserved namespace that
+// is not the one Billy declares. A near miss such as `urn:billy:sef` would
+// otherwise be stored as a counterparty that reads like a person (D65).
+//
+// Claim and Transaction are separate aggregate roots, and each one asks this
+// question for itself.
+func validateCounterparty(value string) error {
+	if strings.HasPrefix(value, counterpartyReserved) && value != CounterpartySelf {
+		return fmt.Errorf("%q is in Billy's reserved namespace and is not %q", value, CounterpartySelf)
+	}
+	return nil
+}
 
 // TimeLayout is how a Claim writes a timestamp: UTC RFC 3339 with milliseconds,
 // matching DATA_MODEL.md §2 and the layout the store and the API already use.
@@ -100,6 +143,7 @@ var fieldIsInt = map[FieldName]bool{
 	FieldFinancialStatus:   false,
 	FieldOccurredAt:        false,
 	FieldTrackingKey:       false,
+	FieldCounterparty:      false,
 }
 
 func (n FieldName) Validate() error {
@@ -318,6 +362,10 @@ func validateFieldValue(name FieldName, f ClaimField) error {
 		}
 	case FieldFinancialStatus:
 		if err := FinancialStatus(f.textValue).Validate(); err != nil {
+			return fmt.Errorf("claim field %q: %w", name, err)
+		}
+	case FieldCounterparty:
+		if err := validateCounterparty(f.textValue); err != nil {
 			return fmt.Errorf("claim field %q: %w", name, err)
 		}
 	case FieldOccurredAt:

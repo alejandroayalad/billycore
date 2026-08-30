@@ -65,12 +65,17 @@ func transactionListSQL(q app.TransactionQuery) (string, []any) {
 
 	args = append(args, q.Limit+1)
 	return `SELECT
-		t.id, t.amount_minor, t.currency, t.merchant, t.account_identifier,
+		t.id, t.amount_minor, t.currency, t.merchant, t.counterparty,
+		t.account_identifier,
 		t.direction, t.financial_status, t.reconciliation_state,
 		t.transaction_state, t.occurred_at, t.created_at,
 		(SELECT cf.confidence FROM claim_transaction ct
 		 JOIN claim_fields cf ON cf.claim_id = ct.claim_id
 		 WHERE ct.transaction_id = t.id AND cf.field_name = 'merchant'
+		 ORDER BY ct.claim_id LIMIT 1),
+		(SELECT cf.confidence FROM claim_transaction ct
+		 JOIN claim_fields cf ON cf.claim_id = ct.claim_id
+		 WHERE ct.transaction_id = t.id AND cf.field_name = 'counterparty'
 		 ORDER BY ct.claim_id LIMIT 1),
 		(SELECT cf.confidence FROM claim_transaction ct
 		 JOIN claim_fields cf ON cf.claim_id = ct.claim_id
@@ -106,10 +111,12 @@ func stringsOf[T ~string](values []T) []string {
 func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 	var id, direction, status, reconciliation, state, occurredText, createdText, evidenceJSON string
 	var amount sql.NullInt64
-	var currency, merchant, account, merchantConfidence, accountConfidence sql.NullString
-	if err := rows.Scan(&id, &amount, &currency, &merchant, &account, &direction, &status,
-		&reconciliation, &state, &occurredText, &createdText, &merchantConfidence,
-		&accountConfidence, &evidenceJSON); err != nil {
+	var currency, merchant, counterparty, account sql.NullString
+	var merchantConfidence, counterpartyConfidence, accountConfidence sql.NullString
+	if err := rows.Scan(&id, &amount, &currency, &merchant, &counterparty, &account,
+		&direction, &status, &reconciliation, &state, &occurredText, &createdText,
+		&merchantConfidence, &counterpartyConfidence, &accountConfidence,
+		&evidenceJSON); err != nil {
 		return app.ListedTransaction{}, fmt.Errorf("list transactions: scan: %w", err)
 	}
 
@@ -136,12 +143,14 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 	if err := json.Unmarshal([]byte(evidenceJSON), &evidenceIDs); err != nil {
 		return app.ListedTransaction{}, fmt.Errorf("list transaction %s: provenance: %w", id, err)
 	}
-	if merchant.Valid != merchantConfidence.Valid || account.Valid != accountConfidence.Valid {
+	if merchant.Valid != merchantConfidence.Valid || account.Valid != accountConfidence.Valid ||
+		counterparty.Valid != counterpartyConfidence.Valid {
 		return app.ListedTransaction{}, fmt.Errorf("list transaction %s: a supported field has no confidence", id)
 	}
 	tx, err := domain.NewTransaction(domain.TransactionDraft{
-		ID: id, Money: money, Merchant: merchant.String, AccountIdentifier: account.String,
-		Direction: domain.TransactionDirection(direction), FinancialStatus: domain.FinancialStatus(status),
+		ID: id, Money: money, Merchant: merchant.String, Counterparty: counterparty.String,
+		AccountIdentifier: account.String,
+		Direction:         domain.TransactionDirection(direction), FinancialStatus: domain.FinancialStatus(status),
 		ReconciliationState: domain.ReconciliationState(reconciliation), State: domain.TransactionState(state),
 		OccurredAt: occurredAt, EvidenceIDs: evidenceIDs, CreatedAt: createdAt,
 	})
@@ -153,6 +162,12 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 		item.MerchantConfidence = domain.Confidence(merchantConfidence.String)
 		if err := item.MerchantConfidence.Validate(); err != nil {
 			return app.ListedTransaction{}, fmt.Errorf("list transaction %s: merchant confidence: %w", id, err)
+		}
+	}
+	if counterpartyConfidence.Valid {
+		item.CounterpartyConfidence = domain.Confidence(counterpartyConfidence.String)
+		if err := item.CounterpartyConfidence.Validate(); err != nil {
+			return app.ListedTransaction{}, fmt.Errorf("list transaction %s: counterparty confidence: %w", id, err)
 		}
 	}
 	if accountConfidence.Valid {

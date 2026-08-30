@@ -95,3 +95,114 @@ func TestListTransactionsReturnsOnlyActiveRows(t *testing.T) {
 		t.Fatalf("page = %+v", page)
 	}
 }
+
+// The counterparty survives the write and the read, and it is not the merchant
+// (D61). Migration 008 added the column; a Transaction that lost it here would
+// discard a field the SPEI reading works to produce.
+func TestACounterpartySurvivesTheRoundTrip(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	storeCounterpartyTransaction(t, transactions, claims, evidence, "tx-spei", "VIAJE74 COMIDA75 ALVAREZ76")
+
+	page, err := transactions.List(context.Background(), app.TransactionQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Transactions) != 1 {
+		t.Fatalf("page = %+v", page)
+	}
+	item := page.Transactions[0]
+	if got := item.Transaction.Counterparty(); got != "VIAJE74 COMIDA75 ALVAREZ76" {
+		t.Errorf("counterparty = %q", got)
+	}
+	if item.CounterpartyConfidence != domain.High {
+		t.Errorf("counterparty confidence = %s, want HIGH", item.CounterpartyConfidence)
+	}
+	// The two fields do not overwrite each other.
+	if got := item.Transaction.Merchant(); got != "HSBC beneficiary" {
+		t.Errorf("merchant = %q", got)
+	}
+}
+
+// Most movements name no counterparty, and the column is NULL for each of them.
+// Absence must stay absence: no email template yields one today.
+func TestATransactionWithNoCounterpartyReloadsWithout(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	storeReadableTransaction(t, transactions, claims, evidence, "tx-plain", observed, 100, domain.Outflow)
+
+	page, err := transactions.List(context.Background(), app.TransactionQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Transactions) != 1 {
+		t.Fatalf("page = %+v", page)
+	}
+	item := page.Transactions[0]
+	if got := item.Transaction.Counterparty(); got != "" {
+		t.Errorf("counterparty = %q, want absent", got)
+	}
+	if item.CounterpartyConfidence != "" {
+		t.Errorf("counterparty confidence = %s, want none", item.CounterpartyConfidence)
+	}
+	if got := item.Transaction.Merchant(); got != "HSBC beneficiary" {
+		t.Errorf("merchant = %q", got)
+	}
+}
+
+// storeCounterpartyTransaction writes one Transaction that names a counterparty,
+// with the Claim field that supports it.
+func storeCounterpartyTransaction(t *testing.T, transactions *TransactionRepository, claims *ClaimRepository,
+	evidence *EvidenceRepository, id, counterparty string) {
+	t.Helper()
+	evidenceID, claimID := "ev-"+id, "claim-"+id
+	storeEvidence(t, evidence, evidenceID, "msg-"+id)
+	claim := claimWithCounterparty(t, claimID, evidenceID, counterparty)
+	in := interpretationOf(t, "interp-"+evidenceID, evidenceID, "", claim)
+	if created, err := claims.Save(context.Background(), in, testProfile, claimedAt); err != nil || !created {
+		t.Fatalf("Save interpretation: created=%v err=%v", created, err)
+	}
+
+	tx := readableTransaction(t, id, evidenceID, 100, domain.Outflow, observed)
+	draft := domain.TransactionDraft{
+		ID: tx.ID(), Merchant: tx.Merchant(), Counterparty: counterparty,
+		Direction: tx.Direction(), FinancialStatus: tx.FinancialStatus(),
+		ReconciliationState: tx.ReconciliationState(), State: tx.State(),
+		OccurredAt: tx.OccurredAt(), EvidenceIDs: tx.EvidenceIDs(), CreatedAt: builtAt,
+	}
+	if money, ok := tx.Money(); ok {
+		draft.Money = money
+	}
+	withCounterparty, err := domain.NewTransaction(draft)
+	if err != nil {
+		t.Fatalf("NewTransaction: %v", err)
+	}
+	if created, err := transactions.Save(context.Background(), one(withCounterparty, claim.ID()), builtAt); err != nil || !created {
+		t.Fatalf("Save %s: created=%v err=%v", id, created, err)
+	}
+}
+
+// claimWithCounterparty is newTransactionalClaim plus the counterparty field.
+// The reading names the person, so D34 rates it HIGH.
+func claimWithCounterparty(t *testing.T, id, evidenceID, counterparty string) domain.Claim {
+	t.Helper()
+	base := newTransactionalClaim(t, id, evidenceID)
+	fields := map[domain.FieldName]domain.ClaimField{}
+	for _, name := range base.FieldNames() {
+		field, _ := base.Field(name)
+		fields[name] = field
+	}
+	value, err := domain.NewTextField(counterparty, domain.High)
+	if err != nil {
+		t.Fatalf("NewTextField: %v", err)
+	}
+	fields[domain.FieldCounterparty] = value
+
+	proposed, err := domain.NewClaim(id, domain.ClaimProposed, []string{evidenceID}, fields, claimedAt)
+	if err != nil {
+		t.Fatalf("NewClaim: %v", err)
+	}
+	active, err := proposed.Activate(claimedAt)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	return active
+}
