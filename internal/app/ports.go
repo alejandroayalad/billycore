@@ -62,12 +62,34 @@ type SourceFetcher interface {
 // ordinary result: 244 of the 1,044 stored artifacts carry no financial event.
 var ErrNoInterpretation = errors.New("interpret: nothing recognises this artifact")
 
-// Interpreter reads one artifact and reports the fields of each Claim, with the
-// confidence of each field (D34). One artifact can describe many movements, so
-// the result is a slice (D46). An empty slice is not valid: report
-// ErrNoInterpretation instead.
+// Reading is the complete result of one Interpreter call: what the parser read,
+// and how much of the artifact it could not read (D59).
+type Reading struct {
+	// Fields holds the fields of one Claim for each movement the parser read,
+	// with the confidence of each field (D34). One artifact can describe many
+	// movements, so this is a slice (D46). An empty slice is not valid: report
+	// ErrNoInterpretation instead.
+	Fields []map[domain.FieldName]domain.ClaimField
+
+	// SkippedRows counts the movements that no shape of the parser reads. A
+	// statement of about 180 rows is read as far as it can be, and it says how
+	// far (D59). It is always zero for an email, which is one movement.
+	SkippedRows int
+}
+
+// Interpreter reads one artifact and reports what Billy believes about it.
+//
+// The context is for an Interpreter that leaves the process. A statement parser
+// runs pdftotext, and the caller must be able to stop it (D54, D57). A parser
+// that works in memory accepts the context and ignores it.
 type Interpreter interface {
-	Interpret(raw []byte) ([]map[domain.FieldName]domain.ClaimField, error)
+	Interpret(ctx context.Context, raw []byte) (Reading, error)
+}
+
+// PDFCoordinateExtractor converts PDF bytes to bounded coordinate XHTML/XML.
+// It does not interpret financial data (D54).
+type PDFCoordinateExtractor interface {
+	Extract(ctx context.Context, pdf []byte) ([]byte, error)
 }
 
 // Redacted is implemented by an error that can describe itself without the

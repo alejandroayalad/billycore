@@ -47,7 +47,7 @@ func TestInterpretCorpus(t *testing.T) {
 		}
 		artifacts++
 
-		sets, err := nu.Interpreter{}.Interpret(raw)
+		reading, err := nu.Interpreter{}.Interpret(t.Context(), raw)
 		if errors.Is(err, app.ErrNoInterpretation) {
 			none++
 			continue
@@ -56,13 +56,13 @@ func TestInterpretCorpus(t *testing.T) {
 			t.Errorf("%s: %v", evidenceID, err)
 			continue
 		}
-		if len(sets) != 1 {
+		if len(reading.Fields) != 1 {
 			// For this corpus a reading holds one Claim, because each of the
 			// four Nu templates is a receipt for one movement.
-			t.Errorf("%s: interpreted into %d claims, want 1", evidenceID, len(sets))
+			t.Errorf("%s: interpreted into %d claims, want 1", evidenceID, len(reading.Fields))
 			continue
 		}
-		fields := sets[0]
+		fields := reading.Fields[0]
 		claims++
 
 		// Every Claim is valid by its own constructor, and every one of them
