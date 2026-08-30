@@ -9,7 +9,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/alejandroayalad/billycore/internal/adapter/parser/profile"
+	"github.com/alejandroayalad/billycore/internal/app"
 	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
@@ -30,6 +33,12 @@ type Source struct {
 	// Query is the Source's fetch configuration. For Gmail it is a search query
 	// such as `from:nu@nu.com.mx`.
 	Query string `json:"query"`
+
+	// ExtractionProfile names the reading contract of this Source's artifacts,
+	// such as `NU_EMAIL_V1`. Ingestion copies it onto each Evidence row, and
+	// extraction selects the parser from it. There is no default: a guess reads
+	// a statement with an email parser.
+	ExtractionProfile app.ExtractionProfile `json:"extraction_profile"`
 }
 
 type sourcesDocument struct {
@@ -65,6 +74,22 @@ func LoadSources(dir string) ([]Source, error) {
 	return document.Sources, nil
 }
 
+// validateProfile holds the configuration to the closed vocabulary of
+// supported profiles. A name with a typo stops the start, for the reason D26
+// gives: the alternative is an artifact that fails one row at a time, days
+// later, with nobody watching.
+func validateProfile(s Source) error {
+	if s.ExtractionProfile == "" {
+		return fmt.Errorf("source %q has no extraction_profile: use one of %s",
+			s.ID, strings.Join(profile.Names(), ", "))
+	}
+	if !profile.Known(s.ExtractionProfile) {
+		return fmt.Errorf("source %q has extraction_profile %q, which BillyCore does not support: use one of %s",
+			s.ID, string(s.ExtractionProfile), strings.Join(profile.Names(), ", "))
+	}
+	return nil
+}
+
 func validate(sources []Source) error {
 	seen := make(map[string]bool, len(sources))
 	for i, s := range sources {
@@ -80,6 +105,9 @@ func validate(sources []Source) error {
 
 		if err := s.Type.Validate(); err != nil {
 			return fmt.Errorf("source %q: %w", s.ID, err)
+		}
+		if err := validateProfile(s); err != nil {
+			return err
 		}
 		if s.Type == domain.SourceGmail && s.Query == "" {
 			// An empty Gmail query matches the entire mailbox. That is not a

@@ -57,9 +57,9 @@ type ExtractResult struct {
 // them. It never changes an artifact, because Evidence is immutable (D7). The
 // caller injects the clock and the id generator.
 type Extractor struct {
-	Queue       EvidenceQueue
-	Claims      ClaimRepository
-	Interpreter Interpreter
+	Queue        EvidenceQueue
+	Claims       ClaimRepository
+	Interpreters InterpreterRegistry
 
 	NewID func() (string, error)
 	Now   func() time.Time
@@ -73,16 +73,16 @@ type Extractor struct {
 	OnPanic func(evidenceID string, stack []byte)
 }
 
-func NewExtractor(queue EvidenceQueue, claims ClaimRepository, interpreter Interpreter) *Extractor {
+func NewExtractor(queue EvidenceQueue, claims ClaimRepository, interpreters InterpreterRegistry) *Extractor {
 	return &Extractor{
-		Queue:       queue,
-		Claims:      claims,
-		Interpreter: interpreter,
-		NewID:       id.New,
-		Now:         func() time.Time { return time.Now().UTC() },
-		Batch:       DefaultExtractBatch,
-		Lease:       DefaultExtractLease,
-		OnPanic:     logPanic,
+		Queue:        queue,
+		Claims:       claims,
+		Interpreters: interpreters,
+		NewID:        id.New,
+		Now:          func() time.Time { return time.Now().UTC() },
+		Batch:        DefaultExtractBatch,
+		Lease:        DefaultExtractLease,
+		OnPanic:      logPanic,
 	}
 }
 
@@ -150,7 +150,14 @@ const (
 // the row. If the queue is unavailable, the lease ends and a later pass claims
 // the row again.
 func (x *Extractor) extractOne(ctx context.Context, evidence PendingEvidence) (outcome, int) {
-	sets, err := x.interpret(evidence)
+	interpreter, err := x.selectInterpreter(evidence)
+	if err != nil {
+		// The artifact reached no parser. The row keeps its stage and takes a
+		// backoff, so a corrected profile or a new parser reads it later.
+		return x.fail(ctx, evidence, classDispatch, err), 0
+	}
+
+	reading, err := x.interpret(ctx, interpreter, evidence)
 	if errors.Is(err, ErrNoInterpretation) {
 		// No template recognises the artifact. This is an answer, not a
 		// failure, so the row advances.
@@ -167,7 +174,7 @@ func (x *Extractor) extractOne(ctx context.Context, evidence PendingEvidence) (o
 		return x.fail(ctx, evidence, class, err), 0
 	}
 
-	interpretation, err := x.buildInterpretation(evidence, sets)
+	interpretation, err := x.buildInterpretation(evidence, reading)
 	if err != nil {
 		// The domain rejected Billy's own interpretation. This is a defect in
 		// the mapping, not a bad artifact. The row keeps its Evidence, so a
@@ -175,7 +182,7 @@ func (x *Extractor) extractOne(ctx context.Context, evidence PendingEvidence) (o
 		// complete set, which is the rule in D46.
 		return x.fail(ctx, evidence, classClaim, err), 0
 	}
-	created, err := x.Claims.Save(ctx, interpretation, x.Now())
+	created, err := x.Claims.Save(ctx, interpretation, evidence.Profile, x.Now())
 	if err != nil {
 		return x.fail(ctx, evidence, classStore, err), 0
 	}
@@ -191,10 +198,24 @@ func (x *Extractor) extractOne(ctx context.Context, evidence PendingEvidence) (o
 	return outcomeClaimed, len(interpretation.Claims())
 }
 
+// selectInterpreter finds the parser of the artifact and validates the format
+// signature. A row with no profile fails here: BillyCore has no default, and a
+// guess reads a statement with an email parser.
+func (x *Extractor) selectInterpreter(evidence PendingEvidence) (Interpreter, error) {
+	if evidence.Profile == "" {
+		return nil, dispatchFailure{err: ErrNoProfile}
+	}
+	interpreter, err := x.Interpreters.Select(evidence.Profile, evidence.ContentType, evidence.RawContent)
+	if err != nil {
+		return nil, dispatchFailure{profile: evidence.Profile, err: err}
+	}
+	return interpreter, nil
+}
+
 // interpret runs the Interpreter and recovers a panic for each artifact, as
 // SECURITY.md §7 requires. The recovery is here, and not around the batch, so
 // only the artifact that caused the panic fails.
-func (x *Extractor) interpret(evidence PendingEvidence) (sets []map[domain.FieldName]domain.ClaimField, err error) {
+func (x *Extractor) interpret(ctx context.Context, interpreter Interpreter, evidence PendingEvidence) (reading Reading, err error) {
 	defer func() {
 		r := recover()
 		if r == nil {
@@ -205,9 +226,9 @@ func (x *Extractor) interpret(evidence PendingEvidence) (sets []map[domain.Field
 		if x.OnPanic != nil {
 			x.OnPanic(evidence.ID, debug.Stack())
 		}
-		sets, err = nil, newPanicked(r)
+		reading, err = Reading{}, newPanicked(r)
 	}()
-	return x.Interpreter.Interpret(evidence.RawContent)
+	return interpreter.Interpret(ctx, evidence.RawContent)
 }
 
 // fail records one failed attempt on its row. The stage does not move, because
@@ -237,11 +258,13 @@ func (x *Extractor) releaseUnattempted(ctx context.Context, pending []PendingEvi
 	}
 }
 
-// buildInterpretation records the complete reading of one artifact: one Claim
-// for each movement, in one set that Billy activates or discards (D46). Each
-// Claim is PROPOSED and then ACTIVE (D37). ActiveInterpretationID arrives with
-// the row and names the interpretation that this reading replaces (D47, D48).
-func (x *Extractor) buildInterpretation(evidence PendingEvidence, sets []map[domain.FieldName]domain.ClaimField) (domain.Interpretation, error) {
+// buildInterpretation records the reading of one artifact: one Claim for each
+// movement, in one set that Billy activates or discards (D46). Each Claim is
+// PROPOSED and then ACTIVE (D37). ActiveInterpretationID arrives with the row
+// and names the interpretation that this reading replaces (D47, D48). The count
+// of rows that no shape read travels with the set (D59).
+func (x *Extractor) buildInterpretation(evidence PendingEvidence, reading Reading) (domain.Interpretation, error) {
+	sets := reading.Fields
 	if len(sets) == 0 {
 		// An Interpreter that recognises an artifact must give a reading of it.
 		// A result with no error and no Claim is a defect in the parser.
@@ -270,7 +293,7 @@ func (x *Extractor) buildInterpretation(evidence PendingEvidence, sets []map[dom
 	if err != nil {
 		return domain.Interpretation{}, fmt.Errorf("extract: generate interpretation id: %w", err)
 	}
-	interpretation, err := domain.NewInterpretation(interpretationID, evidence.ID, claims, evidence.ActiveInterpretationID, now)
+	interpretation, err := domain.NewInterpretation(interpretationID, evidence.ID, claims, reading.SkippedRows, evidence.ActiveInterpretationID, now)
 	if err != nil {
 		return domain.Interpretation{}, fmt.Errorf("extract: evidence %s did not yield a valid interpretation: %w", evidence.ID, err)
 	}

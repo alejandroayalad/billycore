@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/alejandroayalad/billycore/internal/app"
 	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
@@ -31,7 +32,7 @@ func NewClaimRepository(db *sql.DB) *ClaimRepository {
 // the stage advance. One commit, for the reason in D25. The set is atomic
 // (D46). A false with a nil error means that another pass wrote first, and the
 // table evidence_active_interpretation makes that idempotent, not a check here.
-func (r *ClaimRepository) Save(ctx context.Context, in domain.Interpretation, now time.Time) (bool, error) {
+func (r *ClaimRepository) Save(ctx context.Context, in domain.Interpretation, profile app.ExtractionProfile, now time.Time) (bool, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("save interpretation: begin: %w", err)
@@ -39,9 +40,9 @@ func (r *ClaimRepository) Save(ctx context.Context, in domain.Interpretation, no
 	defer tx.Rollback() //nolint:errcheck // no-op once committed
 
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO interpretations (id, evidence_id, superseded_by_interpretation_id, created_at)
-		VALUES (?, ?, NULL, ?)`,
-		in.ID(), in.EvidenceID(), formatTime(in.CreatedAt()),
+		INSERT INTO interpretations (id, evidence_id, superseded_by_interpretation_id, created_at, extraction_profile, unread_rows)
+		VALUES (?, ?, NULL, ?, ?, ?)`,
+		in.ID(), in.EvidenceID(), formatTime(in.CreatedAt()), string(profile), in.UnreadRows(),
 	); err != nil {
 		return false, fmt.Errorf("save interpretation %s: %w", in.ID(), err)
 	}

@@ -5,7 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/alejandroayalad/billycore/internal/app"
 )
+
+// testProfile is the reading contract these tests store. The store never
+// interprets the value, so one name serves every case that is not about the
+// profile itself.
+const testProfile = app.ExtractionProfile("NU_EMAIL_V1")
 
 func testDBPath(t *testing.T) string {
 	t.Helper()
@@ -43,8 +50,8 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if userVersion != 5 {
-		t.Errorf("user_version = %d, want 5 after migration 005", userVersion)
+	if userVersion != 8 {
+		t.Errorf("user_version = %d, want 8 after migration 008", userVersion)
 	}
 
 	for _, table := range []string{"evidence", "domain_event"} {
@@ -443,5 +450,134 @@ func TestMigration005AddsTheTransactionLifecycle(t *testing.T) {
 	}
 	if notNull != 1 {
 		t.Error("transaction_state is nullable; a row that is neither current nor superseded is not a state")
+	}
+}
+
+// Migration 006 gives each artifact the profile that reads it, and each reading
+// the profile that made it (D51 — statement extraction needs both).
+//
+// This is not hypothetical. `~/.billy/billy.db` holds 1,044 Evidence rows and
+// 800 interpretations written before this migration, and every one of them is
+// Nu email that NU_EMAIL_V1 reads (CONTEXT.md §3.1).
+func TestMigration006BackfillsTheExtractionProfile(t *testing.T) {
+	path := testDBPath(t)
+
+	// A database at migration 005, as the email half of M2 left it.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version > 5 {
+			break
+		}
+		if err := applyMigration(db, m); err != nil {
+			t.Fatalf("apply %s: %v", m.name, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+		VALUES ('i-1', 'ev-1', '2026-08-26T00:00:00.000Z')`); err != nil {
+		t.Fatalf("seed interpretation: %v", err)
+	}
+	db.Close()
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a v5 database: %v", err)
+	}
+	defer upgraded.Close()
+
+	for _, tc := range []struct{ what, query string }{
+		{"evidence", `SELECT extraction_profile FROM evidence WHERE id = 'ev-1'`},
+		{"interpretation", `SELECT extraction_profile FROM interpretations WHERE id = 'i-1'`},
+	} {
+		var got string
+		if err := upgraded.QueryRow(tc.query).Scan(&got); err != nil {
+			t.Fatalf("read %s profile: %v", tc.what, err)
+		}
+		if got != "NU_EMAIL_V1" {
+			t.Errorf("%s profile = %q, want NU_EMAIL_V1", tc.what, got)
+		}
+	}
+
+	// The column on evidence is configuration, so it is nullable: a Source that
+	// names no profile records rows that fail extraction with a named reason.
+	if _, err := upgraded.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-2', 's', 'MANUAL', 'r-2', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("insert evidence with no profile: %v", err)
+	}
+	var profile sql.NullString
+	if err := upgraded.QueryRow(`SELECT extraction_profile FROM evidence WHERE id = 'ev-2'`).Scan(&profile); err != nil {
+		t.Fatalf("read evidence profile: %v", err)
+	}
+	if profile.Valid {
+		t.Errorf("evidence profile = %q, want NULL for a row no Source configuration reached", profile.String)
+	}
+}
+
+// Migration 007 gives each reading the count of the movements it did not read.
+//
+// The default is the migration's whole argument: every reading written before
+// it is of one Nu email, and an email is one movement that the parser reads or
+// does not recognise at all. Zero is the true value for all 800 of them (D59).
+func TestMigration007DefaultsUnreadRowsToZero(t *testing.T) {
+	path := testDBPath(t)
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version > 6 {
+			break
+		}
+		if err := applyMigration(db, m); err != nil {
+			t.Fatalf("apply %s: %v", m.name, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+		VALUES ('i-1', 'ev-1', '2026-08-26T00:00:00.000Z')`); err != nil {
+		t.Fatalf("seed interpretation: %v", err)
+	}
+	db.Close()
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a v6 database: %v", err)
+	}
+	defer upgraded.Close()
+
+	var unread int
+	if err := upgraded.QueryRow(`SELECT unread_rows FROM interpretations WHERE id = 'i-1'`).Scan(&unread); err != nil {
+		t.Fatalf("read unread_rows: %v", err)
+	}
+	if unread != 0 {
+		t.Errorf("unread_rows = %d on a reading from before the migration, want 0", unread)
+	}
+
+	// The column is NOT NULL, so a reading always states the number. There is
+	// no third answer between "read it all" and "skipped four rows".
+	if _, err := upgraded.Exec(`INSERT INTO interpretations (id, evidence_id, created_at, unread_rows)
+		VALUES ('i-2', 'ev-1', '2026-08-29T00:00:00.000Z', NULL)`); err == nil {
+		t.Error("the database accepted a reading with no count of unread rows")
 	}
 }

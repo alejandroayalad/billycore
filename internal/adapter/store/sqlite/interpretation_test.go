@@ -39,7 +39,7 @@ func TestReExtractionSupersedesTheActiveInterpretation(t *testing.T) {
 
 	stored := storeEvidence(t, evidence, "ev-1", "msg-1")
 	first := interpretationOf(t, "interp-1", "ev-1", "", newTransactionalClaim(t, "claim-1", "ev-1"))
-	if created, err := claims.Save(ctx, first, claimedAt); err != nil || !created {
+	if created, err := claims.Save(ctx, first, testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("first Save: created=%v err=%v", created, err)
 	}
 	if created, err := transactions.Save(ctx, one(newTestTransaction(t, "tx-1", "ev-1"), "claim-1"), builtAt); err != nil || !created {
@@ -63,7 +63,7 @@ func TestReExtractionSupersedesTheActiveInterpretation(t *testing.T) {
 	}
 
 	second := interpretationOf(t, "interp-2", "ev-1", "interp-1", newTransactionalClaim(t, "claim-2", "ev-1"))
-	if created, err := claims.Save(ctx, second, claimedAt); err != nil || !created {
+	if created, err := claims.Save(ctx, second, testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("second Save: created=%v err=%v", created, err)
 	}
 
@@ -129,20 +129,20 @@ func TestAReplacementThatNamesTheWrongPredecessorWritesNothing(t *testing.T) {
 	ctx := context.Background()
 
 	storeEvidence(t, evidence, "ev-1", "msg-1")
-	if created, err := claims.Save(ctx, oneClaim(t, "interp-1", "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(ctx, oneClaim(t, "interp-1", "claim-1", "ev-1"), testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("first Save: created=%v err=%v", created, err)
 	}
 	resetForExtraction(t, db, "ev-1")
 
 	// The winner.
 	winner := interpretationOf(t, "interp-2", "ev-1", "interp-1", newTestClaim(t, "claim-2", "ev-1"))
-	if created, err := claims.Save(ctx, winner, claimedAt); err != nil || !created {
+	if created, err := claims.Save(ctx, winner, testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("winning Save: created=%v err=%v", created, err)
 	}
 
 	// The loser read the same interpretation before the winner committed.
 	loser := interpretationOf(t, "interp-3", "ev-1", "interp-1", newTestClaim(t, "claim-3", "ev-1"))
-	created, err := claims.Save(ctx, loser, claimedAt)
+	created, err := claims.Save(ctx, loser, testProfile, claimedAt)
 	if err != nil {
 		t.Fatalf("losing Save: %v — losing the race is an outcome, not an error", err)
 	}
@@ -179,7 +179,7 @@ func TestAnInterpretationOfManyClaimsSurvivesTheRoundTrip(t *testing.T) {
 		newTransactionalClaim(t, "claim-1", "ev-1"),
 		newTransactionalClaim(t, "claim-2", "ev-1"),
 		newTransactionalClaim(t, "claim-3", "ev-1"))
-	if created, err := claims.Save(ctx, in, claimedAt); err != nil || !created {
+	if created, err := claims.Save(ctx, in, testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 
@@ -241,7 +241,7 @@ func TestOneUnwritableClaimRollsBackTheWholeInterpretation(t *testing.T) {
 	in := interpretationOf(t, "interp-1", "ev-1", "",
 		newTransactionalClaim(t, "claim-1", "ev-1"),
 		newTransactionalClaim(t, "claim-2", "ev-1"))
-	if _, err := claims.Save(ctx, in, claimedAt); err == nil {
+	if _, err := claims.Save(ctx, in, testProfile, claimedAt); err == nil {
 		t.Fatal("a set with an unwritable member was accepted")
 	}
 

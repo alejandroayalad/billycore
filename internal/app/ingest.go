@@ -15,6 +15,11 @@ import (
 type Source struct {
 	ID   string
 	Type domain.SourceType
+
+	// Profile is the reading contract of this Source's artifacts. Ingestion
+	// copies it onto each Evidence row, so extraction knows which parser reads
+	// the artifact without reading the configuration again.
+	Profile ExtractionProfile
 }
 
 // SyncResult is the summary API.md §5 returns.
@@ -24,6 +29,13 @@ type SyncResult struct {
 	EvidenceCreated     int
 	EvidenceSkipped     int
 	CompletedAt         time.Time
+}
+
+// RecordResult is the Evidence that owns a Source identity and whether this
+// call created it. On a retry, Evidence is the immutable original (D53).
+type RecordResult struct {
+	Evidence domain.Evidence
+	Created  bool
 }
 
 // Ingestor records what a Source offers, and stops.
@@ -48,6 +60,37 @@ func NewIngestor(repo EvidenceRepository) *Ingestor {
 		NewID: id.New,
 		Now:   func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// Record stores one artifact supplied directly by a configured Source.
+//
+// The HTTP boundary validates its wire contract. This use case owns the same
+// domain construction and persistence path as Sync, so an uploaded artifact
+// cannot bypass an Evidence invariant or choose a different write path.
+func (in *Ingestor) Record(ctx context.Context, src Source, artifact Artifact) (RecordResult, error) {
+	evidenceID, err := in.NewID()
+	if err != nil {
+		return RecordResult{}, fmt.Errorf("record %s: generate id: %w", src.ID, err)
+	}
+	evidence, err := domain.NewEvidence(
+		evidenceID, src.ID, src.Type,
+		artifact.Reference, artifact.ContentType, artifact.Content, artifact.ObservedAt,
+	)
+	if err != nil {
+		return RecordResult{}, fmt.Errorf("record %s: artifact is not valid Evidence: %w", src.ID, err)
+	}
+	created, err := in.Repo.Insert(ctx, evidence, src.Profile, in.Now())
+	if err != nil {
+		return RecordResult{}, fmt.Errorf("record %s: store artifact: %w", src.ID, err)
+	}
+	if created {
+		return RecordResult{Evidence: evidence, Created: true}, nil
+	}
+	existing, err := in.Repo.GetByReference(ctx, src.ID, artifact.Reference)
+	if err != nil {
+		return RecordResult{}, fmt.Errorf("record %s: read existing artifact: %w", src.ID, err)
+	}
+	return RecordResult{Evidence: existing}, nil
 }
 
 // Sync fetches from one Source and records whatever it yields.
@@ -110,23 +153,9 @@ func (in *Ingestor) ingestOne(ctx context.Context, src Source, fetcher SourceFet
 		return false, fmt.Errorf("sync %s: fetch artifact %s: %w", src.ID, reference, err)
 	}
 
-	evidenceID, err := in.NewID()
-	if err != nil {
-		return false, fmt.Errorf("sync %s: generate id: %w", src.ID, err)
-	}
-	evidence, err := domain.NewEvidence(
-		evidenceID, src.ID, src.Type,
-		artifact.Reference, artifact.ContentType, artifact.Content, artifact.ObservedAt,
-	)
-	if err != nil {
-		// Never wrap the artifact itself into an error: it ends up in a log
-		// (SECURITY.md §10).
-		return false, fmt.Errorf("sync %s: artifact %s is not valid Evidence: %w", src.ID, reference, err)
-	}
-
-	created, err := in.Repo.Insert(ctx, evidence, in.Now())
+	result, err := in.Record(ctx, src, artifact)
 	if err != nil {
 		return false, fmt.Errorf("sync %s: record artifact %s: %w", src.ID, reference, err)
 	}
-	return created, nil
+	return result.Created, nil
 }

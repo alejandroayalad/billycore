@@ -19,10 +19,19 @@ var ErrEvidenceNotFound = errors.New("evidence: not found")
 type EvidenceRepository interface {
 	// Insert records Evidence and reports if it created a row. A false with a
 	// nil error means that Billy already holds the artifact (D10).
-	Insert(ctx context.Context, e domain.Evidence, now time.Time) (bool, error)
+	//
+	// The profile is the reading contract of the Source at this moment. It is a
+	// pipeline column and not part of Evidence, so a re-extraction can correct
+	// a misconfigured Source without a change to the artifact (D7, D48).
+	Insert(ctx context.Context, e domain.Evidence, profile ExtractionProfile, now time.Time) (bool, error)
 
 	// GetByID returns the Evidence with the given id.
 	GetByID(ctx context.Context, id string) (domain.Evidence, error)
+
+	// GetByReference returns the immutable artifact already recorded under a
+	// Source identity. Direct ingestion uses it to answer an idempotent retry
+	// with the original Evidence rather than the discarded candidate (D53).
+	GetByReference(ctx context.Context, sourceID, sourceReference string) (domain.Evidence, error)
 
 	// ExistsByReference reports if Billy holds an artifact. Insert stays the
 	// authority on idempotency; this only lets a sync skip a download.
@@ -107,6 +116,15 @@ type PendingEvidence struct {
 	ID         string
 	RawContent []byte
 
+	// Profile is the reading contract that the Source named when Billy recorded
+	// the artifact. It selects the parser. It is empty for a row that no Source
+	// configuration reached, and that row fails with a named reason.
+	Profile ExtractionProfile
+
+	// ContentType is what the artifact is, as the Source reported it (D24). The
+	// registry validates it against the profile before any parser reads a byte.
+	ContentType string
+
 	// Attempts is how many times the queue gave out this row, including this
 	// time. The store keeps the count, and the use case decides the backoff.
 	Attempts int
@@ -149,7 +167,11 @@ type ClaimRepository interface {
 	// each Claim, the active-interpretation pointer, and the stage advance.
 	//
 	// The set is the unit (D46). If one Claim fails, Save writes none of them.
-	Save(ctx context.Context, in domain.Interpretation, now time.Time) (bool, error)
+	//
+	// The profile is the parser that made this reading. The row keeps it, and
+	// the row never changes it: it is the record of how Billy read the
+	// artifact, and D47's lineage keeps the readings that came before.
+	Save(ctx context.Context, in domain.Interpretation, profile ExtractionProfile, now time.Time) (bool, error)
 }
 
 // PendingReconciliation is one Evidence row that a pass claimed, with the

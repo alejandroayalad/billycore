@@ -44,7 +44,7 @@ func TestSyncTwiceAgainstRealStorage(t *testing.T) {
 	fetcher := &countingFetcher{references: references}
 
 	ingestor := ingestorFor(NewEvidenceRepository(db))
-	source := app.Source{ID: "gmail_primary", Type: domain.SourceGmail}
+	source := app.Source{ID: "gmail_primary", Type: domain.SourceGmail, Profile: testProfile}
 
 	first, err := ingestor.Sync(context.Background(), source, fetcher)
 	if err != nil {

@@ -38,6 +38,10 @@ func (q *EvidenceQueue) ClaimForExtraction(ctx context.Context, limit int, now, 
 	// attempts increases when the queue gives out the row, not when work fails:
 	// an artifact that stops the process never reaches code that reports a
 	// failure, and it would return to each pass for ever.
+	//
+	// The row carries content_type and extraction_profile, because the pass
+	// selects the parser from them. Both are nullable: a row that no Source
+	// configuration reached has neither, and it fails with a named reason.
 	rows, err := tx.QueryContext(ctx, `
 		UPDATE evidence
 		SET locked_until = ?, attempts = attempts + 1
@@ -48,7 +52,7 @@ func (q *EvidenceQueue) ClaimForExtraction(ctx context.Context, limit int, now, 
 			ORDER BY observed_at, id
 			LIMIT ?
 		)
-		RETURNING id, raw_content, attempts`,
+		RETURNING id, raw_content, attempts, content_type, extraction_profile`,
 		formatTime(lockedUntil), stageReceived, formatTime(now), limit,
 	)
 	if err != nil {
@@ -58,10 +62,13 @@ func (q *EvidenceQueue) ClaimForExtraction(ctx context.Context, limit int, now, 
 	var pending []app.PendingEvidence
 	for rows.Next() {
 		var p app.PendingEvidence
-		if err := rows.Scan(&p.ID, &p.RawContent, &p.Attempts); err != nil {
+		var contentType, profile sql.NullString
+		if err := rows.Scan(&p.ID, &p.RawContent, &p.Attempts, &contentType, &profile); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("claim evidence: scan: %w", err)
 		}
+		p.ContentType = contentType.String
+		p.Profile = app.ExtractionProfile(profile.String)
 		pending = append(pending, p)
 	}
 	if err := rows.Err(); err != nil {

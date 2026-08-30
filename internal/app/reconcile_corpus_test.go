@@ -66,7 +66,7 @@ func TestReconcileCorpus(t *testing.T) {
 		}
 		item := app.PendingReconciliation{EvidenceID: evidenceID, ObservedAt: observed, Attempts: 1}
 
-		sets, err := nu.Interpreter{}.Interpret(raw)
+		reading, err := nu.Interpreter{}.Interpret(t.Context(), raw)
 		switch {
 		case errors.Is(err, app.ErrNoInterpretation):
 			// No Claims. The row still has to leave the queue (D44).
@@ -74,7 +74,7 @@ func TestReconcileCorpus(t *testing.T) {
 			t.Errorf("%s: %v", evidenceID, err)
 			continue
 		default:
-			for n, fields := range sets {
+			for n, fields := range reading.Fields {
 				claimID := fmt.Sprintf("claim-%s-%d", evidenceID, n)
 				proposed, err := domain.NewClaim(claimID, domain.ClaimProposed, []string{evidenceID}, fields, at)
 				if err != nil {
@@ -281,9 +281,9 @@ func TestReconcilingTheCorpusTwiceCreatesNothingTheSecondTime(t *testing.T) {
 		}
 		observed, _ := time.Parse(time.RFC3339, observedAt)
 		item := app.PendingReconciliation{EvidenceID: evidenceID, ObservedAt: observed, Attempts: 1}
-		sets, err := nu.Interpreter{}.Interpret(raw)
+		reading, err := nu.Interpreter{}.Interpret(t.Context(), raw)
 		if err == nil {
-			for n, fields := range sets {
+			for n, fields := range reading.Fields {
 				claimID := fmt.Sprintf("claim-%s-%d", evidenceID, n)
 				proposed, err := domain.NewClaim(claimID, domain.ClaimProposed, []string{evidenceID}, fields, at)
 				if err != nil {

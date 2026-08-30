@@ -32,6 +32,14 @@ func (q *fakeQueue) ClaimForExtraction(_ context.Context, limit int, _, _ time.T
 	if q.claimErr != nil {
 		return nil, q.claimErr
 	}
+	// A stored row carries the profile of its Source. The fake fills the ones
+	// that a test left empty, so a test about extraction does not have to state
+	// a profile. A test about dispatch states its own.
+	for i := range q.pending {
+		if q.pending[i].Profile == "" {
+			q.pending[i].Profile = testProfile
+		}
+	}
 	if limit < len(q.pending) {
 		return q.pending[:limit], nil
 	}
@@ -66,12 +74,15 @@ type fakeClaims struct {
 	saved []domain.Claim
 	err   error
 
+	// profiles holds the profile of each interpretation that Save recorded.
+	profiles []app.ExtractionProfile
+
 	// occupied copies the constraint. It holds the active interpretation id of
 	// each artifact. A Save that names a different one writes nothing (D47).
 	occupied map[string]string
 }
 
-func (c *fakeClaims) Save(_ context.Context, in domain.Interpretation, _ time.Time) (bool, error) {
+func (c *fakeClaims) Save(_ context.Context, in domain.Interpretation, profile app.ExtractionProfile, _ time.Time) (bool, error) {
 	if c.err != nil {
 		return false, c.err
 	}
@@ -82,6 +93,7 @@ func (c *fakeClaims) Save(_ context.Context, in domain.Interpretation, _ time.Ti
 		return false, nil
 	}
 	c.occupied[in.EvidenceID()] = in.ID()
+	c.profiles = append(c.profiles, profile)
 	c.sets = append(c.sets, in)
 	c.saved = append(c.saved, in.Claims()...)
 	return true, nil
@@ -95,31 +107,66 @@ type fakeInterpreter struct {
 	readings map[string][]map[domain.FieldName]domain.ClaimField
 	errs     map[string]error
 	panics   map[string]any
+
+	// skipped is how many rows the parser could not read, for each artifact
+	// (D59). A statement parser reports it; an email parser never does.
+	skipped map[string]int
+
+	// capture records the context that the use case handed over. A statement
+	// parser runs pdftotext and must be able to stop with the caller (D57).
+	capture func(context.Context)
 }
 
-func (i fakeInterpreter) Interpret(raw []byte) ([]map[domain.FieldName]domain.ClaimField, error) {
+func (i fakeInterpreter) Interpret(ctx context.Context, raw []byte) (app.Reading, error) {
+	if i.capture != nil {
+		i.capture(ctx)
+	}
 	if v, ok := i.panics[string(raw)]; ok {
 		panic(v)
 	}
 	if err, ok := i.errs[string(raw)]; ok {
-		return nil, err
+		return app.Reading{}, err
 	}
 	if sets, ok := i.readings[string(raw)]; ok {
-		return sets, nil
+		return app.Reading{Fields: sets, SkippedRows: i.skipped[string(raw)]}, nil
 	}
 	fields, ok := i.answers[string(raw)]
 	if !ok {
-		return nil, app.ErrNoInterpretation
+		return app.Reading{}, app.ErrNoInterpretation
 	}
-	return []map[domain.FieldName]domain.ClaimField{fields}, nil
+	return app.Reading{Fields: []map[domain.FieldName]domain.ClaimField{fields}}, nil
+}
+
+// testProfile is the profile of every artifact these tests store.
+const testProfile = app.ExtractionProfile("NU_EMAIL_V1")
+
+// fakeRegistry answers for one profile. `errs` holds what Select reports for a
+// profile that a dispatch test names.
+type fakeRegistry struct {
+	interpreter app.Interpreter
+	errs        map[app.ExtractionProfile]error
+}
+
+func (r fakeRegistry) Select(profile app.ExtractionProfile, _ string, _ []byte) (app.Interpreter, error) {
+	if err, ok := r.errs[profile]; ok {
+		return nil, err
+	}
+	if profile != testProfile {
+		return nil, app.ErrUnknownProfile
+	}
+	return r.interpreter, nil
 }
 
 func newExtractor(q *fakeQueue, c *fakeClaims, i fakeInterpreter) *app.Extractor {
+	return newExtractorWith(q, c, fakeRegistry{interpreter: i})
+}
+
+func newExtractorWith(q *fakeQueue, c *fakeClaims, r app.InterpreterRegistry) *app.Extractor {
 	ids := 0
 	return &app.Extractor{
-		Queue:       q,
-		Claims:      c,
-		Interpreter: i,
+		Queue:        q,
+		Claims:       c,
+		Interpreters: r,
 		NewID: func() (string, error) {
 			ids++
 			return "claim-" + string(rune('a'+ids-1)), nil
@@ -632,5 +679,191 @@ func TestReRunningExtractionCreatesNoSecondClaim(t *testing.T) {
 	}
 	if len(queue.failures) != 0 {
 		t.Errorf("recorded %+v; an already-interpreted artifact is not a failure", queue.failures)
+	}
+}
+
+// --- dispatch ---------------------------------------------------------------
+
+// A row with no profile reaches no parser. Nothing here guesses: a default
+// would read a statement with an email parser.
+func TestEvidenceWithNoProfileFails(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{{ID: "ev-1", RawContent: []byte("outflow")}}}
+	x := newExtractorWith(queue, &fakeClaims{}, fakeRegistry{interpreter: fakeInterpreter{}})
+	x.Queue = &noProfileQueue{fakeQueue: queue}
+
+	result, err := x.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Failed != 1 || result.Unrecognised != 0 {
+		t.Errorf("result = %+v, want 1 failed", result)
+	}
+	// The row keeps its stage. A profile is configuration, and configuration
+	// can be corrected (D48).
+	if len(queue.extracted) != 0 {
+		t.Errorf("evidence advanced without a parser: %v", queue.extracted)
+	}
+	if len(queue.failures) != 1 || !contains(queue.failures[0].reason, "DISPATCH") {
+		t.Errorf("failures = %+v, want one DISPATCH", queue.failures)
+	}
+}
+
+// An artifact that is not the format its profile expects is a failure, and not
+// the ordinary "nothing recognises this". The Source stated what its artifacts
+// are, and this one is different.
+func TestASignatureMismatchIsAFailureAndNotAnUnrecognisedArtifact(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{
+		{ID: "ev-1", RawContent: []byte("%PDF-1.7"), Profile: "NU_STATEMENT_V1", ContentType: "application/pdf"},
+	}}
+	x := newExtractorWith(queue, &fakeClaims{}, fakeRegistry{
+		errs: map[app.ExtractionProfile]error{"NU_STATEMENT_V1": app.ErrSignatureMismatch},
+	})
+
+	result, err := x.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Failed != 1 || result.Unrecognised != 0 {
+		t.Errorf("result = %+v, want 1 failed and 0 unrecognised", result)
+	}
+	if len(queue.failures) != 1 {
+		t.Fatalf("failures = %+v", queue.failures)
+	}
+	// The reason names the profile, which is configuration. It carries no part
+	// of the artifact (SECURITY.md §10).
+	got := queue.failures[0].reason
+	if !contains(got, "DISPATCH") || !contains(got, "NU_STATEMENT_V1") {
+		t.Errorf("reason = %q, want the class and the profile", got)
+	}
+	if contains(got, "%PDF") {
+		t.Errorf("reason %q carries the artifact", got)
+	}
+}
+
+// A profile that BillyCore supports and cannot yet read fails with a reason
+// that says so. The rows wait, and D39's backoff brings them back when a parser
+// ships (D51).
+func TestAProfileWithNoParserYetFailsWithItsOwnReason(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{
+		{ID: "ev-1", RawContent: []byte("%PDF-1.7"), Profile: "HSBC_STATEMENT_V1", ContentType: "application/pdf"},
+	}}
+	x := newExtractorWith(queue, &fakeClaims{}, fakeRegistry{
+		errs: map[app.ExtractionProfile]error{"HSBC_STATEMENT_V1": app.ErrNoParserYet},
+	})
+
+	if _, err := x.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(queue.failures) != 1 || !contains(queue.failures[0].reason, "no parser yet") {
+		t.Errorf("failures = %+v, want a reason that names the missing parser", queue.failures)
+	}
+	if len(queue.extracted) != 0 {
+		t.Errorf("evidence advanced without a parser: %v", queue.extracted)
+	}
+}
+
+// The reading records the parser that made it. The store keeps that value and
+// never changes it, so an audit can ask which parser produced a Claim.
+func TestSaveRecordsTheProfileOfTheReading(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{
+		{ID: "ev-1", RawContent: []byte("outflow"), Profile: testProfile},
+	}}
+	claims := &fakeClaims{}
+	x := newExtractor(queue, claims, fakeInterpreter{
+		answers: map[string]map[domain.FieldName]domain.ClaimField{"outflow": moneyFields(t)},
+	})
+
+	if _, err := x.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(claims.profiles) != 1 || claims.profiles[0] != testProfile {
+		t.Errorf("Save recorded %v, want [%s]", claims.profiles, testProfile)
+	}
+}
+
+// noProfileQueue is fakeQueue without the profile that the fake fills in. It
+// exists for the one test about a row that names no profile at all.
+type noProfileQueue struct {
+	*fakeQueue
+}
+
+func (q *noProfileQueue) ClaimForExtraction(ctx context.Context, limit int, now, lockedUntil time.Time) ([]app.PendingEvidence, error) {
+	pending, err := q.fakeQueue.ClaimForExtraction(ctx, limit, now, lockedUntil)
+	for i := range pending {
+		pending[i].Profile = ""
+	}
+	return pending, err
+}
+
+// D57: the Interpreter takes the caller's context, and not one it invented.
+// A statement parser leaves the process, so a caller that stops must stop it.
+func TestTheInterpreterReceivesTheCallersContext(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{{ID: "ev-1", RawContent: []byte("artifact")}}}
+	claims := &fakeClaims{}
+
+	var given context.Context
+	x := newExtractor(queue, claims, fakeInterpreter{
+		answers: map[string]map[domain.FieldName]domain.ClaimField{"artifact": moneyFields(t)},
+		capture: func(ctx context.Context) { given = ctx },
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := x.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if given == nil {
+		t.Fatal("the interpreter received no context")
+	}
+	if err := given.Err(); err != nil {
+		t.Fatalf("the context arrived already stopped: %v", err)
+	}
+
+	// If the use case had passed context.Background(), this would stay nil and
+	// a running pdftotext would outlive the caller that asked for it.
+	cancel()
+	if given.Err() == nil {
+		t.Fatal("stopping the caller did not reach the interpreter")
+	}
+}
+
+// D59: the reading says how partial it was, and the count travels to the store
+// with the Claims it belongs to. Nothing recomputes it there: only the parser
+// knows how many rows it read past.
+func TestTheCountOfUnreadRowsReachesTheStore(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{{ID: "ev-1", RawContent: []byte("statement")}}}
+	claims := &fakeClaims{}
+	x := newExtractor(queue, claims, fakeInterpreter{
+		readings: map[string][]map[domain.FieldName]domain.ClaimField{
+			"statement": {moneyFields(t), moneyFields(t)},
+		},
+		skipped: map[string]int{"statement": 4},
+	})
+
+	if _, err := x.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(claims.sets) != 1 {
+		t.Fatalf("wrote %d interpretations, want 1", len(claims.sets))
+	}
+	if got := claims.sets[0].UnreadRows(); got != 4 {
+		t.Errorf("unread rows = %d, want 4", got)
+	}
+}
+
+// An email reading is never partial: one artifact is one movement, and an
+// artifact no template recognises gives no interpretation at all.
+func TestAnEmailReadingReportsNoUnreadRows(t *testing.T) {
+	queue := &fakeQueue{pending: []app.PendingEvidence{{ID: "ev-1", RawContent: []byte("email")}}}
+	claims := &fakeClaims{}
+	x := newExtractor(queue, claims, fakeInterpreter{
+		answers: map[string]map[domain.FieldName]domain.ClaimField{"email": moneyFields(t)},
+	})
+
+	if _, err := x.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := claims.sets[0].UnreadRows(); got != 0 {
+		t.Errorf("unread rows = %d, want 0", got)
 	}
 }
