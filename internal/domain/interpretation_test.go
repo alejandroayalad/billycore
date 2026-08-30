@@ -43,7 +43,7 @@ func TestAnInterpretationHoldsManyClaims(t *testing.T) {
 		activeClaim(t, "claim-2", "ev-1"),
 		activeClaim(t, "claim-3", "ev-1"),
 	}
-	in, err := domain.NewInterpretation("interp-1", "ev-1", claims, "", interpretedAt)
+	in, err := domain.NewInterpretation("interp-1", "ev-1", claims, 0, "", interpretedAt)
 	if err != nil {
 		t.Fatalf("NewInterpretation: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestAnInterpretationHoldsManyClaims(t *testing.T) {
 // recorded reading through the reference.
 func TestInterpretationClaimsCannotBeRewrittenThroughTheAccessor(t *testing.T) {
 	in, err := domain.NewInterpretation("interp-1", "ev-1",
-		[]domain.Claim{activeClaim(t, "claim-1", "ev-1")}, "", interpretedAt)
+		[]domain.Claim{activeClaim(t, "claim-1", "ev-1")}, 0, "", interpretedAt)
 	if err != nil {
 		t.Fatalf("NewInterpretation: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestInterpretationClaimsCannotBeRewrittenThroughTheAccessor(t *testing.T) {
 // that somebody computes from timestamps.
 func TestAnInterpretationNamesTheOneItReplaces(t *testing.T) {
 	in, err := domain.NewInterpretation("interp-2", "ev-1",
-		[]domain.Claim{activeClaim(t, "claim-2", "ev-1")}, "interp-1", interpretedAt)
+		[]domain.Claim{activeClaim(t, "claim-2", "ev-1")}, 0, "interp-1", interpretedAt)
 	if err != nil {
 		t.Fatalf("NewInterpretation: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestAnEmptyInterpretationIsRefused(t *testing.T) {
 	// "No template recognises this" is an answer about the artifact, and the
 	// pipeline records it with MarkExtracted. A reading with no Claims is a
 	// different thing, and it is not a reading.
-	_, err := domain.NewInterpretation("interp-1", "ev-1", nil, "", interpretedAt)
+	_, err := domain.NewInterpretation("interp-1", "ev-1", nil, 0, "", interpretedAt)
 	if !errors.Is(err, domain.ErrInterpretationNoClaims) {
 		t.Errorf("err = %v, want ErrInterpretationNoClaims", err)
 	}
@@ -97,16 +97,16 @@ func TestAnEmptyInterpretationIsRefused(t *testing.T) {
 
 func TestAnInterpretationRequiresItsIdentityAndItsArtifact(t *testing.T) {
 	claims := []domain.Claim{activeClaim(t, "claim-1", "ev-1")}
-	if _, err := domain.NewInterpretation("", "ev-1", claims, "", interpretedAt); !errors.Is(err, domain.ErrInterpretationNoID) {
+	if _, err := domain.NewInterpretation("", "ev-1", claims, 0, "", interpretedAt); !errors.Is(err, domain.ErrInterpretationNoID) {
 		t.Errorf("no id: err = %v, want ErrInterpretationNoID", err)
 	}
-	if _, err := domain.NewInterpretation("interp-1", "", claims, "", interpretedAt); !errors.Is(err, domain.ErrInterpretationNoEvidence) {
+	if _, err := domain.NewInterpretation("interp-1", "", claims, 0, "", interpretedAt); !errors.Is(err, domain.ErrInterpretationNoEvidence) {
 		t.Errorf("no evidence: err = %v, want ErrInterpretationNoEvidence", err)
 	}
-	if _, err := domain.NewInterpretation("interp-1", "ev-1", claims, "", time.Time{}); err == nil {
+	if _, err := domain.NewInterpretation("interp-1", "ev-1", claims, 0, "", time.Time{}); err == nil {
 		t.Error("an interpretation with no created_at was accepted")
 	}
-	if _, err := domain.NewInterpretation("interp-1", "ev-1", claims, "interp-1", interpretedAt); err == nil {
+	if _, err := domain.NewInterpretation("interp-1", "ev-1", claims, 0, "interp-1", interpretedAt); err == nil {
 		t.Error("an interpretation was allowed to supersede itself")
 	}
 }
@@ -130,7 +130,7 @@ func TestAnInterpretationRefusesAClaimThatIsNotActive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClaim: %v", err)
 	}
-	if _, err := domain.NewInterpretation("interp-1", "ev-1", []domain.Claim{proposed}, "", interpretedAt); err == nil {
+	if _, err := domain.NewInterpretation("interp-1", "ev-1", []domain.Claim{proposed}, 0, "", interpretedAt); err == nil {
 		t.Error("a PROPOSED claim was accepted into an interpretation")
 	}
 }
@@ -139,14 +139,14 @@ func TestAnInterpretationRefusesAClaimThatIsNotActive(t *testing.T) {
 // exists. It does not show that the Claim is about this artifact.
 func TestAnInterpretationRefusesAClaimAboutAnotherArtifact(t *testing.T) {
 	claims := []domain.Claim{activeClaim(t, "claim-1", "ev-other")}
-	if _, err := domain.NewInterpretation("interp-1", "ev-1", claims, "", interpretedAt); err == nil {
+	if _, err := domain.NewInterpretation("interp-1", "ev-1", claims, 0, "", interpretedAt); err == nil {
 		t.Error("a claim resting on another artifact was accepted")
 	}
 }
 
 func TestAnInterpretationRefusesTheSameClaimTwice(t *testing.T) {
 	claim := activeClaim(t, "claim-1", "ev-1")
-	if _, err := domain.NewInterpretation("interp-1", "ev-1", []domain.Claim{claim, claim}, "", interpretedAt); err == nil {
+	if _, err := domain.NewInterpretation("interp-1", "ev-1", []domain.Claim{claim, claim}, 0, "", interpretedAt); err == nil {
 		t.Error("one claim was accepted twice into one interpretation")
 	}
 }
@@ -164,5 +164,28 @@ func TestTransactionStateIsRequiredAndClosed(t *testing.T) {
 		if err := domain.TransactionState(state).Validate(); err == nil {
 			t.Errorf("%q was accepted as a transaction state", state)
 		}
+	}
+}
+
+// D59: a reading of a statement records how many of its movements no shape of
+// the parser read. The count is part of the reading, so it is validated with it.
+func TestAnInterpretationRecordsHowManyRowsItDidNotRead(t *testing.T) {
+	in, err := domain.NewInterpretation("interp-1", "ev-1",
+		[]domain.Claim{activeClaim(t, "claim-1", "ev-1")}, 4, "", interpretedAt)
+	if err != nil {
+		t.Fatalf("NewInterpretation: %v", err)
+	}
+	if in.UnreadRows() != 4 {
+		t.Errorf("unread rows = %d, want 4", in.UnreadRows())
+	}
+}
+
+// A parser that could not read a negative number of rows has a defect, and the
+// constructor is where that stops.
+func TestAnInterpretationRejectsANegativeCountOfUnreadRows(t *testing.T) {
+	_, err := domain.NewInterpretation("interp-1", "ev-1",
+		[]domain.Claim{activeClaim(t, "claim-1", "ev-1")}, -1, "", interpretedAt)
+	if !errors.Is(err, domain.ErrInterpretationNegativeUnread) {
+		t.Fatalf("err = %v, want ErrInterpretationNegativeUnread", err)
 	}
 }
