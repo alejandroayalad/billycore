@@ -259,13 +259,26 @@ DOMAIN.md §7's own example. They are assembled into a Money value on Transactio
   "reconciliation_state": "UNRECONCILED",
   "occurred_at": "2026-08-23T13:58:00Z",
   "merchant": { "value": "Amazon", "confidence": "MEDIUM" },
+  "counterparty": null,
   "account": null,
+  "internal": false,
   "evidence_ids": ["ev_01J8X2"],
   "relationships": [
     { "kind": "REFUND_OF", "transaction_id": "tx_01J8Q1" }
   ]
 }
 ```
+
+`merchant` and `counterparty` are two facts, not one. A merchant is a place where
+something was bought; a counterparty is the person or the institution on the other side
+of a transfer (DOMAIN.md §1, D61). A movement carries one, the other, or neither, each
+`{ value, confidence }` or `null`.
+
+`internal` is `true` when both sides of the movement are the user — a Cajita or a
+`dinero de respaldo` movement (D62). Its `counterparty.value` is then the reserved
+`urn:billy:self`; a reader shows it as the user and never prints the raw value (D65).
+An internal movement is a real Transaction and stays in the list, but it is excluded
+from the income and spending totals (D67).
 
 `reconciliation_state` and `financial_status` are separate concerns and never collapse
 into one field (DOMAIN.md §5). There is no `confirmed` flag: provenance, active Claims,
@@ -432,6 +445,26 @@ One Transaction with its full provenance trail:
 `claims` includes `SUPERSEDED` and `REJECTED` Claims, not only `ACTIVE` ones — the
 audit trail is the point. `evidence` carries the Evidence representations without
 `raw_content`.
+
+### `GET /v1/transactions/summary`
+
+Income and spending over a window, for the financial information the table shows. It
+takes the `from`, `to` and `currency` filters of `GET /v1/transactions`; it ignores
+`limit` and `cursor`.
+
+```json
+{
+  "currency": "MXN",
+  "income":  { "amount_minor": 4500000, "count": 21 },
+  "expense": { "amount_minor": 3820000, "count": 16 },
+  "net_minor": 680000,
+  "excluded_internal": 4
+}
+```
+
+Internal movements are excluded from both `income` and `expense` — the money did not
+enter or leave the user's control (D55, D67). `excluded_internal` is how many were left
+out, so the omission is visible. Totals are single-currency, which BillyCore is (D50).
 
 ---
 

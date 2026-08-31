@@ -274,7 +274,7 @@ accident. The authoritative lists are the open-question sections of each documen
 | What gets cut from the ~78 hours? | Everything | CONTEXT.md §8.2 |
 | Repository layout — one repo or three? | First commit | CONTEXT.md §8.3 |
 | Licence | Going public | CONTEXT.md §8.4 |
-| What does a reconciliation candidate reference? | Reconciliation, ~week 3 | DATA_MODEL.md Q1 |
+| ~~What does a reconciliation candidate reference?~~ Closed by D69 | Reconciliation | DATA_MODEL.md Q1 |
 | Where does the currency minor-unit exponent come from? | Rendering amounts | API.md Q8 |
 | Reconciliation time window | Reconciliation | DOMAIN.md Q1 |
 | Merchant normalization | Classification quality | DOMAIN.md Q2 |
@@ -1560,6 +1560,129 @@ superseding this entry; it is one constant and one test.
 
 
 ---
+
+### D66 — A Transaction preserves the counterparty; the tracking key stays a Claim field
+**Status:** Accepted · 2026-08-30 · Reversibility: bounded — a schema column
+**Decision.** `transactions` gains a nullable `counterparty` column (migration
+008), and reconciliation copies `FieldCounterparty` from the Claim onto the
+Transaction. The tracking key gains no such column: it stays a Claim field and a
+reader reaches it from a Transaction through `claim_transaction`.
+**Closes.** D61's open consequence — reconciliation could accept a counterparty
+Claim and then discard it, so a SPEI or an internal movement would lose the one
+field that says who was on the other side.
+**Why.** The counterparty is a fact about the movement, and the Transaction is
+what a reader sees; a value that reaches the read model and stops there is a
+value Billy read and threw away. The tracking key is different: DATA_MODEL.md
+§4.5 writes the Transaction columns down and lists no tracking key, D42 already
+refused to use it at build time, and the value is not lost — `claim_fields`
+keeps it and `claim_transaction` joins back to it.
+**Rejected — a `tracking_key` column on `transactions`.** It reads well and it
+duplicates a Claim field the schema deliberately does not lift, for a
+reconciliation use that no code makes yet. When reconciliation needs it, it
+reads the Claim.
+**Consequence.** `domain.Transaction` carries `Counterparty`, validated against
+the reserved namespace in the aggregate itself (D65), because a Transaction is a
+root of its own and does not trust the Claim it came from. The API and the
+`billycore tx` table now show it (D67).
+**Source.** Author decision, 2026-08-30.
+
+### D67 — Income and spending totals exclude internal movements
+**Status:** Accepted · 2026-08-30 · Reversibility: cheap
+**Decision.** A totals read model sums income and spending over the ACTIVE
+Transactions a query selects and leaves the internal movement out of both,
+matching on the reserved counterparty value (D62, D65). It is exposed at
+`GET /v1/transactions/summary` and shown as a footer under the `billycore tx`
+table. Each Transaction in the list also carries `counterparty` and a derived
+`internal` boolean.
+**Closes.** D55's requirement that an internal movement is excluded from income
+and spending, which had no reader to enforce it: no totals layer existed.
+**Why.** The money did not enter or leave the user's control, so counting a
+Cajita or a `respaldo` movement as income or spending inflates both sides of the
+table whose purpose is to say where money went. The row stays visible and only
+the totals drop it, which is exactly what D55 asked for. The exclusion lives in
+the read model, because that is where a total is computed; the criterion is the
+domain constant, passed as a query parameter, so no literal `urn:billy:self`
+lives in the SQL.
+**Rejected — sum in the CLI over the fetched page.** Smaller, and wrong past the
+page limit: a window of more than 200 rows would under-count. The server sums
+the whole filtered set.
+**Rejected — carry only the raw counterparty on the wire.** A machine client
+would then hardcode the URN to know a movement is internal. The `internal`
+boolean says it once, and the human readers still translate the value (D65).
+**Consequence.** The footer says how many internal movements it excluded, so the
+omission is visible rather than silent (PRODUCT.md). Totals are single-currency,
+which BillyCore already is (D50).
+**Source.** Author decision, 2026-08-30.
+
+### D68 — The Nu statement reads nine more shapes
+**Status:** Accepted · 2026-08-30 · Reversibility: cheap
+**Decision.** The statement parser reads nine further row shapes. Direction is
+the sign of the amount column in every case, as for `Compra`.
+
+| Shape | Direction | Party |
+|---|---|---|
+| `Pago a tu tarjeta de crédito Nu` | OUTFLOW | none, external |
+| `<merchant> Devolución` | INFLOW | merchant |
+| `<merchant> Ajuste realizado` | INFLOW | merchant |
+| `Bonificación por beneficio de Nu` | INFLOW | none |
+| `Compensación de retraso SPEI` | INFLOW | none |
+| `Pago de servicio - <merchant>` | OUTFLOW | merchant |
+| `Cajero <operator> Retiro de efectivo` | OUTFLOW | counterparty = operator |
+| `Depósito en punto de venta` | INFLOW | none |
+| `Descongelamos saldo de tu Cajita: <name>` | INFLOW | self (internal) |
+
+**Closes.** The 42 genuinely-unread statement rows measured under D59, less the
+mirror rows and one balance-summary line.
+**Why.** Each shape names its own kind in the description column, so a
+deterministic rule reads it with no new vocabulary: existing fields carry the
+amount, the direction, the date and the party. A party the column places is
+MEDIUM (D58); `self` is HIGH, because it is a fact about the shape and not a
+reading (D62).
+**Rejected — model the refund now.** A `Devolución` and an `Ajuste` relate to an
+earlier purchase, and that relationship is real. DATA_MODEL.md §9 leaves
+relationships open, and a refund is recorded as a plain inflow without it. The
+link waits for that decision.
+**The two calls that were judgements.** A card payment is external: the Nu
+credit card is its own product and its own statement, not one of the debit-side
+accounts D62 covers. An ATM operator is an institution, so it is the
+counterparty and not a merchant, and a cash withdrawal is an outflow — where the
+cash then goes is unknown, and it is not counted as internal.
+**Consequence.** Unread drops from 126 to 85 across the three statements: 84
+internal-mirror rows, deliberately unread (D55), and one Cajita balance-summary
+line, correctly furniture. The redacted fixtures do not carry these Spanish
+words, so the tests are synthetic and the counts were validated against the real
+statements.
+**Source.** Author decisions on the shape matrix, 2026-08-30.
+
+### D69 — A reconciliation candidate references two Transactions
+**Status:** Accepted · 2026-08-31 · Reversibility: bounded — a schema table
+**Decision.** `reconciliation_candidate.left_ref` and `right_ref` are
+`transactions.id`. A candidate pairs two Transactions and records a status —
+`MATCH`, `NO_MATCH` or `AMBIGUOUS` (DOMAIN.md §6). The table and its foreign keys
+are added by a migration when reconciliation is built.
+**Closes.** DATA_MODEL.md Q1, open since the schema was written: the domain
+described reconciliation between Claims or Evidence, and the API used Transaction
+ids, and nothing chose. No generic untyped reference was added as a workaround.
+**Why.** The Transaction is Billy's representation of one financial event, and it
+carries every signal DOMAIN.md §6 compares: amount, direction, time, counterparty,
+status, and the tracking key through its Claim. The rest of the system already
+speaks in Transactions — D42 builds one for each Claim, born `UNRECONCILED`;
+DOMAIN.md §8's `TransactionReconciled` names a "surviving transactionId"; D49
+reserved `superseded_by_transaction_id`; the API uses Transaction ids throughout.
+Pointing a candidate at anything else makes reconciliation translate back to these
+values before it can compare them.
+**Rejected — Claim ids.** More faithful to "a Claim is one observation", and it
+fights the Transaction-centric API and needs a Claim-to-values path the Transaction
+already is.
+**Rejected — Evidence ids.** One statement PDF is one Evidence with about 180
+movements, so a pair of Evidence ids cannot say which movement matched. Wrong
+granularity.
+**Consequence — one decision remains before the code.** What a `MATCH` does to the
+two Transactions is not settled here: whether one survives and the other is retired
+(`transaction_state` SUPERSEDED, `superseded_by_transaction_id` the survivor, the
+column D49 reserved), or both stay and are linked. DOMAIN.md §8 and D49 lean toward
+the merge, and it is the next entry to write.
+**Source.** Author decision, 2026-08-31.
 
 ## Template
 
