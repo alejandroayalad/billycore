@@ -129,9 +129,10 @@ func TestARowThatNoShapeReadsIsSkippedAndCounted(t *testing.T) {
 // A statement of rows no shape reads is an answer, not a failure. The use case
 // knows "nothing recognised this" and not what a Compra is.
 func TestAStatementWithNoReadableRowReportsNoInterpretation(t *testing.T) {
+	// Two Cajita-section balance lines. No shape reads a `saldo` summary.
 	extractor := fakeExtractor{coordinates: statement(
-		[3]string{"31 MAY 2026", "Pago a tu tarjeta de crédito Nu", "-$100.00"},
 		[3]string{"31 MAY 2026", "Larios580 saldo de tu Cajita: delgado79", "+$250.50"},
+		[3]string{"31 MAY 2026", "Cortez648 saldo de tu Cajita: Mi primera Cajita", "-$100.00"},
 	)}
 	_, err := nustatement.New(extractor).Interpret(t.Context(), []byte("%PDF-1.7"))
 	if !errors.Is(err, app.ErrNoInterpretation) {
@@ -368,6 +369,60 @@ func TestTheInternalShapesChangeNoOtherReading(t *testing.T) {
 	assertText(t, spei, domain.FieldOccurredAt, "2026-05-31T16:22:34.000Z", domain.High)
 }
 
+// The amount column also holds unsigned figures: balances and totals, not
+// movements. bbox.IsAmount requires a sign, so an unsigned figure pairs with no
+// date and yields no row. There are 18 such figures across the three
+// statements (D59 measurement).
+func TestAnUnsignedAmountColumnFigureIsNotAMovement(t *testing.T) {
+	var b strings.Builder
+	openDoc(&b)
+	// One real purchase, so the reading is not empty for the wrong reason.
+	writeBlock(&b, 56.00, 150, "31 MAY 2026")
+	writeBlock(&b, 135.84, 149, "PANADERIA65 Compra")
+	writeBlock(&b, 494.64, 150, "-$100.00")
+	// A balance total on its own y: an unsigned figure in the amount column.
+	writeBlock(&b, 494.64, 200, "$20,012.81")
+	closeDoc(&b)
+
+	reading := interpret(t, []byte(b.String()))
+	if len(reading.Fields) != 1 {
+		t.Fatalf("read %d rows, want 1: the unsigned figure is not a movement", len(reading.Fields))
+	}
+	if reading.SkippedRows != 0 {
+		t.Errorf("skipped %d rows, want 0: an unsigned figure pairs with no date", reading.SkippedRows)
+	}
+}
+
+// The cover page prints a `Gastos` total: a one-word label near x=58 beside a
+// signed amount at y=409.2, with no date block. A date block is exactly three
+// words `DD MON YYYY`, so a one-word label is not a date and the row assembler
+// makes no row (D59). This pins the rule against regression.
+func TestACoverSummaryLineIsNotAMovement(t *testing.T) {
+	var b strings.Builder
+	openDoc(&b)
+	writeBlock(&b, 58.00, 409.2, "Gastos")
+	writeBlock(&b, 494.64, 409.2, "-$51,274.21")
+	closeDoc(&b)
+
+	if _, err := nustatement.New(fakeExtractor{coordinates: []byte(b.String())}).
+		Interpret(t.Context(), []byte("%PDF-1.7")); !errors.Is(err, app.ErrNoInterpretation) {
+		t.Fatalf("err = %v, want app.ErrNoInterpretation: a one-word label is not a date", err)
+	}
+
+	// The same amount with a real three-word date is a row. The date block is
+	// the discriminator, not the amount.
+	var withDate strings.Builder
+	openDoc(&withDate)
+	writeBlock(&withDate, 56.00, 409.2, "31 MAY 2026")
+	writeBlock(&withDate, 135.84, 408.2, "PANADERIA65 Compra")
+	writeBlock(&withDate, 494.64, 409.2, "-$51,274.21")
+	closeDoc(&withDate)
+	reading := interpret(t, []byte(withDate.String()))
+	if len(reading.Fields) != 1 {
+		t.Fatalf("a three-word date did not form a row: read %d", len(reading.Fields))
+	}
+}
+
 // The parser never makes a context of its own. A shutdown has to stop a running
 // pdftotext, and it can only do that through the caller's context (D57).
 func TestTheCallersContextReachesTheExtractor(t *testing.T) {
@@ -511,6 +566,18 @@ func assertInt(t *testing.T, fields map[domain.FieldName]domain.ClaimField, name
 // triples. The columns are the measured ones: a date left of x=130, a
 // description between the columns, and an amount right of x=480. The date and
 // the amount share one y, which is what makes the pair a row (D54).
+// openDoc and closeDoc wrap a coordinate document, so a furniture test can place
+// each block itself instead of through the row-shaped statement helper.
+func openDoc(b *strings.Builder) {
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)
+	b.WriteString(`<html xmlns="http://www.w3.org/1999/xhtml"><body><doc>`)
+	b.WriteString(`<page width="595.000000" height="842.000000"><flow>`)
+}
+
+func closeDoc(b *strings.Builder) {
+	b.WriteString(`</flow></page></doc></body></html>`)
+}
+
 func statement(rows ...[3]string) []byte {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>`)

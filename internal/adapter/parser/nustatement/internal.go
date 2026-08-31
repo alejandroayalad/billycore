@@ -25,6 +25,9 @@ var internalShapes = []struct {
 	{"Retiro de Cajita:", domain.Inflow},
 	{"Depósito en Cajita:", domain.Outflow},
 	{"Retirado de tu dinero de respaldo", domain.Inflow},
+	// Unfreezing a Cajita returns the user's own money to the balance. It has
+	// no mirror row in the corpus, so it is read as a single inflow.
+	{"Descongelamos saldo de tu Cajita:", domain.Inflow},
 }
 
 // internalMovement reads one movement between accounts of one user, and reports

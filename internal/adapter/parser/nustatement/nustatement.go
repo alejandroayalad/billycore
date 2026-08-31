@@ -2,9 +2,9 @@
 //
 // The statement labels nothing, so the reading is geometric: pdftotext gives
 // coordinates (D54), package bbox gives positioned rows, and this package reads
-// the shape of one row. It handles the `Compra` shape, the SPEI shapes, and the
-// movements between accounts of one user. Each other shape is skipped and
-// counted (D59).
+// the shape of one row. It reads the `Compra` shape, the SPEI shapes, the
+// movements between accounts of one user, and the descriptor rows. Each other
+// shape is skipped and counted (D59).
 package nustatement
 
 import (
@@ -101,7 +101,7 @@ type shape func(bbox.Row) (map[domain.FieldName]domain.ClaimField, bool, error)
 
 // shapes are the rows this parser reads, in the order it tries them. A row that
 // no shape reads is skipped and counted (D59).
-var shapes = []shape{compra, internalMovement, spei}
+var shapes = []shape{compra, internalMovement, descriptor, spei}
 
 // read gives one row to each shape until one recognises it.
 func read(row bbox.Row) (map[domain.FieldName]domain.ClaimField, bool, error) {
