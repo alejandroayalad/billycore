@@ -206,3 +206,49 @@ func claimWithCounterparty(t *testing.T, id, evidenceID, counterparty string) do
 	}
 	return active
 }
+
+// Totals sum income and spending and leave the internal movement out of both
+// (D55). The internal movement is still counted, so a reader can say so.
+func TestTotalsExcludeInternalMovements(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	day := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	storeReadableTransaction(t, transactions, claims, evidence, "in-1", day, 30000, domain.Inflow)
+	storeReadableTransaction(t, transactions, claims, evidence, "out-1", day, 50000, domain.Outflow)
+	// An internal outflow of the user's own money. It must touch no total.
+	storeCounterpartyTransaction(t, transactions, claims, evidence, "internal-1", domain.CounterpartySelf)
+
+	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.IncomeMinor != 30000 || totals.IncomeCount != 1 {
+		t.Errorf("income = %d (%d), want 30000 (1)", totals.IncomeMinor, totals.IncomeCount)
+	}
+	if totals.ExpenseMinor != 50000 || totals.ExpenseCount != 1 {
+		t.Errorf("expense = %d (%d), want 50000 (1): the internal outflow must not count", totals.ExpenseMinor, totals.ExpenseCount)
+	}
+	if totals.ExcludedInternal != 1 {
+		t.Errorf("excluded internal = %d, want 1", totals.ExcludedInternal)
+	}
+	if totals.Currency != domain.Currency("MXN") {
+		t.Errorf("currency = %s, want MXN", totals.Currency)
+	}
+}
+
+// The from and to window filters the totals, as it filters the list.
+func TestTotalsHonourTheWindow(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	inside := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	outside := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	storeReadableTransaction(t, transactions, claims, evidence, "in-window", inside, 20000, domain.Outflow)
+	storeReadableTransaction(t, transactions, claims, evidence, "out-window", outside, 99999, domain.Outflow)
+
+	from := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{From: &from})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.ExpenseMinor != 20000 {
+		t.Errorf("expense = %d, want 20000: the July row is outside the window", totals.ExpenseMinor)
+	}
+}

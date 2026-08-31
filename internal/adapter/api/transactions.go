@@ -37,9 +37,15 @@ type transactionResponse struct {
 	ReconciliationState string                 `json:"reconciliation_state"`
 	OccurredAt          string                 `json:"occurred_at"`
 	Merchant            *supportedTextResponse `json:"merchant"`
+	Counterparty        *supportedTextResponse `json:"counterparty"`
 	Account             *supportedTextResponse `json:"account"`
-	EvidenceIDs         []string               `json:"evidence_ids"`
-	Relationships       []any                  `json:"relationships"`
+
+	// Internal is true when both sides of the movement are the user (D62). A
+	// client that reports income or spending excludes an internal movement
+	// (D55); this boolean is that fact, so no client hardcodes the URN.
+	Internal      bool     `json:"internal"`
+	EvidenceIDs   []string `json:"evidence_ids"`
+	Relationships []any    `json:"relationships"`
 }
 
 type transactionListResponse struct {
@@ -85,6 +91,54 @@ func (s *Server) handleListTransactions(w http.ResponseWriter, r *http.Request) 
 		response.NextCursor = &cursor
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+type totalsSideResponse struct {
+	AmountMinor int64 `json:"amount_minor"`
+	Count       int   `json:"count"`
+}
+
+type transactionTotalsResponse struct {
+	Currency string             `json:"currency"`
+	Income   totalsSideResponse `json:"income"`
+	Expense  totalsSideResponse `json:"expense"`
+	NetMinor int64              `json:"net_minor"`
+
+	// ExcludedInternal is how many internal movements were left out of the
+	// totals. They are the user's own money and are neither income nor spending
+	// (D55), but a reader is told they exist.
+	ExcludedInternal int `json:"excluded_internal"`
+}
+
+// handleTransactionTotals answers GET /v1/transactions/summary. It honours the
+// from, to and currency filters and ignores the cursor and the limit.
+func (s *Server) handleTransactionTotals(w http.ResponseWriter, r *http.Request) {
+	query, err := parseTransactionQuery(r)
+	if err != nil {
+		var problem queryParameterError
+		if !errors.As(err, &problem) {
+			problem = queryParameterError{Detail: "is not valid"}
+		}
+		writeError(w, http.StatusBadRequest, typeMalformedRequest,
+			"One or more query parameters are invalid.", violation{
+				Code: "query.invalid", Field: problem.Field, Detail: problem.Detail,
+			})
+		return
+	}
+	totals, err := s.transactions.Totals(r.Context(), query)
+	if err != nil {
+		slog.Error("cannot total transactions", "error", err)
+		writeError(w, http.StatusInternalServerError, typeInternalError,
+			"BillyCore could not total Transactions.")
+		return
+	}
+	writeJSON(w, http.StatusOK, transactionTotalsResponse{
+		Currency:         totals.Currency.String(),
+		Income:           totalsSideResponse{AmountMinor: totals.IncomeMinor, Count: totals.IncomeCount},
+		Expense:          totalsSideResponse{AmountMinor: totals.ExpenseMinor, Count: totals.ExpenseCount},
+		NetMinor:         totals.IncomeMinor - totals.ExpenseMinor,
+		ExcludedInternal: totals.ExcludedInternal,
+	})
 }
 
 func parseTransactionQuery(r *http.Request) (app.TransactionQuery, error) {
@@ -165,6 +219,13 @@ func transactionRepresentation(item app.ListedTransaction) transactionResponse {
 	}
 	if tx.Merchant() != "" {
 		response.Merchant = &supportedTextResponse{Value: tx.Merchant(), Confidence: item.MerchantConfidence.String()}
+	}
+	// The counterparty carries the raw value, the reserved one included. The
+	// human readers translate it and never print it raw; a machine client
+	// reads `internal` (D65).
+	if tx.Counterparty() != "" {
+		response.Counterparty = &supportedTextResponse{Value: tx.Counterparty(), Confidence: item.CounterpartyConfidence.String()}
+		response.Internal = tx.Counterparty() == domain.CounterpartySelf
 	}
 	if tx.AccountIdentifier() != "" {
 		response.Account = &supportedTextResponse{Value: tx.AccountIdentifier(), Confidence: item.AccountConfidence.String()}

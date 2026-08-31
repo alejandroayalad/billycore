@@ -267,7 +267,29 @@ type TransactionPage struct {
 	HasMore      bool
 }
 
+// TransactionTotals is income and spending over a filtered set of Transactions.
+//
+// An internal movement is money between the user's own accounts, so it is not
+// income and not spending, and it is excluded from both totals (D55, D62). It
+// is still counted here, so a reader can say how many were left out.
+//
+// The amounts are minor units of one currency. BillyCore supports one currency
+// today (D50), so a total mixes none.
+type TransactionTotals struct {
+	Currency         domain.Currency
+	IncomeMinor      int64
+	ExpenseMinor     int64
+	IncomeCount      int
+	ExpenseCount     int
+	ExcludedInternal int
+}
+
 // TransactionReader reads the ACTIVE Transactions Billy currently uses.
 type TransactionReader interface {
 	List(ctx context.Context, query TransactionQuery) (TransactionPage, error)
+
+	// Totals sums income and spending over the Transactions the query selects,
+	// excluding internal movements (D55). The from, to and currency filters
+	// apply; the cursor and the limit do not.
+	Totals(ctx context.Context, query TransactionQuery) (TransactionTotals, error)
 }

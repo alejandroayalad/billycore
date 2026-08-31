@@ -178,3 +178,67 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 	}
 	return item, nil
 }
+
+// Totals sums income and spending over the Transactions the query selects. An
+// internal movement is the user's own money and counts as neither (D55); the
+// exclusion uses the reserved counterparty value, passed as a parameter so the
+// domain owns it and no literal lives in this SQL (D65).
+func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQuery) (app.TransactionTotals, error) {
+	// Totals are single-currency: mixing minor units of two currencies is
+	// meaningless. BillyCore supports one currency today (D50), so the default
+	// is MXN where the query names none.
+	currency := q.Currency
+	if currency == "" {
+		currency = domain.Currency("MXN")
+	}
+	totals := app.TransactionTotals{Currency: currency}
+
+	where := []string{"t.transaction_state = ?", "t.currency = ?", "t.amount_minor IS NOT NULL"}
+	args := []any{string(domain.TransactionActive), string(currency)}
+	if q.From != nil {
+		where, args = append(where, "t.occurred_at >= ?"), append(args, formatTime(*q.From))
+	}
+	if q.To != nil {
+		where, args = append(where, "t.occurred_at < ?"), append(args, formatTime(*q.To))
+	}
+
+	// Income and spending, excluding the internal movement.
+	external := append([]string{"(t.counterparty IS NULL OR t.counterparty <> ?)"}, where...)
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT t.direction, COALESCE(SUM(t.amount_minor), 0), COUNT(*)
+		FROM transactions t
+		WHERE `+strings.Join(external, " AND ")+`
+		GROUP BY t.direction`,
+		append([]any{domain.CounterpartySelf}, args...)...)
+	if err != nil {
+		return app.TransactionTotals{}, fmt.Errorf("transaction totals: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var direction string
+		var sum int64
+		var count int
+		if err := rows.Scan(&direction, &sum, &count); err != nil {
+			return app.TransactionTotals{}, fmt.Errorf("transaction totals: scan: %w", err)
+		}
+		switch domain.TransactionDirection(direction) {
+		case domain.Inflow:
+			totals.IncomeMinor, totals.IncomeCount = sum, count
+		case domain.Outflow:
+			totals.ExpenseMinor, totals.ExpenseCount = sum, count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return app.TransactionTotals{}, fmt.Errorf("transaction totals: %w", err)
+	}
+
+	// The internal movements that were left out, so the reader can say so.
+	internal := append([]string{"t.counterparty = ?"}, where...)
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM transactions t WHERE `+strings.Join(internal, " AND "),
+		append([]any{domain.CounterpartySelf}, args...)...,
+	).Scan(&totals.ExcludedInternal); err != nil {
+		return app.TransactionTotals{}, fmt.Errorf("transaction totals: internal: %w", err)
+	}
+	return totals, nil
+}

@@ -92,6 +92,7 @@ func (s *Server) Handler(token string) http.Handler {
 	v1.HandleFunc("POST /v1/evidence", s.handlePostEvidence)
 	v1.HandleFunc("GET /v1/evidence/{id}", s.handleGetEvidence)
 	v1.HandleFunc("GET /v1/transactions", s.handleListTransactions)
+	v1.HandleFunc("GET /v1/transactions/summary", s.handleTransactionTotals)
 	mux.Handle("/v1/", authenticate(token, v1))
 
 	return recoverPanics(logRequests(mux))

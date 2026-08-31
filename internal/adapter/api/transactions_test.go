@@ -12,14 +12,20 @@ import (
 )
 
 type stubTransactionReader struct {
-	page  app.TransactionPage
-	err   error
-	query app.TransactionQuery
+	page   app.TransactionPage
+	totals app.TransactionTotals
+	err    error
+	query  app.TransactionQuery
 }
 
 func (s *stubTransactionReader) List(_ context.Context, query app.TransactionQuery) (app.TransactionPage, error) {
 	s.query = query
 	return s.page, s.err
+}
+
+func (s *stubTransactionReader) Totals(_ context.Context, query app.TransactionQuery) (app.TransactionTotals, error) {
+	s.query = query
+	return s.totals, s.err
 }
 
 func apiTransaction(t *testing.T, id string, at time.Time) domain.Transaction {
@@ -71,6 +77,46 @@ func TestListTransactionsReturnsTheDocumentedRepresentation(t *testing.T) {
 	if tx.Account != nil || len(tx.Relationships) != 0 {
 		t.Errorf("account/relationships = %+v/%+v", tx.Account, tx.Relationships)
 	}
+	// A purchase names no counterparty and is not internal.
+	if tx.Counterparty != nil || tx.Internal {
+		t.Errorf("counterparty/internal = %+v/%v", tx.Counterparty, tx.Internal)
+	}
+}
+
+// An internal movement carries the reserved counterparty and reports internal.
+// The API sends the raw value; the human readers translate it (D62, D65).
+func TestAnInternalMovementIsMarkedInTheResponse(t *testing.T) {
+	at := time.Date(2026, 5, 31, 6, 0, 0, 0, time.UTC)
+	money, err := domain.NewMoney(70771, domain.Currency("MXN"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := domain.NewTransaction(domain.TransactionDraft{
+		ID: "tx-int", Money: money, Counterparty: domain.CounterpartySelf, Direction: domain.Inflow,
+		FinancialStatus: domain.StatusUnknown, ReconciliationState: domain.Unreconciled,
+		State: domain.TransactionActive, OccurredAt: at, EvidenceIDs: []string{"ev-1"}, CreatedAt: at,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &stubTransactionReader{page: app.TransactionPage{Transactions: []app.ListedTransaction{
+		{Transaction: tx, CounterpartyConfidence: domain.High},
+	}}}
+	w := request(t, transactionHandler(t, reader), http.MethodGet, "/v1/transactions", "Bearer "+testToken)
+	got := decode[transactionListResponse](t, w)
+	if len(got.Data) != 1 {
+		t.Fatalf("response = %+v", got)
+	}
+	item := got.Data[0]
+	if item.Counterparty == nil || item.Counterparty.Value != domain.CounterpartySelf || item.Counterparty.Confidence != "HIGH" {
+		t.Errorf("counterparty = %+v", item.Counterparty)
+	}
+	if !item.Internal {
+		t.Error("internal = false, want true")
+	}
+	if item.Merchant != nil {
+		t.Errorf("an internal movement has a merchant: %+v", item.Merchant)
+	}
 }
 
 func TestListTransactionsParsesFiltersAndCursor(t *testing.T) {
@@ -109,5 +155,29 @@ func TestListTransactionsReportsStorageFailure(t *testing.T) {
 	w := request(t, handler, http.MethodGet, "/v1/transactions", "Bearer "+testToken)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+// The summary endpoint returns income and spending with the internal movements
+// excluded and counted (D55).
+func TestTransactionSummaryReturnsTotals(t *testing.T) {
+	reader := &stubTransactionReader{totals: app.TransactionTotals{
+		Currency: domain.Currency("MXN"), IncomeMinor: 120000, ExpenseMinor: 150000,
+		IncomeCount: 3, ExpenseCount: 5, ExcludedInternal: 4,
+	}}
+	w := request(t, transactionHandler(t, reader), http.MethodGet,
+		"/v1/transactions/summary?from=2026-08-01T00:00:00Z", "Bearer "+testToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", w.Code, w.Body)
+	}
+	got := decode[transactionTotalsResponse](t, w)
+	if got.Currency != "MXN" || got.Income.AmountMinor != 120000 || got.Income.Count != 3 {
+		t.Errorf("income = %+v", got.Income)
+	}
+	if got.Expense.AmountMinor != 150000 || got.NetMinor != -30000 || got.ExcludedInternal != 4 {
+		t.Errorf("totals = %+v", got)
+	}
+	if reader.query.From == nil {
+		t.Error("the from filter did not reach the reader")
 	}
 }
