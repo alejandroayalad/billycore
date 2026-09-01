@@ -101,7 +101,7 @@ Two consequences:
 
 ### Entities
 
-The v1 entity list is deliberately short: **Evidence**, **Claim**, **Transaction**.
+The v1 entity list: **Evidence**, **Interpretation**, **Claim**, **Transaction**.
 
 #### Evidence
 
@@ -114,6 +114,23 @@ Conceptually carries:
 - source reference
 - the original raw content, or an immutable reference to it
 - observed / received timestamp
+
+#### Interpretation
+
+Has identity because one artifact can be read more than once, and each reading is a
+whole that supersedes the last, not a Claim edited in place (D46). One Evidence has at
+most one *active* Interpretation, which owns a set of Claims — one bank statement is one
+Interpretation of about 180 movements. Re-reading the same Evidence under a better
+profile produces a new Interpretation that supersedes the old one (D48), so the Claims
+of a reading move together and never interleave two readings.
+
+Conceptually carries:
+
+- `id`
+- the `Evidence` it reads
+- the extraction profile that read it
+- how many rows the reading could not parse (its unread count)
+- the Interpretation it supersedes, if any
 
 #### Claim
 
@@ -257,14 +274,39 @@ Immutable once recorded. Evidence has no domain state.
 Processing statuses such as `PARSING`, `LLM_FAILED`, or `RETRYING` belong outside the
 core domain.
 
+### Interpretation lifecycle
+
+An Interpretation is either the active reading of its Evidence or superseded by a later
+one. It carries no `PROPOSED` or `REJECTED` state: a reading is activated as a whole
+when it is stored, and replaced as a whole when a better one arrives (D46, D48). One
+Evidence has at most one active Interpretation at a time, and the supersession keeps the
+old reading for provenance.
+
 ### Claim lifecycle
 
 | State | Meaning |
 |---|---|
-| `PROPOSED` | An interpretation exists but is not yet Billy's usable interpretation. |
+| `PROPOSED` | A Claim of an Interpretation, not yet part of Billy's active reading. |
 | `ACTIVE` | Billy currently uses this Claim. **Active does not mean objectively true.** |
 | `SUPERSEDED` | A newer or better Claim replaced it. Kept for provenance and audit. |
 | `REJECTED` | The interpretation was determined not to be usable. |
+
+A Claim is activated as part of an Interpretation, not on its own: the unit of
+activation is the set, so a whole reading becomes active or is superseded together
+(D46).
+
+### Transaction lifecycle state
+
+Kept separate from both reconciliation and financial status, because it answers a third
+question — is this Transaction still one Billy shows?
+
+`ACTIVE` · `SUPERSEDED`
+
+A Transaction is `ACTIVE` until reconciliation finds it is the same event as another and
+merges the two: the survivor stays `ACTIVE`, and the other becomes `SUPERSEDED` and
+points at the survivor (D70). A `SUPERSEDED` Transaction leaves every list and total but
+stays in history, so the merge is auditable and the two-source fact is not lost. Nothing
+outside reconciliation sets this state.
 
 ### Transaction reconciliation state
 
@@ -383,6 +425,25 @@ human resolves the ambiguity.
 BillyCore enforces the domain invariants in all cases. **BillyAgent cannot bypass
 BillyCore merely because an LLM believes two observations match.**
 
+#### What a MATCH does, and how BillyCore reaches one
+
+A `MATCH` **merges** the two Transactions: the smaller id survives, the other becomes
+`SUPERSEDED` and points at it, and the survivor takes the union of both Evidence so the
+two-source fact is kept (D70). The candidate is recorded either way, so the decision is
+auditable and idempotent by its unique pair.
+
+BillyCore reaches a `MATCH` only through an **exact key**, never a fuzzy score:
+
+- the **tracking key** — a shared SPEI `Clave de rastreo` is the same movement (D36);
+- an **exact composite key** where no tracking key is shared — equal amount, currency,
+  direction and party (the merchant, or the counterparty where a Source fills that
+  field), on the same calendar day in a fixed UTC−6 — and only when it holds for exactly
+  one Transaction on each of two Sources (D72).
+
+Everything else stays `AMBIGUOUS`. The time window and the amount tolerance of §2 and §3
+remain open questions, so BillyCore does not merge on them: a weaker, LLM-assisted match
+is BillyAgent's to propose, and BillyCore still enforces the invariants on it.
+
 ---
 
 ## 7. Uncertainty & Confidence
@@ -457,7 +518,9 @@ either a first Claim became `ACTIVE`, or a new Claim replaced an existing one.
 **Why others care:** the interpretation consumers read has changed. When it carries a
 superseded id, it is also the provenance record of the change.
 
-**Carries:** `claimId`, `evidenceId`, `supersededClaimId` (optional).
+**Carries:** `claimId`, `evidenceIds`, `interpretationId`, `supersedesInterpretationId`
+(optional), `supersededClaimId` (optional). A Claim is activated as a member of an
+Interpretation, so the event names the reading it belongs to and the one it replaced.
 
 ### TransactionCreated
 
@@ -475,8 +538,9 @@ view of the data.
 **Why others care:** a consumer's earlier view may have contained what now turns out
 to be one event, not two.
 
-**Carries:** surviving `transactionId`, the reconciled `transactionId` / `evidenceId`,
-and the outcome's basis.
+**Carries:** the surviving `transactionId`, the superseded `transactionId`, and the
+basis — `tracking_key` or `composite` (D72). It holds no amounts: the event log does not
+keep the finances of a person (SECURITY.md).
 
 ### ReconciliationAmbiguous
 

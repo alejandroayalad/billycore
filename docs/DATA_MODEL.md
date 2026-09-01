@@ -109,17 +109,22 @@ Missing information must not be represented as fake values such as `"UNKNOWN"`, 
 | Domain concept | Schema |
 |---|---|
 | Evidence | `evidence` |
+| Interpretation | `interpretations` (§4.8) |
+| Interpretation membership | `interpretation_claims` (§4.8) |
+| Active interpretation of an Evidence | `evidence_active_interpretation` (§4.8) |
 | Claim | `claims` |
 | Claim provenance | `claim_evidence` |
 | Claim fields + confidence | `claim_fields` |
 | Transaction | `transactions` |
 | Transaction provenance | `transaction_evidence` |
+| Transaction merge / supersession | `transactions.transaction_state` + `superseded_by_transaction_id` |
 | Money | integer `amount_minor` + `currency` |
 | Confidence | `claim_fields.confidence` |
 | AccountIdentifier | text value, not a table |
+| Counterparty | text value on `transactions`, not a table |
 | SourceReference | columns on `evidence` |
 | Domain event | `domain_event` |
-| Reconciliation candidate | unresolved; see Open Questions |
+| Reconciliation candidate | `reconciliation_candidate` (§9) |
 
 Several domain concepts deliberately do not become tables. There is no `account`,
 `merchant`, `currency`, or `user` table.
@@ -329,20 +334,25 @@ CREATE TABLE transactions (
     merchant                TEXT,
     counterparty            TEXT,
     account_identifier      TEXT,
-    direction               TEXT NOT NULL,
-    financial_status        TEXT NOT NULL,
-    reconciliation_state    TEXT NOT NULL,
-    transaction_state       TEXT NOT NULL,
-    occurred_at             TEXT NOT NULL,
-    created_at              TEXT NOT NULL,
-    updated_at              TEXT NOT NULL
+    direction                     TEXT NOT NULL,
+    financial_status              TEXT NOT NULL,
+    reconciliation_state          TEXT NOT NULL,
+    transaction_state             TEXT NOT NULL,
+    superseded_by_transaction_id  TEXT,
+    occurred_at                   TEXT NOT NULL,
+    created_at                    TEXT NOT NULL,
+    updated_at                    TEXT NOT NULL
 ) STRICT;
 ```
 
 **`counterparty`** is nullable and holds the person or the institution on the other
 side of the movement, preserved from the Claim (D66). It is not the merchant. It carries
 the reserved value `urn:billy:self` for an internal movement — money between the user's
-own accounts (D62, D65). `transaction_state` is the lifecycle from D49.
+own accounts (D62, D65). **`transaction_state`** is the lifecycle from D49 — `ACTIVE` or
+`SUPERSEDED`; **`superseded_by_transaction_id`** is null while the row is `ACTIVE` and
+names the survivor once reconciliation merges this Transaction into another (D70). Both
+are written only by reconciliation; `GET /v1/transactions` filters to `ACTIVE`, so a
+superseded row leaves the list and the totals but stays in history.
 
 ```
 direction:             INFLOW · OUTFLOW
@@ -427,6 +437,53 @@ Events are append-only. They are never updated and never deleted.
 > the domain, and a change that commits without its event is invisible to every
 > consumer.
 
+### 4.8 Interpretations
+
+One reading of one Evidence, owning a set of Claims (D46). A re-reading is a new
+Interpretation that supersedes the old one (D48); the pointer table names the one Billy
+uses now.
+
+```sql
+CREATE TABLE interpretations (
+    id                               TEXT PRIMARY KEY NOT NULL,
+    evidence_id                      TEXT NOT NULL,
+    superseded_by_interpretation_id  TEXT,
+    created_at                       TEXT NOT NULL,
+    extraction_profile               TEXT NOT NULL,
+    unread_rows                      INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (evidence_id) REFERENCES evidence(id) ON DELETE RESTRICT,
+    FOREIGN KEY (superseded_by_interpretation_id)
+        REFERENCES interpretations(id) ON DELETE RESTRICT
+) STRICT;
+
+-- The Claims one reading holds. A join table, not a column on claims, so a
+-- PROPOSED Claim takes no slot and POST /v1/claims never invents an id (D38).
+CREATE TABLE interpretation_claims (
+    interpretation_id  TEXT NOT NULL,
+    claim_id           TEXT NOT NULL,
+    PRIMARY KEY (interpretation_id, claim_id),
+    FOREIGN KEY (interpretation_id) REFERENCES interpretations(id) ON DELETE RESTRICT,
+    FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE RESTRICT
+) STRICT;
+
+-- One active reading for each Evidence. The primary key is the invariant, one
+-- level above evidence_active_claim; a re-extraction moves the pointer with a
+-- compare-and-swap against the reading it expects to find.
+CREATE TABLE evidence_active_interpretation (
+    evidence_id        TEXT PRIMARY KEY NOT NULL,
+    interpretation_id  TEXT NOT NULL,
+    FOREIGN KEY (evidence_id) REFERENCES evidence(id) ON DELETE RESTRICT,
+    FOREIGN KEY (interpretation_id) REFERENCES interpretations(id) ON DELETE RESTRICT
+) STRICT;
+```
+
+**`extraction_profile`** (migration 006) records the contract that read the artifact;
+**`unread_rows`** (migration 007) records how many rows a reading could not parse — zero
+for an email, non-zero where a statement was partly understood. A Claim is activated as
+a member of an Interpretation, so the set moves together and two readings never
+interleave.
+
+---
 
 Indexes exist for known queries. Indexes are not added only because a column looks
 important.
@@ -596,12 +653,22 @@ Database migrations are embedded in the BillyCore binary, numbered, forward-only
 run automatically at startup.
 
 ```
-001_initial.sql
-002_add_example_index.sql
-003_add_example_column.sql
+001_initial.sql          evidence, domain_event
+002_claims.sql           claims, claim_evidence, claim_fields
+003_active_claim.sql     evidence_active_claim (one active Claim per Evidence)
+004_transactions.sql     transactions, transaction_evidence, claim_transaction
+005_interpretations.sql  interpretations + membership + active pointer; transaction_state
+006_extraction_profiles  extraction_profile on evidence and interpretations
+007_unread_rows.sql      unread_rows on interpretations
+008_counterparty.sql     counterparty on transactions
+009_reconciliation.sql   reconciliation_candidate (§9)
 ```
 
-BillyCore tracks the current migration with `PRAGMA user_version`.
+A table appears in the migration that first writes to it, not when a document first
+names it (D45): the schema never runs ahead of the code that exercises it.
+
+BillyCore tracks the current migration with `PRAGMA user_version`; the schema above is
+`user_version = 9`.
 
 ```
 open database
@@ -650,11 +717,12 @@ their representation is still an open question. The schema must not invent that 
 > `relationships` is removed or changed in API.md. A schema is not invented here only to
 > satisfy the current API document.
 
-**Reconciliation candidates.** A `reconciliation_candidate` pairs two Transactions and
-records a status. `left_ref` and `right_ref` are `transactions.id`; the status is
-`MATCH`, `NO_MATCH` or `AMBIGUOUS` (DOMAIN.md §6, D69). The Transaction is Billy's
-representation of one event and carries every signal the comparison uses, so the
-candidate points at it rather than at a Claim or a piece of Evidence.
+**Reconciliation candidates — built (migration 009).** A `reconciliation_candidate`
+pairs two Transactions and records a status. `left_ref` and `right_ref` are
+`transactions.id`; the status is `MATCH`, `NO_MATCH` or `AMBIGUOUS` (DOMAIN.md §6, D69).
+The Transaction is Billy's representation of one event and carries every signal the
+comparison uses, so the candidate points at it rather than at a Claim or a piece of
+Evidence.
 
 ```sql
 CREATE TABLE reconciliation_candidate (
@@ -663,15 +731,29 @@ CREATE TABLE reconciliation_candidate (
     right_ref   TEXT NOT NULL,
     status      TEXT NOT NULL,
     created_at  TEXT NOT NULL,
+    UNIQUE (left_ref, right_ref),
+    CHECK (left_ref < right_ref),
     FOREIGN KEY (left_ref)  REFERENCES transactions(id) ON DELETE RESTRICT,
     FOREIGN KEY (right_ref) REFERENCES transactions(id) ON DELETE RESTRICT
 ) STRICT;
+
+CREATE INDEX idx_reconciliation_candidate_by_right
+ON reconciliation_candidate(right_ref);
 ```
 
-The table and its indexes are added by a migration when reconciliation is built. What a
-`MATCH` does to the two Transactions — one survives and the other is retired through
-`superseded_by_transaction_id` (D49), or both stay and are linked — is the remaining
-decision.
+The pair is canonical — `left_ref < right_ref` — so one unordered pair has one row, and
+the `UNIQUE` constraint is the idempotency: a re-run finds the pair and writes nothing,
+the way every other pass is a no-op by constraint. `status` is bare `TEXT` with no
+`CHECK`, because the domain owns that vocabulary (§2).
+
+**What a `MATCH` does — decided (D70).** The pair merges: the smaller id survives and
+turns `RECONCILED`, the other becomes `SUPERSEDED` and points at the survivor through
+`transactions.superseded_by_transaction_id` (§4.5), and the survivor takes the union of
+both Evidence links. A `TransactionReconciled` event records the survivor, the
+superseded id, and the basis — `tracking_key` (D36) or `composite` (D72). Merging one
+Transaction into another was chosen over keeping both and linking them, because a linked
+pair still double-counts in the list and the totals — the very thing reconciliation
+removes. An explicit relationship is what a refund needs, not a same-event match.
 
 ---
 

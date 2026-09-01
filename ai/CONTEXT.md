@@ -1,6 +1,6 @@
 # BillyCore — Context
 
-**Last updated:** 2026-08-28
+**Last updated:** 2026-09-01
 
 Orientation for anyone — human or agent — starting work on BillyCore. `docs/` describes
 the system as designed. This file describes where the project actually *is*, which is a
@@ -10,7 +10,16 @@ Read this first, then [docs/PRODUCT.md](../docs/PRODUCT.md).
 
 ---
 
-## 1. State: the email half of M2 is done — real Transactions, from the real mailbox
+## 1. State: M2 is done — statements and reconciliation now land on top of the email half
+
+> **2026-09-01 — statements and cross-Source reconciliation landed.** Slices 9 and 10 are
+> built and proven on real data. A real June Nu statement drained to 168 Transactions,
+> and reconciliation merged **34** of them against the already-ingested emails on a
+> throwaway copy of the live database: each survivor keeps both Sources as provenance,
+> and the double-counted movements left the list and the totals. `superseded_by_transaction_id`
+> (D49) is now written. The one gap left in M2 is the viewing surface — §3 slice 8's
+> static page — everything below §1's original text still describes the email half that
+> made this possible.
 
 The pipeline runs end to end. Email goes in at one end and financial facts come out
 at the other.
@@ -59,15 +68,16 @@ What runs today: `billycore auth`, `billycore peek`, and `billycore serve` — `
 bearer token compared in constant time — plus one background pipeline worker draining
 extraction and then Transaction construction (D45).
 
-What does not exist: **no way to see any of this that is not SQL**, no bank statements,
-no reconciliation between Sources, no AI, and no HSBC. The success criterion in §2 is a
-*table*, and 800 rows nobody can look at do not satisfy it. That is now the whole gap
-for the email half, and §8 item 1 is the critical path.
+What does not exist: **no way to see any of this that is not SQL** (beyond the terminal
+`billycore tx` table), no AI, and no HSBC statement parser. Bank statements and
+cross-Source reconciliation now exist (the 2026-09-01 note above). The success criterion
+in §2 is a *table a human can look at*, and the static page is still the whole remaining
+gap — §3 slice 8 is the critical path.
 
-Two things the code can do that nothing has yet asked it to do: re-extraction (D48) has
+One thing the code can do that nothing has yet asked it to do: re-extraction (D48) has
 never run against the live database — `superseded_by_interpretation_id` is NULL on all
-800 rows — and no trigger exposes it. `superseded_by_transaction_id` exists and is never
-written (D49, open).
+800 email rows — and no trigger exposes it. `superseded_by_transaction_id` (D49) is no
+longer idle: reconciliation writes it on every merge.
 
 ### Code
 
@@ -84,21 +94,24 @@ written (D49, open).
 | `internal/id/` | 38 | 32 | UUID v4; outside the domain because randomness is I/O |
 | **Total** | **7,123** | **8,186** | `make check` green, and green under `-race` |
 
-More test than code, for the first time. Schema: `001_initial`, `002_claims`,
-`003_active_claim`, `004_transactions`, `005_interpretations` — the live database is at
-`user_version = 5`.
+More test than code, for the first time. Schema: nine migrations, `001_initial` through
+`009_reconciliation` — the code applies them on startup, so a database opened by this
+build reaches `user_version = 9`. (The code table above counts the email half; the
+statement and reconciliation slices added `internal/app/match.go`, the SQLite
+reconciliation repository, migrations `006`–`009`, and the statement parser and PDF
+extractor.)
 
 ### Documents
 
 | Document | State |
 |---|---|
-| `ai/DECISIONS.md` | Written · D1–D49 |
+| `ai/DECISIONS.md` | Written · D1–D72 |
 | `AGENTS.md` | Written · §8 now carries the ASD-STE100 comment rule |
 | `ai/CONTEXT.md` | This file |
 | `docs/PRODUCT.md` | Written |
 | `docs/ARCHITECTURE.md` | Written · §5's stages now exist in code |
-| `docs/DOMAIN.md` | Written · **behind**: no Interpretation, and §8 does not list the two new `ClaimActivated` fields |
-| `docs/DATA_MODEL.md` | Written · **behind**: no `interpretations`, `interpretation_claims`, `evidence_active_interpretation`; no `transaction_state` |
+| `docs/DOMAIN.md` | Written · synced 2026-09-01: Interpretation entity and lifecycle, Transaction `ACTIVE`/`SUPERSEDED` state, the merge and composite key in §6, the fuller `ClaimActivated`/`TransactionReconciled` payloads |
+| `docs/DATA_MODEL.md` | Written · synced 2026-09-01: §4.8 interpretation tables, `transaction_state`/`superseded_by_transaction_id`, migrations `005`–`009`, the finalized `reconciliation_candidate` (§9) |
 | `docs/API.md` | Written · §5 and §6 have running implementations |
 | `docs/SECURITY.md` | Written |
 | `ai/CONVENTIONS.md`, `ai/CONSTRAINTS.md`, `ai/WORKFLOW.md`, `ai/GLOSSARY.md` | **Empty** |
@@ -162,13 +175,21 @@ The slices, in order:
 5. ~~Look at real Nu and HSBC email~~ — **done**, §3.1 is what it said
 6. ~~Per-template parsers, Claims with field-level confidence, `EXTRACTED`~~ — **done**
 7. ~~Transactions from active Claims; the background worker~~ — **done**, 800 rows
-8. **`GET /v1/transactions`, a `billycore tx` table, and one static page (D32)**
-9. Statements: intake by hand through `POST /v1/evidence`, then PDF text extraction
-10. Reconciliation: DOMAIN.md §6's six signals, and transfers that appear in both Sources
+8. `GET /v1/transactions` and a `billycore tx` table — **done**; **one static page (D32) is the last piece, and unbuilt**
+9. ~~Statements: intake by hand through `POST /v1/evidence`, then PDF text extraction~~ — **done**
+10. ~~Reconciliation: DOMAIN.md §6's signals, and transfers that appear in both Sources~~ — **done** (D69–D72)
 
-**The order still matters.** 9 before 10, because reconciliation cannot be tested until
-there are two kinds of Transaction to reconcile. 8 first because it is cheap, it is on
-the critical path for the criterion, and it audits everything 6 and 7 produced.
+**The order held.** 9 before 10, because reconciliation could not be tested until there
+were two kinds of Transaction to reconcile — and the June run bore that out: with no
+statement, the emails alone merged nothing. Only slice 8's static page remains, and it
+is now the whole critical path to the §2 criterion.
+
+> **On reconciliation and the real data.** DOMAIN.md §6's *six signals* are read, but
+> BillyCore merges only on an exact key: the tracking key (D36) or the composite key of
+> D72 (amount, currency, direction, party, same day, two Sources, unique). The time
+> window and amount tolerance stay open (D71), and fuzzy party normalization is
+> BillyAgent's — which is why June's `PAULINA CAMPOS ROMERO` vs `paulina campos` did not
+> merge while 34 exact matches did.
 
 Two smaller things that are logged and unbuilt, either of which can be picked up in an
 hour when it becomes annoying: the re-extraction trigger (D48 — the mechanism is written
