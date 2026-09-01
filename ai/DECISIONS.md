@@ -1684,6 +1684,126 @@ column D49 reserved), or both stay and are linked. DOMAIN.md §8 and D49 lean to
 the merge, and it is the next entry to write.
 **Source.** Author decision, 2026-08-31.
 
+### D70 — A MATCH merges: one Transaction survives, the other is superseded
+**Status:** Accepted · 2026-08-31 · Reversibility: bounded — it writes two reserved columns
+**Decision.** When reconciliation finds two Transactions are the same event, the
+candidate is recorded `MATCH` and the two are merged. One survives; the other is
+retired with `transaction_state = SUPERSEDED` and `superseded_by_transaction_id`
+pointing at the survivor (the columns D49 reserved and left unwritten). The
+survivor becomes `RECONCILED` and its provenance is the **union** of both
+Transactions' Evidence, so the two-source fact is not lost. The survivor is the
+Transaction with the smaller id — the canonical `left_ref` of the pair (D69).
+**Closes.** The one decision D69 left: what a `MATCH` does to the two
+Transactions — merge one-for-one, or keep both and link.
+**Why.** A transfer seen in a Nu email and in the bank statement is one movement,
+and a table that shows it twice is wrong. DOMAIN.md §8's `TransactionReconciled`
+already names a "surviving transactionId", and D49 already reserved the retirement
+columns for exactly this, so merge is the reading the whole design leans toward.
+The survivor keeps both Evidence ids because provenance is the one thing a merge
+must never drop: the fact that two Sources agree is stronger than either alone.
+Smaller-id-survives is arbitrary but deterministic, and it makes a re-run reach
+the same survivor — nothing here depends on which Source won.
+**Rejected — keep both Transactions and only link them.** It leaves the double
+count in the list and the totals, which is the problem reconciliation exists to
+remove. A link is what a refund relationship needs (DATA_MODEL.md §9), not what a
+same-event match needs.
+**Rejected — a new merged Transaction that supersedes both.** DOMAIN.md §6
+question 20 raises it. It needs a third id and a rule for the merged fields, and
+one-for-one retirement is enough while one ACTIVE Claim owns one Transaction (D42,
+D49). It waits until a Transaction is supported by several artifacts.
+**Consequence — the merge is idempotent by the candidate's UNIQUE pair.** A
+re-run finds the pair already recorded, writes nothing, and the loser is no
+longer ACTIVE to be re-selected. The constraint enforces it, not a code path.
+**Consequence — a superseded Transaction leaves the list and the totals and
+stays in history.** `GET /v1/transactions` already filters to ACTIVE (D49), so no
+reader changes. The row and its `superseded_by` pointer keep the audit trail
+(DATA_MODEL.md §6).
+**Source.** Author task, 2026-08-31; DOMAIN.md §6, §8; builds on D49, D69.
+
+### D71 — Weak-signal reconciliation never auto-merges
+**Status:** Accepted · 2026-09-01 · Reversibility: easy — it only writes candidates
+**Decision.** A pair with no shared tracking key is compared on the weaker signals
+(DOMAIN.md §6). It reaches `NO_MATCH` on a contradiction the domain has already
+decided, and `AMBIGUOUS` otherwise. It never reaches `MATCH`. Only the exact
+tracking key (D36, slice 2) merges two Transactions; weak signals record a
+candidate and merge nothing, which is the critical rule that `AMBIGUOUS` is never
+auto-merged (DOMAIN.md §6).
+**Why.** DOMAIN.md §6 leaves two signals undecided — the time window ("not yet
+decided") and the amount tolerance ("does not invent tolerances") — and gives
+merchant normalization to BillyAgent, not BillyCore. A safe `MATCH` needs one of
+those, so BillyCore cannot reach `MATCH` from weak signals without inventing a
+number the domain has withheld (D21). `AMBIGUOUS` is the honest outcome: the pair
+looks alike but nothing proves it, so it waits for new Evidence, BillyAgent, or a
+human.
+**Consequence — the block is exact, so it invents no number.** The pass groups
+ACTIVE UNRECONCILED Transactions by exact `(currency, amount_minor, direction)`
+and compares only within a block. Exact equality is not a tolerance. Opposite
+directions and different amounts fall in different blocks and never pair, so no
+candidate is written for a pair that plainly is not the same event.
+**Consequence — a Transaction without Money is not weak-paired.** With no amount
+and no tracking key there is no signal to block on, so pairing it is noise. It
+stays UNRECONCILED until Evidence gives it an amount or a key.
+**Consequence — the one weak `NO_MATCH` is internal against external (D55).**
+Within a block direction, amount and currency already agree, so the only decided
+contradiction left is an internal movement against an external one. Every other
+in-block pair is `AMBIGUOUS`. A differing known account is left `AMBIGUOUS`, not
+`NO_MATCH`: "strongly contradict" (DOMAIN.md §6 signal 4) is not yet a rule.
+**Consequence — pairs are the star of a block, smallest id to each other.** It
+bounds the writes to one for each look-alike, not one for every pair, and it is
+enough to flag the block as ambiguous. A full resolution is BillyAgent's.
+**Rejected — invent a time window and an amount tolerance now.** It is the two
+open questions DOMAIN.md §6 names, and guessing them is exactly what D21 forbids.
+They wait for an author decision, and then weak signals can reach `MATCH`.
+**Source.** Author task, 2026-09-01; DOMAIN.md §6; builds on D55, D69, D70.
+
+### D72 — A weak pair merges on an exact composite key, gated by uniqueness and two Sources
+**Status:** Accepted · 2026-09-01 · Reversibility: bounded — it merges Transactions, like D70
+**Decision.** A pair with no shared tracking key merges (`MATCH`) when all of these
+hold: equal amount, currency and direction; equal party after trimming and
+casefolding only, where the party is the merchant or, where a Source leaves that
+empty, the counterparty; the same calendar day in a fixed UTC−6; the two
+Transactions come from different Sources; and the composite tuple identifies
+exactly one Transaction on each Source. Any collision, any same-Source pair, and
+any tuple that is not unique on both sides stays `AMBIGUOUS` and does not merge.
+This partly answers the open questions D71 held — weak signals can now reach
+`MATCH`, but only through an exact composite key, never a fuzzy tolerance or a
+time window.
+**Consequence — the party reads two fields.** A Nu email names the other party in
+`merchant`; a statement names it in `counterparty`. The composite party reads
+merchant first, then counterparty, so the field a Source happens to use does not
+hide the identity the two agree on. On the June data this is the difference
+between zero merges and 34: with merchant alone every statement row has an empty
+party and cannot match.
+**Closes.** Half of what D71 left open: what lets a weak pair merge. The tracking
+key (D36) is one exact key of a movement; this is a second, weaker one.
+**Why.** June proves the need and the risk together. The Nu emails of June carry
+no `Clave de rastreo` — Nu added it to email only near 2026-07-23 — so a June
+statement cannot tracking-key-merge with its emails, and every match must come
+from the weaker signals. But amount and direction collide in June (three distinct
+$500 outflows), so a merge on those alone would collapse real records. The four
+guards make the composite safe: **uniqueness** stops a collision from guessing a
+pair; **two Sources** keeps two real same-day payments from one Source apart,
+because reconciliation means one movement seen twice, not two movements that look
+alike; **exact merchant** keeps normalization in BillyAgent, not BillyCore
+(DOMAIN.md §6); **fixed UTC−6** compares the day the emails (UTC) and the
+statement (local) actually share — the Plomero transfer is `00:22Z`, which is
+`18:22` the day before in Mexico City, so a raw compare would split it.
+**Consequence — the survivor and the audit trail are D70's.** One survives, the
+other is `SUPERSEDED`, provenance is the union, and the event records the merge.
+Only the basis differs: `composite` rather than `tracking_key`.
+**Consequence — UTC−6 is fixed, not loaded.** Mexico abolished DST in 2022, so
+Mexico City is UTC−6 all year. A fixed offset needs no tzdata and no dependency
+(the task forbids one). If Mexico restores DST, the day compare is off by the
+offset for the affected hours, and the offset becomes a table.
+**Rejected — a time window and an amount tolerance.** DOMAIN.md §6 defers both,
+and D21 forbids guessing them. The composite key needs neither: it is exact
+equality on every field, and the day is a calendar day, not a ± window.
+**Rejected — merge any unique cross-Source amount+direction pair without
+merchant.** Too weak: two unrelated same-day, same-amount transfers to different
+people would merge. Merchant equality is the cheap guard that makes the tuple a
+plausible identity, and BillyAgent widens it later.
+**Source.** Author decision, 2026-09-01; DOMAIN.md §6; builds on D55, D69, D70, D71.
+
 ## Template
 
 ```markdown

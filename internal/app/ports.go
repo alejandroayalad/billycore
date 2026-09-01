@@ -293,3 +293,54 @@ type TransactionReader interface {
 	// apply; the cursor and the limit do not.
 	Totals(ctx context.Context, query TransactionQuery) (TransactionTotals, error)
 }
+
+// TrackingKeyed pairs an ACTIVE UNRECONCILED Transaction with the SPEI Clave de
+// rastreo one of its Claims carries (D36). Two Transactions that share one key
+// are the same movement, which is the exact signal the pass matches on first.
+type TrackingKeyed struct {
+	Transaction domain.Transaction
+	TrackingKey string
+}
+
+// SourcedTransaction pairs an ACTIVE UNRECONCILED Transaction with the id of the
+// one Source its Evidence came from (D72). The weak sweep needs the Source to
+// keep two look-alike movements from one Source apart from one seen in two.
+type SourcedTransaction struct {
+	Transaction domain.Transaction
+	SourceID    string
+}
+
+// ReconcileDecision is one candidate the pass reached, ready to persist. The
+// pair is canonical, LeftID < RightID (D69). Survivor and Superseded are set
+// only on a MATCH: they are the merged pair the domain already validated (D70).
+type ReconcileDecision struct {
+	CandidateID string
+	LeftID      string
+	RightID     string
+	Outcome     domain.ReconciliationOutcome
+	Survivor    domain.Transaction
+	Superseded  domain.Transaction
+
+	// Basis names the signal that decided a MATCH, for the audit event (D70,
+	// D72): the tracking key, or the exact composite key. It is empty for a
+	// candidate that did not merge.
+	Basis string
+}
+
+// ReconciliationRepository reads the Transactions a pass compares and records
+// what it decided (DATA_MODEL.md §9, D69).
+type ReconciliationRepository interface {
+	// UnreconciledWithTrackingKey returns each ACTIVE UNRECONCILED Transaction
+	// that carries a tracking key, so the pass groups them into pairs.
+	UnreconciledWithTrackingKey(ctx context.Context) ([]TrackingKeyed, error)
+
+	// UnreconciledTransactions returns every ACTIVE UNRECONCILED Transaction with
+	// its Source, so the weak sweep blocks them by amount and applies the
+	// composite key across Sources (D71, D72). A merged one is not here.
+	UnreconciledTransactions(ctx context.Context) ([]SourcedTransaction, error)
+
+	// Reconcile records one candidate and, on a MATCH, merges the pair in one
+	// database transaction (D70). The UNIQUE pair makes a re-run a no-op; it
+	// reports whether it wrote a new candidate.
+	Reconcile(ctx context.Context, d ReconcileDecision, now time.Time) (bool, error)
+}

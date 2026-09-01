@@ -34,6 +34,13 @@ type reconcilePass interface {
 	Run(ctx context.Context) (app.ReconcileResult, error)
 }
 
+// matchPass is cross-Source reconciliation: it merges two Transactions that are
+// one event (D70). It is optional — a nil matcher skips the stage — because the
+// scheduling test has no use for it and drives only the two stages above.
+type matchPass interface {
+	Run(ctx context.Context) (app.MatchResult, error)
+}
+
 // pipelineWorker advances stored Evidence through extraction and then through
 // Transaction construction (D45).
 //
@@ -45,6 +52,7 @@ type reconcilePass interface {
 type pipelineWorker struct {
 	extractor  extractPass
 	reconciler reconcilePass
+	matcher    matchPass
 
 	// wake is the signal that there may be new work. It carries no payload —
 	// what changed is not interesting, because a wake always drains everything
@@ -59,10 +67,11 @@ type pipelineWorker struct {
 	newTicker func(d time.Duration) (<-chan time.Time, func())
 }
 
-func newPipelineWorker(extractor extractPass, reconciler reconcilePass, wake <-chan struct{}) *pipelineWorker {
+func newPipelineWorker(extractor extractPass, reconciler reconcilePass, matcher matchPass, wake <-chan struct{}) *pipelineWorker {
 	return &pipelineWorker{
 		extractor:  extractor,
 		reconciler: reconciler,
+		matcher:    matcher,
 		wake:       wake,
 		retryEvery: retryInterval,
 		newTicker:  realTicker,
@@ -141,6 +150,10 @@ func (w *pipelineWorker) process(ctx context.Context) {
 		return
 	}
 	report("reconciliation", w.drainReconciliation(ctx))
+	if ctx.Err() != nil {
+		return
+	}
+	report("matching", w.drainMatching(ctx))
 }
 
 // drainExtraction runs extraction passes until one finds nothing.
@@ -187,6 +200,30 @@ func (w *pipelineWorker) drainReconciliation(ctx context.Context) error {
 			"claimless", result.Claimless,
 			"skipped", result.Skipped,
 			"failed", result.Failed,
+		)
+	}
+}
+
+// drainMatching merges Transactions that describe one event until a pass records
+// no new candidate, on the same terms as the drains above. A merge changes state
+// (D70), so the next pass finds fewer pairs and the loop ends. A nil matcher —
+// the scheduling test — skips the stage.
+func (w *pipelineWorker) drainMatching(ctx context.Context) error {
+	if w.matcher == nil {
+		return nil
+	}
+	for {
+		result, err := w.matcher.Run(ctx)
+		if err != nil {
+			return err
+		}
+		if result.CandidatesRecorded == 0 {
+			return nil
+		}
+		slog.Info("matched",
+			"candidates", result.CandidatesRecorded,
+			"merged", result.Merged,
+			"no_match", result.NoMatch,
 		)
 	}
 }

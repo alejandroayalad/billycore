@@ -136,8 +136,9 @@ func runServe(args []string) error {
 	extractor := app.NewExtractor(queue, sqlite.NewClaimRepository(db), profile.New())
 	transactions := sqlite.NewTransactionRepository(db)
 	reconciler := app.NewReconciler(queue, transactions)
+	matcher := app.NewMatcher(sqlite.NewReconciliationRepository(db))
 	pipelineWake, wakePipeline := newWakeSignal()
-	worker := newPipelineWorker(extractor, reconciler, pipelineWake)
+	worker := newPipelineWorker(extractor, reconciler, matcher, pipelineWake)
 
 	server := api.NewServer(app.NewIngestor(evidence), evidence, transactions, configuredSources(sources), targets, db, wakePipeline)
 

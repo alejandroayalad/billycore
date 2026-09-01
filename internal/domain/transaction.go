@@ -96,10 +96,16 @@ type Transaction struct {
 	financialStatus     FinancialStatus
 	reconciliationState ReconciliationState
 	state               TransactionState
-	occurredAt          time.Time
-	evidenceIDs         []string
-	createdAt           time.Time
-	updatedAt           time.Time
+
+	// supersededByTransactionID names the survivor of a merge, and is empty
+	// while this Transaction is ACTIVE (D70). Only the supersede transition
+	// sets it, so an ACTIVE row can never carry one.
+	supersededByTransactionID string
+
+	occurredAt  time.Time
+	evidenceIDs []string
+	createdAt   time.Time
+	updatedAt   time.Time
 }
 
 // NewTransaction records a financial event, enforcing every invariant
@@ -242,6 +248,7 @@ func (t Transaction) Direction() TransactionDirection          { return t.direct
 func (t Transaction) FinancialStatus() FinancialStatus         { return t.financialStatus }
 func (t Transaction) ReconciliationState() ReconciliationState { return t.reconciliationState }
 func (t Transaction) State() TransactionState                  { return t.state }
+func (t Transaction) SupersededByTransactionID() string        { return t.supersededByTransactionID }
 func (t Transaction) OccurredAt() time.Time                    { return t.occurredAt }
 func (t Transaction) CreatedAt() time.Time                     { return t.createdAt }
 func (t Transaction) UpdatedAt() time.Time                     { return t.updatedAt }
@@ -259,4 +266,42 @@ func (t Transaction) EvidenceIDs() []string {
 	out := make([]string, len(t.evidenceIDs))
 	copy(out, t.evidenceIDs)
 	return out
+}
+
+// ReconciledWith records that another observation is the same event, and is the
+// survivor of the merge (D70). It becomes RECONCILED and its provenance is the
+// union of both, so the two-source fact is kept. It stays ACTIVE. A Transaction
+// that is not ACTIVE cannot absorb another; that is a defect in the caller.
+func (t Transaction) ReconciledWith(additionalEvidence []string, at time.Time) (Transaction, error) {
+	if t.state != TransactionActive {
+		return Transaction{}, fmt.Errorf("transaction %s: only an active transaction can be a survivor", t.id)
+	}
+	union, err := cleanTransactionProvenance(append(t.EvidenceIDs(), additionalEvidence...))
+	if err != nil {
+		return Transaction{}, err
+	}
+	next := t
+	next.reconciliationState = Reconciled
+	next.evidenceIDs = union
+	next.updatedAt = at.UTC()
+	return next, nil
+}
+
+// SupersededByTransaction retires this Transaction into the survivor of a merge
+// (D70). It becomes SUPERSEDED and RECONCILED and points at the survivor, and it
+// leaves every list and total while staying in history. The survivor id must
+// exist and be another Transaction, and this one must still be ACTIVE.
+func (t Transaction) SupersededByTransaction(survivorID string, at time.Time) (Transaction, error) {
+	if survivorID == "" || survivorID == t.id {
+		return Transaction{}, fmt.Errorf("transaction %s: a survivor must be another transaction", t.id)
+	}
+	if t.state != TransactionActive {
+		return Transaction{}, fmt.Errorf("transaction %s: only an active transaction can be superseded", t.id)
+	}
+	next := t
+	next.state = TransactionSuperseded
+	next.reconciliationState = Reconciled
+	next.supersededByTransactionID = survivorID
+	next.updatedAt = at.UTC()
+	return next, nil
 }

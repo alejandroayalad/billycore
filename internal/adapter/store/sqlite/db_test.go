@@ -50,8 +50,8 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if userVersion != 8 {
-		t.Errorf("user_version = %d, want 8 after migration 008", userVersion)
+	if userVersion != 9 {
+		t.Errorf("user_version = %d, want 9 after migration 009", userVersion)
 	}
 
 	for _, table := range []string{"evidence", "domain_event"} {
@@ -78,10 +78,11 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 // migration 004 arrived with `internal/app/reconcile.go` — the code that writes
 // to them. The rule did not change; the code caught up with the document.
 //
-// What it still asserts is the rule itself, against the next table to be
-// described and not yet written: `reconciliation_candidate`, whose columns
-// DATA_MODEL.md §10 Q1 cannot even name until the domain settles what a
-// candidate references.
+// It asserted the absence of `reconciliation_candidate` too, through migration
+// 008. It now asserts its presence, because migration 009 arrived with
+// `internal/adapter/store/sqlite/reconciliation.go` — the code that writes to
+// it (D69, D70). The rule caught up with the document a second time; the domain
+// settled what a candidate references, so the columns exist and are exercised.
 func TestMigrationsCreateNoUnusedTables(t *testing.T) {
 	db, err := Open(testDBPath(t))
 	if err != nil {
@@ -92,8 +93,8 @@ func TestMigrationsCreateNoUnusedTables(t *testing.T) {
 	for _, table := range []string{"reconciliation_candidate"} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
-		if err == nil {
-			t.Errorf("table %s exists, and nothing writes to it yet", table)
+		if err != nil {
+			t.Errorf("table %s missing, and reconciliation.go writes to it: %v", table, err)
 		}
 	}
 }

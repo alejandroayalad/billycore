@@ -112,7 +112,7 @@ func start(t *testing.T, extract, reconcile *stage) *harness {
 	wakeCh, wake := newWakeSignal()
 	tick := make(chan time.Time)
 
-	worker := newPipelineWorker(extractStage{extract}, reconcileStage{reconcile}, wakeCh)
+	worker := newPipelineWorker(extractStage{extract}, reconcileStage{reconcile}, nil, wakeCh)
 	worker.newTicker = func(time.Duration) (<-chan time.Time, func()) { return tick, func() {} }
 
 	ctx, cancel := context.WithCancel(context.Background())
