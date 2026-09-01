@@ -1804,6 +1804,26 @@ people would merge. Merchant equality is the cheap guard that makes the tuple a
 plausible identity, and BillyAgent widens it later.
 **Source.** Author decision, 2026-09-01; DOMAIN.md §6; builds on D55, D69, D70, D71.
 
+### D73 — The web view is a local file that calls the API; the API allows the cross-origin read
+**Status:** Accepted · 2026-09-01 · Reversibility: cheap
+**Decision.** Closes the question D32 left open — Core does **not** serve the page. The
+view is a single static file, `web/transactions.html`, that the user opens from disk and
+that calls `GET /v1/transactions` and `/summary` with a bearer token typed into the page
+and held only in the tab. To let a `file://` page read the response, the API answers
+CORS with `Access-Control-Allow-Origin: *` and, on a preflight, `Allow-Private-Network:
+true`. The token stays the only control (SECURITY.md §4): a request without it is still
+`401`, and no cookie is ever read, so a broad origin exposes no reachable data.
+**Why.** It keeps the binary a pure API — no template engine, no static-file route, no
+second concern — and keeps the token out of a URL, which the "server-render with
+`?token=`" option could not. The cost is CORS on the API and the token typed each
+session, both small and both paid once.
+**Consequence — the page is a view, not a UI (D32).** No framework, no build, no route
+of its own, no persisted state. A real interface is BillySat's, not Core's.
+**Rejected — Core serves the page behind the token.** A browser cannot set an
+`Authorization` header on a plain navigation, so the token would have to ride in the URL
+and its history. Rejected for that leak.
+**Source.** Author decision, 2026-09-01; resolves the open question in D32.
+
 ## Template
 
 ```markdown

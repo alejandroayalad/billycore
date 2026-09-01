@@ -95,7 +95,7 @@ func (s *Server) Handler(token string) http.Handler {
 	v1.HandleFunc("GET /v1/transactions/summary", s.handleTransactionTotals)
 	mux.Handle("/v1/", authenticate(token, v1))
 
-	return recoverPanics(logRequests(mux))
+	return recoverPanics(logRequests(cors(mux)))
 }
 
 // handleHealthz reports whether the process can serve requests, storage
@@ -291,6 +291,30 @@ func (r *statusRecorder) WriteHeader(status int) {
 //
 // The stack trace is logged; whatever was being processed is not (SECURITY.md
 // §10). A panic is a bug, so the client is told 500 and nothing more.
+// cors lets a local file:// page reach the API from a browser (D32). It allows
+// any origin because the bearer token, not the origin, is the control on a
+// loopback listener (SECURITY.md §4): a request with no token still gets 401,
+// and no cookie is ever read, so a broad origin exposes no reachable data. A
+// preflight carries no token, so it is answered before authentication.
+func cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		if r.Method == http.MethodOptions {
+			// A file:// page reaching a loopback listener is a Private Network
+			// Access request in Chrome; without this the browser blocks the real
+			// request even after the token would have let it through.
+			if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+				w.Header().Set("Access-Control-Allow-Private-Network", "true")
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func recoverPanics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {

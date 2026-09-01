@@ -680,3 +680,51 @@ func TestEveryErrorUsesOneEnvelope(t *testing.T) {
 		t.Error("no \"error\" key")
 	}
 }
+
+// A browser opening the local page (D32) preflights /v1 from a file:// origin.
+// The preflight carries no token and must be answered before authentication.
+func TestCORSPreflightNeedsNoToken(t *testing.T) {
+	handler := serverWith(t, newStubRepo(), nil, nil, nil)
+	w := request(t, handler, http.MethodOptions, "/v1/transactions", "")
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Allow-Origin = %q, want *", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Headers"); got == "" {
+		t.Error("Allow-Headers is empty; the Authorization preflight would fail")
+	}
+}
+
+// Chrome preflights a file:// page reaching loopback as Private Network Access.
+// Without the matching allow header the browser blocks the real request.
+func TestCORSAllowsPrivateNetworkPreflight(t *testing.T) {
+	handler := serverWith(t, newStubRepo(), nil, nil, nil)
+	r := httptest.NewRequest(http.MethodOptions, "/v1/transactions", nil)
+	r.Header.Set("Access-Control-Request-Private-Network", "true")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Private-Network"); got != "true" {
+		t.Errorf("Allow-Private-Network = %q, want true", got)
+	}
+}
+
+// A real GET still carries the CORS header, so the file:// page can read the
+// response. The token gate is unchanged.
+func TestCORSHeaderOnAuthenticatedGet(t *testing.T) {
+	handler := serverWith(t, newStubRepo(), nil, nil, nil)
+	w := request(t, handler, http.MethodGet, "/v1/transactions", "Bearer "+testToken)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("Allow-Origin = %q, want *", got)
+	}
+}

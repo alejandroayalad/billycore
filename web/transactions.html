@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BillyCore — Transactions</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --fg: #1a1a1a; --muted: #6a6a6a; --line: #e5e5e3;
+    --card: #ffffff; --in: #1a7f4b; --out: #b0341d; --accent: #6b2fb3;
+    --chip: #f0edf7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16161a; --fg: #ececec; --muted: #9a9a9a; --line: #2c2c33;
+      --card: #1e1e24; --in: #4cc38a; --out: #f0785e; --accent: #b98cf0;
+      --chip: #2a2440;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 20px 24px; border-bottom: 1px solid var(--line); }
+  h1 { margin: 0 0 4px; font-size: 18px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end;
+    padding: 16px 24px; border-bottom: 1px solid var(--line); }
+  .field { display: flex; flex-direction: column; gap: 4px; }
+  .field label { font-size: 12px; color: var(--muted); }
+  input { padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--card); color: var(--fg); font-size: 13px; }
+  input#base { width: 220px; } input#token { width: 260px; }
+  button { padding: 8px 14px; border: 0; border-radius: 6px; cursor: pointer;
+    background: var(--accent); color: #fff; font-size: 13px; font-weight: 600; }
+  button.secondary { background: var(--chip); color: var(--fg); }
+  button:disabled { opacity: .5; cursor: default; }
+  #msg { padding: 12px 24px; color: var(--out); font-size: 13px; display: none; }
+  #msg.show { display: block; }
+  .totals { display: flex; flex-wrap: wrap; gap: 12px; padding: 16px 24px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 16px; min-width: 150px; }
+  .stat .k { font-size: 12px; color: var(--muted); }
+  .stat .v { font-size: 20px; font-weight: 650; margin-top: 2px; }
+  .wrap { padding: 0 24px 40px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line);
+    white-space: nowrap; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600;
+    position: sticky; top: 0; background: var(--bg); }
+  td.amt { text-align: right; font-variant-numeric: tabular-nums; }
+  .in { color: var(--in); } .out { color: var(--out); }
+  .party { white-space: normal; max-width: 320px; }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 999px;
+    background: var(--chip); color: var(--accent); font-size: 11px; font-weight: 600; }
+  .dim { color: var(--muted); font-size: 12px; }
+  #more { margin: 16px 24px; display: none; }
+  #more.show { display: inline-block; }
+  .empty { padding: 40px 24px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>BillyCore — Transactions</h1>
+  <div class="sub">A plain view of <code>GET /v1/transactions</code> (D32). Nothing is stored; the token lives only in this tab.</div>
+</header>
+
+<div class="bar">
+  <div class="field">
+    <label for="base">BillyCore address</label>
+    <input id="base" value="http://127.0.0.1:8787" spellcheck="false">
+  </div>
+  <div class="field">
+    <label for="token">Bearer token</label>
+    <input id="token" type="password" placeholder="BILLYCORE_TOKEN" spellcheck="false">
+  </div>
+  <button id="load">Load</button>
+</div>
+
+<div id="msg"></div>
+<div class="totals" id="totals"></div>
+<div class="wrap"><table id="table" hidden>
+  <thead><tr>
+    <th>Date</th><th>Direction</th><th>Party</th>
+    <th style="text-align:right">Amount</th><th>Status</th><th>Reconciliation</th><th>Evidence</th>
+  </tr></thead>
+  <tbody id="rows"></tbody>
+</table><div class="empty" id="empty" hidden>No transactions.</div></div>
+<button class="secondary" id="more">Load more</button>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var cursor = null;      // next_cursor from the last page, or null
+  var loading = false;
+
+  function base() { return $("base").value.replace(/\/+$/, ""); }
+  function token() { return $("token").value.trim(); }
+
+  function money(m) {
+    if (!m) return "";
+    var v = (m.amount_minor / 100).toLocaleString(undefined, {
+      minimumFractionDigits: 2, maximumFractionDigits: 2
+    });
+    return v + " " + m.currency;
+  }
+
+  function party(t) {
+    var p = t.merchant || t.counterparty;
+    if (t.internal) return "Between your accounts";
+    return p ? p.value : "—";
+  }
+
+  function when(iso) {
+    var d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "2-digit" }) +
+      " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function error(text) { var m = $("msg"); m.textContent = text; m.className = "show"; }
+  function clearError() { $("msg").className = ""; }
+
+  function api(path) {
+    return fetch(base() + path, { headers: { "Authorization": "Bearer " + token() } })
+      .then(function (r) {
+        if (r.status === 401) throw new Error("The token was missing or wrong (401). Check BILLYCORE_TOKEN.");
+        if (!r.ok) return r.json().then(function (b) {
+          throw new Error((b && b.detail) || ("Request failed: HTTP " + r.status));
+        }, function () { throw new Error("Request failed: HTTP " + r.status); });
+        return r.json();
+      });
+  }
+
+  function renderTotals(s) {
+    $("totals").innerHTML =
+      stat("Income", money(s.income) + " · " + s.income.count, "in") +
+      stat("Expense", money(s.expense) + " · " + s.expense.count, "out") +
+      stat("Net", ((s.net_minor / 100).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) + " " + s.currency), "") +
+      stat("Internal (excluded)", String(s.excluded_internal), "");
+  }
+  function stat(k, v, cls) {
+    return '<div class="stat"><div class="k">' + k + '</div><div class="v ' + cls + '">' + v + "</div></div>";
+  }
+
+  function appendRows(items) {
+    var body = $("rows");
+    items.forEach(function (t) {
+      var tr = document.createElement("tr");
+      var dirCls = t.direction === "INFLOW" ? "in" : "out";
+      var arrow = t.direction === "INFLOW" ? "▲ in" : "▼ out";
+      tr.innerHTML =
+        "<td>" + when(t.occurred_at) + "</td>" +
+        '<td class="' + dirCls + '">' + arrow + "</td>" +
+        '<td class="party">' + escape(party(t)) + (t.internal ? ' <span class="chip">internal</span>' : "") + "</td>" +
+        '<td class="amt ' + dirCls + '">' + (t.amount ? money(t.amount) : '<span class="dim">no amount</span>') + "</td>" +
+        "<td>" + t.financial_status + "</td>" +
+        '<td>' + t.reconciliation_state + "</td>" +
+        '<td class="dim">' + (t.evidence_ids ? t.evidence_ids.length : 0) + "</td>";
+      body.appendChild(tr);
+    });
+  }
+
+  function escape(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function loadPage(reset) {
+    if (loading) return;
+    if (!token()) { error("Enter the bearer token BillyCore was started with."); return; }
+    loading = true; clearError();
+    $("load").disabled = true; $("more").disabled = true;
+
+    var work = [];
+    if (reset) {
+      cursor = null;
+      $("rows").innerHTML = "";
+      work.push(api("/v1/transactions/summary").then(renderTotals));
+    }
+    var path = "/v1/transactions?limit=100" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
+    work.push(api(path).then(function (page) {
+      appendRows(page.data);
+      cursor = page.next_cursor || null;
+      var count = $("rows").children.length;
+      $("table").hidden = count === 0;
+      $("empty").hidden = count !== 0;
+      $("more").className = cursor ? "secondary show" : "secondary";
+    }));
+
+    Promise.all(work).catch(function (e) { error(e.message); })
+      .then(function () { loading = false; $("load").disabled = false; $("more").disabled = false; });
+  }
+
+  $("load").addEventListener("click", function () { loadPage(true); });
+  $("more").addEventListener("click", function () { loadPage(false); });
+  $("token").addEventListener("keydown", function (e) { if (e.key === "Enter") loadPage(true); });
+})();
+</script>
+</body>
+</html>

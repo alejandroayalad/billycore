@@ -17,9 +17,10 @@ Read this first, then [docs/PRODUCT.md](../docs/PRODUCT.md).
 > and reconciliation merged **34** of them against the already-ingested emails on a
 > throwaway copy of the live database: each survivor keeps both Sources as provenance,
 > and the double-counted movements left the list and the totals. `superseded_by_transaction_id`
-> (D49) is now written. The one gap left in M2 is the viewing surface — §3 slice 8's
-> static page — everything below §1's original text still describes the email half that
-> made this possible.
+> (D49) is now written. The viewing surface landed too — `web/transactions.html`, a local
+> file that calls the API (D32, resolved by D73) — so M2's slices 8, 9 and 10 are all
+> done. Everything below §1's original text still describes the email half that made this
+> possible.
 
 The pipeline runs end to end. Email goes in at one end and financial facts come out
 at the other.
@@ -68,11 +69,11 @@ What runs today: `billycore auth`, `billycore peek`, and `billycore serve` — `
 bearer token compared in constant time — plus one background pipeline worker draining
 extraction and then Transaction construction (D45).
 
-What does not exist: **no way to see any of this that is not SQL** (beyond the terminal
-`billycore tx` table), no AI, and no HSBC statement parser. Bank statements and
-cross-Source reconciliation now exist (the 2026-09-01 note above). The success criterion
-in §2 is a *table a human can look at*, and the static page is still the whole remaining
-gap — §3 slice 8 is the critical path.
+What does not exist: no AI, and no HSBC statement parser. Bank statements,
+cross-Source reconciliation, and both views — the terminal `billycore tx` table and the
+`web/transactions.html` page — now exist (the 2026-09-01 note above). The success
+criterion in §2, *a table a human can look at*, is met; what remains is polish and the
+deferred work — AI, HSBC, and fuzzy party normalization — not a missing surface.
 
 One thing the code can do that nothing has yet asked it to do: re-extraction (D48) has
 never run against the live database — `superseded_by_interpretation_id` is NULL on all
@@ -175,7 +176,7 @@ The slices, in order:
 5. ~~Look at real Nu and HSBC email~~ — **done**, §3.1 is what it said
 6. ~~Per-template parsers, Claims with field-level confidence, `EXTRACTED`~~ — **done**
 7. ~~Transactions from active Claims; the background worker~~ — **done**, 800 rows
-8. `GET /v1/transactions` and a `billycore tx` table — **done**; **one static page (D32) is the last piece, and unbuilt**
+8. `GET /v1/transactions`, a `billycore tx` table, and a static page — **done** (the page is `web/transactions.html`, a local file that calls the API; D32 resolved by D73)
 9. ~~Statements: intake by hand through `POST /v1/evidence`, then PDF text extraction~~ — **done**
 10. ~~Reconciliation: DOMAIN.md §6's signals, and transfers that appear in both Sources~~ — **done** (D69–D72)
 
