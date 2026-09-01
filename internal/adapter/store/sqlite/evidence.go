@@ -56,7 +56,7 @@ func NewEvidenceRepository(db *sql.DB) *EvidenceRepository {
 // artifacts to every consumer.
 //
 // `now` is passed in rather than read from the clock so the caller owns time.
-func (r *EvidenceRepository) Insert(ctx context.Context, e domain.Evidence, now time.Time) (bool, error) {
+func (r *EvidenceRepository) Insert(ctx context.Context, e domain.Evidence, profile app.ExtractionProfile, now time.Time) (bool, error) {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, fmt.Errorf("insert evidence: begin: %w", err)
@@ -67,13 +67,13 @@ func (r *EvidenceRepository) Insert(ctx context.Context, e domain.Evidence, now 
 		INSERT INTO evidence (
 			id, source_id, source_type, source_reference,
 			content_type, raw_content, observed_at, created_at,
-			processing_stage
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			processing_stage, extraction_profile
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (source_id, source_reference) DO NOTHING`,
 		e.ID(), e.SourceID(), string(e.SourceType()), e.SourceReference(),
 		nullableText(e.ContentType()), e.RawContent(),
 		formatTime(e.ObservedAt()), formatTime(now),
-		stageReceived,
+		stageReceived, nullableText(string(profile)),
 	)
 	if err != nil {
 		// Never include the row values: raw_content is in them (SECURITY.md §10).
@@ -105,27 +105,39 @@ func (r *EvidenceRepository) Insert(ctx context.Context, e domain.Evidence, now 
 // an older binary surfaces as an error here instead of as an invalid domain
 // object flowing onward (D6, D11).
 func (r *EvidenceRepository) GetByID(ctx context.Context, id string) (domain.Evidence, error) {
-	var (
-		sourceID, sourceType, sourceReference string
-		contentType                           sql.NullString
-		rawContent                            []byte
-		observedAt                            string
-	)
-	err := r.db.QueryRowContext(ctx, `
-		SELECT source_id, source_type, source_reference, content_type, raw_content, observed_at
+	return scanEvidence(r.db.QueryRowContext(ctx, `
+		SELECT id, source_id, source_type, source_reference, content_type, raw_content, observed_at
 		FROM evidence
-		WHERE id = ?`, id,
-	).Scan(&sourceID, &sourceType, &sourceReference, &contentType, &rawContent, &observedAt)
+		WHERE id = ?`, id))
+}
+
+// GetByReference returns the row that won the Source identity slot. It is the
+// original Evidence after an idempotent direct-upload retry (D53).
+func (r *EvidenceRepository) GetByReference(ctx context.Context, sourceID, sourceReference string) (domain.Evidence, error) {
+	return scanEvidence(r.db.QueryRowContext(ctx, `
+		SELECT id, source_id, source_type, source_reference, content_type, raw_content, observed_at
+		FROM evidence
+		WHERE source_id = ? AND source_reference = ?`, sourceID, sourceReference))
+}
+
+func scanEvidence(row *sql.Row) (domain.Evidence, error) {
+	var (
+		id, sourceID, sourceType, sourceReference string
+		contentType                               sql.NullString
+		rawContent                                []byte
+		observedAt                                string
+	)
+	err := row.Scan(&id, &sourceID, &sourceType, &sourceReference, &contentType, &rawContent, &observedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Evidence{}, ErrEvidenceNotFound
 	}
 	if err != nil {
-		return domain.Evidence{}, fmt.Errorf("get evidence %s: %w", id, err)
+		return domain.Evidence{}, fmt.Errorf("get evidence: %w", err)
 	}
 
 	observed, err := time.Parse(time.RFC3339, observedAt)
 	if err != nil {
-		return domain.Evidence{}, fmt.Errorf("get evidence %s: observed_at is not RFC 3339: %w", id, err)
+		return domain.Evidence{}, fmt.Errorf("get evidence: observed_at is not RFC 3339: %w", err)
 	}
 	return domain.NewEvidence(
 		id, sourceID, domain.SourceType(sourceType),

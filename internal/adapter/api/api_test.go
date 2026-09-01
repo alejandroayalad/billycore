@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,23 +30,35 @@ type stubRepo struct {
 	getErr    error
 	inserted  int
 	insertErr error
+	profile   app.ExtractionProfile
 }
 
 func newStubRepo() *stubRepo {
 	return &stubRepo{evidence: map[string]domain.Evidence{}, exists: map[string]bool{}}
 }
 
-func (s *stubRepo) Insert(_ context.Context, e domain.Evidence, _ time.Time) (bool, error) {
+func (s *stubRepo) Insert(_ context.Context, e domain.Evidence, profile app.ExtractionProfile, _ time.Time) (bool, error) {
 	if s.insertErr != nil {
 		return false, s.insertErr
 	}
-	if s.exists[e.SourceReference()] {
+	key := e.SourceID() + "\x00" + e.SourceReference()
+	if s.exists[key] {
 		return false, nil
 	}
-	s.exists[e.SourceReference()] = true
+	s.exists[key] = true
 	s.evidence[e.ID()] = e
 	s.inserted++
+	s.profile = profile
 	return true, nil
+}
+
+func (s *stubRepo) GetByReference(_ context.Context, sourceID, sourceReference string) (domain.Evidence, error) {
+	for _, evidence := range s.evidence {
+		if evidence.SourceID() == sourceID && evidence.SourceReference() == sourceReference {
+			return evidence, nil
+		}
+	}
+	return domain.Evidence{}, app.ErrEvidenceNotFound
 }
 
 func (s *stubRepo) GetByID(_ context.Context, id string) (domain.Evidence, error) {
@@ -58,8 +72,8 @@ func (s *stubRepo) GetByID(_ context.Context, id string) (domain.Evidence, error
 	return e, nil
 }
 
-func (s *stubRepo) ExistsByReference(_ context.Context, _, sourceReference string) (bool, error) {
-	return s.exists[sourceReference], nil
+func (s *stubRepo) ExistsByReference(_ context.Context, sourceID, sourceReference string) (bool, error) {
+	return s.exists[sourceID+"\x00"+sourceReference], nil
 }
 
 type stubFetcher struct {
@@ -96,17 +110,37 @@ type stubPinger struct{ err error }
 
 func (s stubPinger) PingContext(context.Context) error { return s.err }
 
-// testServer wires a Server with no database, no network, and no clock.
+// testServer wires a Server with no database, no network, and no clock — and
+// with no pipeline listening, which is what most of these tests are about. That
+// nil is what proves a Server with nobody to notify is a valid Server: every
+// sync below runs through the same branch a daemon with no worker would.
 func testServer(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFetcher, fetcherErr error) http.Handler {
+	t.Helper()
+	return serverWith(t, repo, fetcher, fetcherErr, nil)
+}
+
+// notifyingServer is testServer with the pipeline's wake callback attached, and
+// a count of how many times it fired.
+func notifyingServer(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFetcher, fetcherErr error) (http.Handler, *atomic.Int64) {
+	t.Helper()
+	woken := new(atomic.Int64)
+	return serverWith(t, repo, fetcher, fetcherErr, func() { woken.Add(1) }), woken
+}
+
+func serverWith(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFetcher, fetcherErr error, notify func()) http.Handler {
 	t.Helper()
 	ingestor := &app.Ingestor{
 		Repo:  repo,
 		NewID: func() (string, error) { return "evidence-" + time.Now().Format("150405.000000000"), nil },
 		Now:   func() time.Time { return syncedAt },
 	}
-	sources := map[string]SyncTarget{
+	sources := map[string]app.Source{
+		"gmail_primary": {ID: "gmail_primary", Type: domain.SourceGmail, Profile: "NU_EMAIL_V1"},
+		"nu_statements": {ID: "nu_statements", Type: domain.SourceBankStatement, Profile: "NU_STATEMENT_V1"},
+	}
+	targets := map[string]SyncTarget{
 		"gmail_primary": {
-			Source: app.Source{ID: "gmail_primary", Type: domain.SourceGmail},
+			Source: sources["gmail_primary"],
 			Fetcher: func(context.Context) (app.SourceFetcher, error) {
 				if fetcherErr != nil {
 					return nil, fetcherErr
@@ -115,18 +149,35 @@ func testServer(t *testing.T, repo app.EvidenceRepository, fetcher app.SourceFet
 			},
 		},
 	}
-	return NewServer(ingestor, repo, sources, stubPinger{}).Handler(testToken)
+	return NewServer(ingestor, repo, &stubTransactionReader{}, sources, targets, stubPinger{}, notify).Handler(testToken)
 }
 
 func request(t *testing.T, handler http.Handler, method, path, token string) *httptest.ResponseRecorder {
 	t.Helper()
-	r := httptest.NewRequest(method, path, nil)
+	return requestBody(t, handler, method, path, token, nil)
+}
+
+func requestBody(t *testing.T, handler http.Handler, method, path, token string, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	r := httptest.NewRequest(method, path, bytes.NewReader(body))
 	if token != "" {
 		r.Header.Set("Authorization", token)
 	}
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, r)
 	return w
+}
+
+func uploadBody(t *testing.T, sourceID, key, observedAt, contentType string, raw []byte) []byte {
+	t.Helper()
+	body, err := json.Marshal(evidenceUploadRequest{
+		SourceID: sourceID, SourceArtifactKey: key, ObservedAt: observedAt,
+		ContentType: contentType, RawContent: raw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
 }
 
 func decode[T any](t *testing.T, w *httptest.ResponseRecorder) T {
@@ -186,7 +237,7 @@ func TestHealthzNeedsNoToken(t *testing.T) {
 }
 
 func TestHealthzReportsUnreachableStorage(t *testing.T) {
-	server := NewServer(nil, newStubRepo(), nil, stubPinger{err: errors.New("database is locked")})
+	server := NewServer(nil, newStubRepo(), &stubTransactionReader{}, nil, nil, stubPinger{err: errors.New("database is locked")}, nil)
 	w := request(t, server.Handler(testToken), http.MethodGet, "/healthz", "")
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
@@ -314,6 +365,227 @@ func TestSyncRefusesToOverlapItself(t *testing.T) {
 	// The lock is released when the sync ends, so the next one is served.
 	if again := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken).Code; again != http.StatusOK {
 		t.Errorf("sync after the first finished = %d, want 200", again)
+	}
+}
+
+// --- waking the pipeline -------------------------------------------------
+
+// D45: the handler notifies, it does not process. What the callback must be is
+// cheap and non-blocking; what it must not be is extraction running inside the
+// request that produced the Evidence.
+
+func TestASuccessfulSyncWakesThePipelineOnce(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), &stubFetcher{references: []string{"msg-a", "msg-b"}}, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body)
+	}
+	if got := woken.Load(); got != 1 {
+		t.Errorf("the pipeline was woken %d times, want 1 — once per sync, not once per artifact", got)
+	}
+}
+
+// A sync that recorded nothing new still wakes it. The handler knows how many
+// rows it created, and could stay quiet on zero; it does not, because Evidence
+// left mid-pipeline by an earlier run is exactly what a re-sync is often for,
+// and a wake that finds nothing costs one empty query per stage.
+func TestARepeatedSyncStillWakesThePipeline(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), &stubFetcher{references: []string{"msg-a"}}, nil)
+
+	request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+
+	if got := woken.Load(); got != 2 {
+		t.Errorf("the pipeline was woken %d times across two syncs, want 2", got)
+	}
+}
+
+func TestAFailedSyncDoesNotWakeThePipeline(t *testing.T) {
+	fetcher := &stubFetcher{references: []string{"msg-a"}, fetchErr: errors.New("gmail API returned 500")}
+	handler, woken := notifyingServer(t, newStubRepo(), fetcher, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", w.Code)
+	}
+	if got := woken.Load(); got != 0 {
+		t.Errorf("a failed sync woke the pipeline %d times, want 0", got)
+	}
+}
+
+func TestAnUnreachableSourceDoesNotWakeThePipeline(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), nil, errors.New("no Gmail credentials"))
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", w.Code)
+	}
+	if got := woken.Load(); got != 0 {
+		t.Errorf("an unreachable Source woke the pipeline %d times, want 0", got)
+	}
+}
+
+func TestAnUnconfiguredSourceDoesNotWakeThePipeline(t *testing.T) {
+	handler, woken := notifyingServer(t, newStubRepo(), &stubFetcher{}, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/hsbc_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+	if got := woken.Load(); got != 0 {
+		t.Errorf("an unconfigured Source woke the pipeline %d times, want 0", got)
+	}
+}
+
+// Every other test in this file runs against a Server with no callback at all,
+// which is the assertion this one only makes explicit: a daemon with no worker
+// serves normally rather than panicking on the first successful sync.
+func TestSyncWithNoPipelineListening(t *testing.T) {
+	handler := testServer(t, newStubRepo(), &stubFetcher{references: []string{"msg-a"}}, nil)
+
+	w := request(t, handler, http.MethodPost, "/v1/sources/gmail_primary/sync", "Bearer "+testToken)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", w.Code, w.Body)
+	}
+}
+
+// --- POST /v1/evidence --------------------------------------------------
+
+func TestPostEvidenceRecordsAConfiguredStatementSource(t *testing.T) {
+	repo := newStubRepo()
+	handler, woken := notifyingServer(t, repo, &stubFetcher{}, nil)
+	body := uploadBody(t, "nu_statements", "statement-2026-07.pdf",
+		"2026-08-23T14:02:11-06:00", "application/pdf", []byte("%PDF-1.7\nstatement"))
+
+	w := requestBody(t, handler, http.MethodPost, "/v1/evidence", "Bearer "+testToken, body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %s", w.Code, w.Body)
+	}
+	got := decode[evidenceResponse](t, w)
+	if got.SourceID != "nu_statements" || got.SourceArtifactKey != "statement-2026-07.pdf" {
+		t.Errorf("evidence = %+v", got)
+	}
+	if got.ObservedAt != "2026-08-23T20:02:11.000Z" || got.ContentBytes != len("%PDF-1.7\nstatement") {
+		t.Errorf("evidence time/size = %+v", got)
+	}
+	if got.RawContent != "" {
+		t.Error("POST returned raw_content; only GET may return it")
+	}
+	rawResponse := decode[map[string]any](t, w)
+	if _, present := rawResponse["raw_content"]; present {
+		t.Error("POST included raw_content in its JSON representation")
+	}
+	if repo.profile != "NU_STATEMENT_V1" {
+		t.Errorf("profile = %q, want NU_STATEMENT_V1", repo.profile)
+	}
+	if woken.Load() != 1 {
+		t.Errorf("pipeline wakes = %d, want 1", woken.Load())
+	}
+}
+
+func TestPostEvidenceReturnsTheImmutableOriginalOnRetry(t *testing.T) {
+	repo := newStubRepo()
+	handler, woken := notifyingServer(t, repo, &stubFetcher{}, nil)
+	firstBody := uploadBody(t, "nu_statements", "statement.pdf", observed.Format(time.RFC3339),
+		"application/pdf", []byte("%PDF-first"))
+	first := requestBody(t, handler, http.MethodPost, "/v1/evidence", "Bearer "+testToken, firstBody)
+	want := decode[evidenceResponse](t, first)
+
+	secondBody := uploadBody(t, "nu_statements", "statement.pdf", syncedAt.Format(time.RFC3339),
+		"application/pdf", []byte("%PDF-different"))
+	second := requestBody(t, handler, http.MethodPost, "/v1/evidence", "Bearer "+testToken, secondBody)
+	if second.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", second.Code, second.Body)
+	}
+	if got := decode[evidenceResponse](t, second); got != want {
+		t.Errorf("retry returned %+v, want original %+v", got, want)
+	}
+	if repo.inserted != 1 || woken.Load() != 1 {
+		t.Errorf("inserted/woken = %d/%d, want 1/1", repo.inserted, woken.Load())
+	}
+}
+
+func TestPostEvidenceRejectsMalformedRequests(t *testing.T) {
+	handler := testServer(t, newStubRepo(), &stubFetcher{}, nil)
+	valid := uploadBody(t, "nu_statements", "statement.pdf", observed.Format(time.RFC3339),
+		"application/pdf", []byte("%PDF-ok"))
+	cases := map[string][]byte{
+		"invalid base64": []byte(`{"source_id":"nu_statements","source_artifact_key":"x","observed_at":"2026-08-23T14:02:11Z","content_type":"application/pdf","raw_content":"%%%"}`),
+		"unknown field":  append(valid[:len(valid)-1], []byte(`,"profile":"NU_STATEMENT_V1"}`)...),
+		"trailing JSON":  append(valid, []byte(` {}`)...),
+		"missing field":  []byte(`{"source_id":"nu_statements"}`),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			w := requestBody(t, handler, http.MethodPost, "/v1/evidence", "Bearer "+testToken, body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", w.Code, w.Body)
+			}
+			got := decode[errorEnvelope](t, w)
+			if got.Error.Type != typeMalformedRequest || len(got.Error.Details) == 0 {
+				t.Errorf("error = %+v", got.Error)
+			}
+		})
+	}
+}
+
+func TestPostEvidenceRejectsInvalidTimeAndSource(t *testing.T) {
+	handler := testServer(t, newStubRepo(), &stubFetcher{}, nil)
+	cases := []struct {
+		name, source, observed string
+		status                 int
+	}{
+		{"invalid time", "nu_statements", "yesterday", http.StatusBadRequest},
+		{"unknown source", "missing", observed.Format(time.RFC3339), http.StatusNotFound},
+		{"fetchable source", "gmail_primary", observed.Format(time.RFC3339), http.StatusConflict},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := uploadBody(t, tc.source, "statement.pdf", tc.observed, "application/pdf", []byte("%PDF-ok"))
+			w := requestBody(t, handler, http.MethodPost, "/v1/evidence", "Bearer "+testToken, body)
+			if w.Code != tc.status {
+				t.Errorf("status = %d, want %d: %s", w.Code, tc.status, w.Body)
+			}
+		})
+	}
+}
+
+func TestPostEvidenceEnforcesBothSizeLimits(t *testing.T) {
+	handler := testServer(t, newStubRepo(), &stubFetcher{}, nil)
+	decoded := uploadBody(t, "nu_statements", "large.pdf", observed.Format(time.RFC3339),
+		"application/pdf", make([]byte, maxUploadArtifactBytes+1))
+	for name, body := range map[string][]byte{
+		"decoded artifact": decoded,
+		"HTTP body":        make([]byte, maxUploadBodyBytes+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := requestBody(t, handler, http.MethodPost, "/v1/evidence", "Bearer "+testToken, body)
+			if w.Code != http.StatusRequestEntityTooLarge {
+				t.Fatalf("status = %d, want 413: %s", w.Code, w.Body)
+			}
+			if got := decode[errorEnvelope](t, w).Error.Type; got != typePayloadTooLarge {
+				t.Errorf("type = %q, want %q", got, typePayloadTooLarge)
+			}
+		})
+	}
+}
+
+func TestPostEvidenceRequiresAuthentication(t *testing.T) {
+	repo := newStubRepo()
+	body := uploadBody(t, "nu_statements", "statement.pdf", observed.Format(time.RFC3339),
+		"application/pdf", []byte("%PDF-ok"))
+	w := requestBody(t, testServer(t, repo, &stubFetcher{}, nil), http.MethodPost, "/v1/evidence", "", body)
+	if w.Code != http.StatusUnauthorized || repo.inserted != 0 {
+		t.Errorf("status/inserted = %d/%d, want 401/0", w.Code, repo.inserted)
+	}
+}
+
+func TestStatementSourceCannotBeSynced(t *testing.T) {
+	w := request(t, testServer(t, newStubRepo(), &stubFetcher{}, nil), http.MethodPost,
+		"/v1/sources/nu_statements/sync", "Bearer "+testToken)
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409: %s", w.Code, w.Body)
 	}
 }
 

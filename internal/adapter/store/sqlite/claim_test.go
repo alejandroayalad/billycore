@@ -29,7 +29,7 @@ func newClaimTestRepo(t *testing.T) (*ClaimRepository, *EvidenceQueue, *Evidence
 func storeEvidence(t *testing.T, repo *EvidenceRepository, id, reference string) domain.Evidence {
 	t.Helper()
 	e := newTestEvidence(t, id, reference)
-	created, err := repo.Insert(context.Background(), e, ingestedAt)
+	created, err := repo.Insert(context.Background(), e, testProfile, ingestedAt)
 	if err != nil || !created {
 		t.Fatalf("Insert: created=%v err=%v", created, err)
 	}
@@ -71,14 +71,55 @@ func newTestClaim(t *testing.T, id, evidenceID string) domain.Claim {
 	return active
 }
 
-// The whole point of D25 applied to Claims: the row, its provenance, its
-// fields, the event and the stage advance either all happen or none do.
+// oneClaim is the shape that each Nu artifact gives: an interpretation with one
+// Claim. It does not supersede another reading.
+func oneClaim(t *testing.T, interpretationID, claimID, evidenceID string) domain.Interpretation {
+	t.Helper()
+	return interpretationOf(t, interpretationID, evidenceID, "", newTestClaim(t, claimID, evidenceID))
+}
+
+func interpretationOf(t *testing.T, interpretationID, evidenceID, supersedes string, claims ...domain.Claim) domain.Interpretation {
+	t.Helper()
+	in, err := domain.NewInterpretation(interpretationID, evidenceID, claims, 0, supersedes, claimedAt)
+	if err != nil {
+		t.Fatalf("NewInterpretation: %v", err)
+	}
+	return in
+}
+
+// D59: a statement reading may be partial, and it records how partial. The
+// count is written with the reading, in the same transaction as the Claims.
+func TestSaveRecordsHowManyRowsTheReadingDidNotRead(t *testing.T) {
+	claims, _, evidence, db := newClaimTestRepo(t)
+	storeEvidence(t, evidence, "ev-1", "msg-1")
+
+	in, err := domain.NewInterpretation("interp-1", "ev-1",
+		[]domain.Claim{newTestClaim(t, "claim-1", "ev-1")}, 4, "", claimedAt)
+	if err != nil {
+		t.Fatalf("NewInterpretation: %v", err)
+	}
+	if created, err := claims.Save(context.Background(), in, testProfile, claimedAt); err != nil || !created {
+		t.Fatalf("Save: created=%v err=%v", created, err)
+	}
+
+	var unread int
+	if err := db.QueryRow(`SELECT unread_rows FROM interpretations WHERE id = 'interp-1'`).Scan(&unread); err != nil {
+		t.Fatalf("read unread_rows: %v", err)
+	}
+	if unread != 4 {
+		t.Errorf("unread_rows = %d, want 4", unread)
+	}
+}
+
+// D25 applied to Claims. The row, its provenance, its fields, the event and the
+// stage advance all happen, or none of them happen.
 func TestSaveWritesTheClaimItsFieldsItsProvenanceAndItsEvent(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
 	claim := newTestClaim(t, "claim-1", "ev-1")
+	in := interpretationOf(t, "interp-1", "ev-1", "", claim)
 
-	if created, err := claims.Save(context.Background(), claim, claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), in, testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 
@@ -153,7 +194,7 @@ func TestSaveAdvancesTheEvidenceItInterpreted(t *testing.T) {
 	if stage := readStage(t, db, "ev-1"); stage != stageReceived {
 		t.Fatalf("stage before = %q, want RECEIVED", stage)
 	}
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 	if stage := readStage(t, db, "ev-1"); stage != stageExtracted {
@@ -166,7 +207,7 @@ func TestSaveAdvancesTheEvidenceItInterpreted(t *testing.T) {
 func TestAClaimCitingEvidenceThatDoesNotExistIsRejectedWhole(t *testing.T) {
 	claims, _, _, db := newClaimTestRepo(t)
 
-	_, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-missing"), claimedAt)
+	_, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-missing"), testProfile, claimedAt)
 	if err == nil {
 		t.Fatal("Save accepted a claim with no such Evidence")
 	}
@@ -187,7 +228,7 @@ func TestExtractionDoesNotRewriteTheArtifact(t *testing.T) {
 	claims, _, evidence, _ := newClaimTestRepo(t)
 	stored := storeEvidence(t, evidence, "ev-1", "msg-1")
 
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 	after, err := evidence.GetByID(context.Background(), "ev-1")
@@ -279,21 +320,35 @@ func TestMarkExtractedAdvancesAndReleaseDoesNot(t *testing.T) {
 	}
 }
 
-// Migration 003's tables are not this slice's business, and there is a test
-// asserting their absence. This is the other half of that: nothing here creates
-// them by accident.
-func TestExtractionCreatesNoTransactionTables(t *testing.T) {
+// Extraction writes no Transaction. The tables exist now — migration 004
+// brought them with the reconciliation pass — so the assertion moved from
+// "these tables are absent" to the thing it was always protecting: extraction
+// is one stage, it produces a Claim, and a financial event is the next stage's
+// to record.
+//
+// The distinction is not academic. A Claim is an interpretation and may be
+// wrong, superseded or rejected; a Transaction is Billy asserting that money
+// moved. Collapsing the two would put an unreviewed parse straight into the
+// table the success criterion is about.
+func TestExtractionWritesNoTransaction(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
-	for _, table := range []string{"transactions", "transaction_evidence"} {
-		var name string
-		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name = ?`, table).Scan(&name)
-		if err == nil {
-			t.Errorf("%s exists; it belongs to migration 003", table)
+	for _, table := range []string{"transactions", "transaction_evidence", "claim_transaction"} {
+		var rows int
+		if err := db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&rows); err != nil {
+			t.Fatalf("count %s: %v", table, err)
 		}
+		if rows != 0 {
+			t.Errorf("%s holds %d rows after extraction; a Transaction is the reconciliation pass's to write", table, rows)
+		}
+	}
+	// And the stage stops at EXTRACTED. Advancing further here would hand the
+	// reconciliation pass an artifact it never saw.
+	if stage := readStage(t, db, "ev-1"); stage != stageExtracted {
+		t.Errorf("stage = %q, want EXTRACTED", stage)
 	}
 }
 
@@ -393,7 +448,7 @@ func TestASuccessfulExtractionClearsAnEarlierError(t *testing.T) {
 		t.Fatalf("RecordFailure: %v", err)
 	}
 
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 	if err := queue.MarkExtracted(context.Background(), "ev-2", claimedAt); err != nil {
@@ -473,14 +528,14 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
 
-	created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt)
+	created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), testProfile, claimedAt)
 	if err != nil || !created {
 		t.Fatalf("first Save: created=%v err=%v", created, err)
 	}
 
-	// A different Claim id, the same artifact — what a second pass produces
-	// after a lease lapses, since ids come from crypto/rand.
-	created, err = claims.Save(context.Background(), newTestClaim(t, "claim-2", "ev-1"), claimedAt)
+	// A different Claim id and the same artifact. A second pass gives this
+	// result after a lease ends, because each id comes from crypto/rand.
+	created, err = claims.Save(context.Background(), oneClaim(t, "interp-2", "claim-2", "ev-1"), testProfile, claimedAt)
 	if err != nil {
 		t.Fatalf("second Save: %v — losing the race is an outcome, not an error", err)
 	}
@@ -488,9 +543,8 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 		t.Error("a second active claim was created for one artifact")
 	}
 
-	// Nothing of the losing Claim survives. A half-written interpretation — the
-	// claim row without its fields, or an event describing a Claim that is not
-	// there — would be worse than the duplicate it was preventing.
+	// Nothing from the losing Claim stays. A part-written interpretation is
+	// worse than the duplicate that the constraint prevents.
 	var claimCount int
 	if err := db.QueryRow(`SELECT count(*) FROM claims`).Scan(&claimCount); err != nil {
 		t.Fatalf("count claims: %v", err)
@@ -521,10 +575,13 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 		}
 	}
 
-	// The pointer still names the winner.
+	// The pointer names the winner.
 	var activeClaim string
-	if err := db.QueryRow(
-		`SELECT claim_id FROM evidence_active_claim WHERE evidence_id = ?`, "ev-1").Scan(&activeClaim); err != nil {
+	if err := db.QueryRow(`
+		SELECT ic.claim_id
+		FROM evidence_active_interpretation eai
+		JOIN interpretation_claims ic ON ic.interpretation_id = eai.interpretation_id
+		WHERE eai.evidence_id = ?`, "ev-1").Scan(&activeClaim); err != nil {
 		t.Fatalf("read active claim: %v", err)
 	}
 	if activeClaim != "claim-1" {
@@ -532,9 +589,8 @@ func TestASecondActiveClaimForOneArtifactIsRefused(t *testing.T) {
 	}
 }
 
-// The duplicate this prevents does not need a crash. Two passes overlap when a
-// lease lapses under a slow one, both interpret the same artifact, and both
-// try to write. Exactly one may win.
+// The duplicate that this prevents needs no crash. Two passes overlap when a
+// lease ends under a slow pass, and only one of them can win.
 func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
@@ -550,7 +606,7 @@ func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 			defer wg.Done()
 			<-start
 			created, err := claims.Save(context.Background(),
-				newTestClaim(t, fmt.Sprintf("claim-%d", i), "ev-1"), claimedAt)
+				oneClaim(t, fmt.Sprintf("interp-%d", i), fmt.Sprintf("claim-%d", i), "ev-1"), testProfile, claimedAt)
 			if err != nil {
 				errs <- err
 				return
@@ -583,7 +639,7 @@ func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 	if claimCount != 1 {
 		t.Errorf("claims = %d for one artifact, want 1", claimCount)
 	}
-	// One artifact, one interpretation, one activation event.
+	// One artifact, one interpretation, and one activation event.
 	var events int
 	if err := db.QueryRow(
 		`SELECT count(*) FROM domain_event WHERE type = ?`, eventClaimActivated).Scan(&events); err != nil {
@@ -594,34 +650,30 @@ func TestTwoOverlappingPassesProduceOneClaim(t *testing.T) {
 	}
 }
 
-// A PROPOSED Claim takes no active slot, which is what keeps the proposal
-// endpoints of D11/D12 working: an outside proposer may offer a competing
-// interpretation of an artifact Billy has already interpreted.
-func TestAProposedClaimDoesNotTakeTheActiveSlot(t *testing.T) {
+// An interpretation is a set of ACTIVE Claims, so this port refuses a PROPOSED
+// Claim. The proposal endpoint of D11 therefore has no writer: before D46 this
+// port took one Claim and accepted a PROPOSED one. POST /v1/claims needs its
+// own writer, and that endpoint does not exist yet.
+func TestAnInterpretationRefusesAProposedClaim(t *testing.T) {
 	claims, _, evidence, db := newClaimTestRepo(t)
 	storeEvidence(t, evidence, "ev-1", "msg-1")
 
-	if created, err := claims.Save(context.Background(), newTestClaim(t, "claim-1", "ev-1"), claimedAt); err != nil || !created {
+	if created, err := claims.Save(context.Background(), oneClaim(t, "interp-1", "claim-1", "ev-1"), testProfile, claimedAt); err != nil || !created {
 		t.Fatalf("Save: created=%v err=%v", created, err)
 	}
 
 	proposed := newProposedClaim(t, "claim-2", "ev-1")
-	created, err := claims.Save(context.Background(), proposed, claimedAt)
-	if err != nil {
-		t.Fatalf("Save proposed: %v", err)
-	}
-	if !created {
-		t.Error("a proposed claim was refused; it competes for no slot")
+	if _, err := domain.NewInterpretation("interp-2", "ev-1", []domain.Claim{proposed}, 0, "", claimedAt); err == nil {
+		t.Fatal("a proposed claim was accepted into an interpretation")
 	}
 
 	var claimCount int
 	if err := db.QueryRow(`SELECT count(*) FROM claims`).Scan(&claimCount); err != nil {
 		t.Fatalf("count claims: %v", err)
 	}
-	if claimCount != 2 {
-		t.Errorf("claims = %d, want 2 — one active, one proposed", claimCount)
+	if claimCount != 1 {
+		t.Errorf("claims = %d, want 1 — nothing was written for the refused set", claimCount)
 	}
-	// And no ClaimActivated for it: nothing became anyone's interpretation.
 	var events int
 	if err := db.QueryRow(
 		`SELECT count(*) FROM domain_event WHERE type = ?`, eventClaimActivated).Scan(&events); err != nil {
@@ -651,4 +703,65 @@ func newProposedClaim(t *testing.T, id, evidenceID string) domain.Claim {
 		t.Fatalf("NewClaim: %v", err)
 	}
 	return c
+}
+
+// The queue hands out what the pass needs to select a parser: the profile that
+// the Source named, and the content type that the Source reported (D24).
+func TestClaimForExtractionCarriesTheProfileAndTheContentType(t *testing.T) {
+	_, queue, evidence, _ := newClaimTestRepo(t)
+	storeEvidence(t, evidence, "ev-1", "msg-1")
+
+	pending, err := queue.ClaimForExtraction(context.Background(), 10, claimedAt, claimedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimForExtraction: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("claimed %d rows, want 1", len(pending))
+	}
+	if pending[0].Profile != testProfile {
+		t.Errorf("profile = %q, want %q", pending[0].Profile, testProfile)
+	}
+	if pending[0].ContentType != "message/rfc822" {
+		t.Errorf("content type = %q, want message/rfc822", pending[0].ContentType)
+	}
+}
+
+// A row that no Source configuration reached carries no profile, and the queue
+// reports it as empty rather than failing to scan. Extraction fails it with a
+// named reason, which is how a misconfigured Source becomes visible.
+func TestClaimForExtractionCarriesAnEmptyProfileWhenTheRowHasNone(t *testing.T) {
+	_, queue, _, db := newClaimTestRepo(t)
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'MANUAL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+
+	pending, err := queue.ClaimForExtraction(context.Background(), 10, claimedAt, claimedAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ClaimForExtraction: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Profile != "" || pending[0].ContentType != "" {
+		t.Errorf("pending = %+v, want one row with no profile and no content type", pending)
+	}
+}
+
+// The reading keeps the parser that made it. An audit asks which parser
+// produced a Claim, and D47's lineage keeps the readings that came before.
+func TestSaveRecordsTheProfileOfTheReading(t *testing.T) {
+	claims, _, evidence, db := newClaimTestRepo(t)
+	storeEvidence(t, evidence, "ev-1", "msg-1")
+
+	if created, err := claims.Save(context.Background(),
+		oneClaim(t, "interp-1", "claim-1", "ev-1"), "NU_STATEMENT_V1", claimedAt); err != nil || !created {
+		t.Fatalf("Save: created=%v err=%v", created, err)
+	}
+
+	var got string
+	if err := db.QueryRow(`SELECT extraction_profile FROM interpretations WHERE id = 'interp-1'`).Scan(&got); err != nil {
+		t.Fatalf("read interpretation profile: %v", err)
+	}
+	if got != "NU_STATEMENT_V1" {
+		t.Errorf("profile = %q, want NU_STATEMENT_V1", got)
+	}
 }

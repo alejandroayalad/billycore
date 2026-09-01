@@ -17,18 +17,20 @@ var (
 	syncedAt   = time.Date(2026, 8, 25, 9, 0, 0, 0, time.UTC)
 	receivedAt = time.Date(2026, 8, 16, 17, 44, 0, 0, time.UTC)
 
-	gmailPrimary = Source{ID: "gmail_primary", Type: domain.SourceGmail}
+	gmailPrimary = Source{ID: "gmail_primary", Type: domain.SourceGmail, Profile: "NU_EMAIL_V1"}
+	nuStatements = Source{ID: "nu_statements", Type: domain.SourceBankStatement, Profile: "NU_STATEMENT_V1"}
 )
 
 // fakeRepo records what it was asked to store, in order.
 type fakeRepo struct {
 	stored     []domain.Evidence
 	insertedAt []time.Time
+	profiles   []ExtractionProfile
 	existsErr  error
 	insertErr  error
 }
 
-func (f *fakeRepo) Insert(_ context.Context, e domain.Evidence, now time.Time) (bool, error) {
+func (f *fakeRepo) Insert(_ context.Context, e domain.Evidence, profile ExtractionProfile, now time.Time) (bool, error) {
 	if f.insertErr != nil {
 		return false, f.insertErr
 	}
@@ -39,6 +41,7 @@ func (f *fakeRepo) Insert(_ context.Context, e domain.Evidence, now time.Time) (
 	}
 	f.stored = append(f.stored, e)
 	f.insertedAt = append(f.insertedAt, now)
+	f.profiles = append(f.profiles, profile)
 	return true, nil
 }
 
@@ -49,6 +52,15 @@ func (f *fakeRepo) GetByID(_ context.Context, id string) (domain.Evidence, error
 		}
 	}
 	return domain.Evidence{}, errors.New("not found")
+}
+
+func (f *fakeRepo) GetByReference(_ context.Context, sourceID, sourceReference string) (domain.Evidence, error) {
+	for _, e := range f.stored {
+		if e.SourceID() == sourceID && e.SourceReference() == sourceReference {
+			return e, nil
+		}
+	}
+	return domain.Evidence{}, ErrEvidenceNotFound
 }
 
 func (f *fakeRepo) ExistsByReference(_ context.Context, sourceID, sourceReference string) (bool, error) {
@@ -115,6 +127,37 @@ func newTestIngestor(repo EvidenceRepository) *Ingestor {
 		Repo:  repo,
 		NewID: ids("evidence"),
 		Now:   func() time.Time { return syncedAt },
+	}
+}
+
+func TestRecordReturnsTheImmutableWinnerOfAnArtifactKey(t *testing.T) {
+	repo := &fakeRepo{}
+	ingestor := newTestIngestor(repo)
+	artifact := Artifact{
+		Reference: "statement.pdf", ContentType: "application/pdf",
+		ObservedAt: receivedAt, Content: []byte("%PDF-first"),
+	}
+	first, err := ingestor.Record(context.Background(), nuStatements, artifact)
+	if err != nil {
+		t.Fatalf("first Record: %v", err)
+	}
+	if !first.Created || first.Evidence.ID() != "evidence-1" {
+		t.Fatalf("first Record = %+v", first)
+	}
+
+	artifact.Content = []byte("%PDF-different")
+	second, err := ingestor.Record(context.Background(), nuStatements, artifact)
+	if err != nil {
+		t.Fatalf("second Record: %v", err)
+	}
+	if second.Created || second.Evidence.ID() != first.Evidence.ID() {
+		t.Errorf("second Record = %+v, want immutable original", second)
+	}
+	if string(second.Evidence.RawContent()) != "%PDF-first" {
+		t.Error("the retry replaced the original content")
+	}
+	if len(repo.stored) != 1 || repo.profiles[0] != "NU_STATEMENT_V1" {
+		t.Errorf("stored/profile = %d/%q, want 1/NU_STATEMENT_V1", len(repo.stored), repo.profiles[0])
 	}
 }
 
@@ -281,4 +324,19 @@ func (b *brokenTimeFetcher) Fetch(ctx context.Context, reference string) (Artifa
 	a, err := b.fakeFetcher.Fetch(ctx, reference)
 	a.ObservedAt = time.Time{}
 	return a, err
+}
+
+// The profile travels from the Source configuration onto the row. Extraction
+// reads it there rather than reading sources.json again, so a later change to
+// the configuration does not rewrite what Billy already recorded.
+func TestIngestionCopiesTheSourceProfileOntoEvidence(t *testing.T) {
+	repo := &fakeRepo{}
+	source := Source{ID: "gmail_primary", Type: domain.SourceGmail, Profile: "NU_EMAIL_V1"}
+
+	if _, err := newTestIngestor(repo).Sync(context.Background(), source, newFetcher("msg-a")); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(repo.profiles) != 1 || repo.profiles[0] != "NU_EMAIL_V1" {
+		t.Errorf("recorded profiles = %v, want [NU_EMAIL_V1]", repo.profiles)
+	}
 }

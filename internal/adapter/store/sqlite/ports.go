@@ -10,3 +10,12 @@ var (
 	_ app.EvidenceQueue      = (*EvidenceQueue)(nil)
 	_ app.ClaimRepository    = (*ClaimRepository)(nil)
 )
+
+// The reconciliation stage's ports. EvidenceQueue satisfies both stages'
+// queues: they are separate interfaces because they are consumed by separate
+// use cases (D6), not because two objects move rows through one table.
+var (
+	_ app.ReconcileQueue        = (*EvidenceQueue)(nil)
+	_ app.TransactionRepository = (*TransactionRepository)(nil)
+	_ app.TransactionReader     = (*TransactionRepository)(nil)
+)

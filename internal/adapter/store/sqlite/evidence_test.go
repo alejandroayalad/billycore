@@ -46,7 +46,7 @@ func TestInsertIsIdempotentOnSourceReference(t *testing.T) {
 	ctx := context.Background()
 
 	first := newTestEvidence(t, "evidence-1", "18f2a9c4d5e6")
-	created, err := repo.Insert(ctx, first, ingestedAt)
+	created, err := repo.Insert(ctx, first, testProfile, ingestedAt)
 	if err != nil {
 		t.Fatalf("first Insert: %v", err)
 	}
@@ -58,7 +58,7 @@ func TestInsertIsIdempotentOnSourceReference(t *testing.T) {
 	// the caller generated a new one — the identity that matters is
 	// (source_id, source_reference), not the row id (D10).
 	second := newTestEvidence(t, "evidence-2", "18f2a9c4d5e6")
-	created, err = repo.Insert(ctx, second, ingestedAt.Add(time.Hour))
+	created, err = repo.Insert(ctx, second, testProfile, ingestedAt.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("second Insert: %v", err)
 	}
@@ -91,10 +91,10 @@ func TestInsertEmitsOneEventPerIngestion(t *testing.T) {
 	repo, db := newTestRepo(t)
 	ctx := context.Background()
 
-	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-a"), ingestedAt); err != nil {
+	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-a"), testProfile, ingestedAt); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
-	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-2", "msg-a"), ingestedAt); err != nil {
+	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-2", "msg-a"), testProfile, ingestedAt); err != nil {
 		t.Fatalf("duplicate Insert: %v", err)
 	}
 
@@ -125,12 +125,12 @@ func TestInsertWritesNoEventWhenTheRowFails(t *testing.T) {
 	repo, db := newTestRepo(t)
 	ctx := context.Background()
 
-	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-a"), ingestedAt); err != nil {
+	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-a"), testProfile, ingestedAt); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 	// Same primary key, different source_reference: a PRIMARY KEY conflict, which
 	// ON CONFLICT (source_id, source_reference) does not absorb.
-	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-b"), ingestedAt); err == nil {
+	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-b"), testProfile, ingestedAt); err == nil {
 		t.Fatal("Insert accepted a duplicate primary key")
 	}
 
@@ -148,7 +148,7 @@ func TestGetByIDReturnsTheStoredArtifact(t *testing.T) {
 	ctx := context.Background()
 
 	stored := newTestEvidence(t, "evidence-1", "18f2a9c4d5e6")
-	if _, err := repo.Insert(ctx, stored, ingestedAt); err != nil {
+	if _, err := repo.Insert(ctx, stored, testProfile, ingestedAt); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 
@@ -179,10 +179,30 @@ func TestGetByIDReportsMissingEvidence(t *testing.T) {
 	}
 }
 
+func TestGetByReferenceReturnsTheStoredArtifact(t *testing.T) {
+	repo, _ := newTestRepo(t)
+	ctx := context.Background()
+	stored := newTestEvidence(t, "evidence-1", "statement.pdf")
+	if _, err := repo.Insert(ctx, stored, testProfile, ingestedAt); err != nil {
+		t.Fatalf("Insert: %v", err)
+	}
+
+	got, err := repo.GetByReference(ctx, "gmail_primary", "statement.pdf")
+	if err != nil {
+		t.Fatalf("GetByReference: %v", err)
+	}
+	if got.ID() != "evidence-1" || !bytes.Equal(got.RawContent(), stored.RawContent()) {
+		t.Errorf("GetByReference returned %+v", got)
+	}
+	if _, err := repo.GetByReference(ctx, "other", "statement.pdf"); !errors.Is(err, ErrEvidenceNotFound) {
+		t.Errorf("missing reference error = %v", err)
+	}
+}
+
 // Ingestion records and stops. Extraction is a separate stage (D7).
 func TestInsertLeavesEvidenceAtReceived(t *testing.T) {
 	repo, db := newTestRepo(t)
-	if _, err := repo.Insert(context.Background(), newTestEvidence(t, "evidence-1", "msg-a"), ingestedAt); err != nil {
+	if _, err := repo.Insert(context.Background(), newTestEvidence(t, "evidence-1", "msg-a"), testProfile, ingestedAt); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 
@@ -210,7 +230,7 @@ func TestInsertStoresMissingContentTypeAsNull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEvidence: %v", err)
 	}
-	if _, err := repo.Insert(context.Background(), e, ingestedAt); err != nil {
+	if _, err := repo.Insert(context.Background(), e, testProfile, ingestedAt); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 
@@ -230,7 +250,7 @@ func TestExistsByReference(t *testing.T) {
 	repo, _ := newTestRepo(t)
 	ctx := context.Background()
 
-	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-a"), ingestedAt); err != nil {
+	if _, err := repo.Insert(ctx, newTestEvidence(t, "evidence-1", "msg-a"), testProfile, ingestedAt); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 

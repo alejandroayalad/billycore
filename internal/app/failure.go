@@ -25,6 +25,11 @@ const (
 	// rather than a bad artifact.
 	classClaim = "CLAIM"
 
+	// classDispatch — the artifact reached no parser. The profile is missing,
+	// unsupported, or has no parser yet; or the artifact is not the format the
+	// profile expects.
+	classDispatch = "DISPATCH"
+
 	// classStore — the Claim was valid and could not be written.
 	classStore = "STORE"
 )

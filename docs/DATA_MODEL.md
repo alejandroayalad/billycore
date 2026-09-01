@@ -293,6 +293,26 @@ meaning.
 | `account_identifier` | `NULL` | `1234` | `LOW` |
 | `direction` | `NULL` | `OUTFLOW` | `HIGH` |
 | `financial_status` | `NULL` | `PENDING` | `HIGH` |
+| `occurred_at` | `NULL` | `2026-08-23T…Z` | `MEDIUM` |
+| `tracking_key` | `NULL` | `NU3AG95…` | `HIGH` |
+| `counterparty` | `NULL` | `A. García` | `HIGH` |
+
+The vocabulary is nine names, a closed set the domain owns (D33, D36, D61):
+
+- **`occurred_at`** is when the artifact said the event happened, UTC RFC 3339.
+  It can be absent — a card-payment email states no date, and a statement row
+  states a day only — and its absence is what the Transaction fallback fills
+  (§4.5). It is never present with a `null` value.
+- **`tracking_key`** is the SPEI `Clave de rastreo`, kept verbatim, present where
+  the artifact states one. A statement states one on almost every SPEI movement,
+  in both directions — it is no longer an outflow-only field — so it is the
+  strongest reconciliation signal (§6). It has no Transaction column: a reader
+  reaches it through `claim_transaction` (D66).
+- **`counterparty`** is the person or the institution on the other side of a
+  movement (D61). It is not the merchant: a merchant is a place where something
+  was bought, and a counterparty is the other side of a transfer. It carries the
+  reserved value `urn:billy:self` when both sides are the user (D62, D65), which
+  marks an internal movement.
 
 If Billy has no Claim for a field, no row exists. This preserves the difference between
 *account is missing* and *account = 1234 with LOW confidence*.
@@ -307,15 +327,22 @@ CREATE TABLE transactions (
     amount_minor            INTEGER,
     currency                TEXT,
     merchant                TEXT,
+    counterparty            TEXT,
     account_identifier      TEXT,
     direction               TEXT NOT NULL,
     financial_status        TEXT NOT NULL,
     reconciliation_state    TEXT NOT NULL,
+    transaction_state       TEXT NOT NULL,
     occurred_at             TEXT NOT NULL,
     created_at              TEXT NOT NULL,
     updated_at              TEXT NOT NULL
 ) STRICT;
 ```
+
+**`counterparty`** is nullable and holds the person or the institution on the other
+side of the movement, preserved from the Claim (D66). It is not the merchant. It carries
+the reserved value `urn:billy:self` for an internal movement — money between the user's
+own accounts (D62, D65). `transaction_state` is the lifecycle from D49.
 
 ```
 direction:             INFLOW · OUTFLOW
@@ -339,6 +366,13 @@ Evidence. This gives Transactions a stable value for cursor pagination.
 
 The fallback is calculated before writing the Transaction. It is not calculated inside
 SQL queries.
+
+**Internal movements.** A Transaction whose `counterparty` is `urn:billy:self` is a
+movement between the user's own accounts — a Cajita or a `dinero de respaldo` movement
+(D55, D63). It is a real Transaction: it keeps its true direction, it stays in the
+history, and its Evidence is not hidden. It is only excluded from the income and spending
+totals, because the money did not enter or leave the user's control (D67). The totals
+read model, at `GET /v1/transactions/summary`, is where that exclusion happens.
 
 ### 4.6 Transaction provenance
 
@@ -616,25 +650,40 @@ their representation is still an open question. The schema must not invent that 
 > `relationships` is removed or changed in API.md. A schema is not invented here only to
 > satisfy the current API document.
 
-**Reconciliation candidates.** `reconciliation_candidate` is intentionally not finalized
-in this document. The unresolved question is what each side identifies — Claim /
-Evidence, or Transaction. Those are different domain models and require different
-foreign keys. DATA_MODEL.md will not choose between them.
+**Reconciliation candidates.** A `reconciliation_candidate` pairs two Transactions and
+records a status. `left_ref` and `right_ref` are `transactions.id`; the status is
+`MATCH`, `NO_MATCH` or `AMBIGUOUS` (DOMAIN.md §6, D69). The Transaction is Billy's
+representation of one event and carries every signal the comparison uses, so the
+candidate points at it rather than at a Claim or a piece of Evidence.
 
-Once the domain decision is made, the reconciliation tables and their indexes can be
-added through a migration.
+```sql
+CREATE TABLE reconciliation_candidate (
+    id          TEXT PRIMARY KEY NOT NULL,
+    left_ref    TEXT NOT NULL,
+    right_ref   TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    FOREIGN KEY (left_ref)  REFERENCES transactions(id) ON DELETE RESTRICT,
+    FOREIGN KEY (right_ref) REFERENCES transactions(id) ON DELETE RESTRICT
+) STRICT;
+```
+
+The table and its indexes are added by a migration when reconciliation is built. What a
+`MATCH` does to the two Transactions — one survives and the other is retired through
+`superseded_by_transaction_id` (D49), or both stay and are linked — is the remaining
+decision.
 
 ---
 
 ## 10. Open questions
 
-**1. What does a reconciliation candidate reference?**
+**1. ~~What does a reconciliation candidate reference?~~ Closed by D69.**
 
-The domain currently describes reconciliation between Claims or pieces of Evidence. The
-API design has used Transaction IDs. This must be settled before defining
-`reconciliation_candidate.left_ref` and `right_ref`.
-
-No generic untyped reference is added as a workaround.
+`reconciliation_candidate.left_ref` and `right_ref` are `transactions.id` (§9). The
+Transaction carries every signal DOMAIN.md §6 compares, and the rest of the system
+already speaks in Transaction ids. A Claim reference or an Evidence reference was
+rejected: the first fights the Transaction-centric API, and one statement PDF is one
+Evidence with about 180 movements, so an Evidence pair cannot say which movement matched.
 
 **2. Can Evidence be deleted?**
 
@@ -652,6 +701,7 @@ is created until that decision exists.
 ## Initial schema
 
 The first migration consists of the finalized tables and indexes above. The
-reconciliation schema is added only after its domain reference type is settled.
+reconciliation schema — the `reconciliation_candidate` table of §9 — is added by its own
+migration when reconciliation is built (D69).
 
 > SQLite stores the domain. It does not define the domain.

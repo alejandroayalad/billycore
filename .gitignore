@@ -11,3 +11,10 @@ credentials.json
 
 # OS
 .DS_Store
+
+# Real statements and unredacted extraction output. A fixture in a testdata/
+# directory is redacted and public; the corpus it came from never enters git.
+# AGENTS.md §3 rule 8, SECURITY.md §10, D54.
+*.pdf
+/testdata/statements/
+*.raw.xhtml

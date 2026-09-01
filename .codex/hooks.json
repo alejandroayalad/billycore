@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'.codex/hooks/session-digest.sh'",
+            "timeout": 180,
+            "statusMessage": "Recording the session digest"
+          }
+        ]
+      }
+    ]
+  }
+}

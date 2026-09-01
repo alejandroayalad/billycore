@@ -50,9 +50,29 @@ func (m Money) Add(other Money) (Money, error) {
 	return Money{minor: m.minor + other.minor, currency: m.currency}, nil
 }
 
-// String renders the raw minor amount and the code — never a decimal.
+// String renders the raw minor amount and the code, such as "89993 MXN".
 //
-// Rendering a decimal needs the currency's minor-unit exponent, and where that
-// table comes from is API.md open question 8. Until it is answered, nothing in
-// the domain pretends to know it.
+// It stays the unambiguous form for a log or an error, where the exact stored
+// integer is what a reader needs. Decimal is the form a person reads.
 func (m Money) String() string { return fmt.Sprintf("%d %s", m.minor, m.currency) }
+
+// Decimal renders the amount for a person to read, such as "899.93 MXN".
+//
+// It uses the minor-unit exponent of the currency (D50). Money is never
+// negative, so there is no sign to place.
+func (m Money) Decimal() string {
+	exponent, ok := m.currency.Exponent()
+	if !ok {
+		// Unreachable: NewMoney validated the currency. A currency that left
+		// the table after a row was written must not render as a wrong amount.
+		return m.String()
+	}
+	if exponent == 0 {
+		return fmt.Sprintf("%d %s", m.minor, m.currency)
+	}
+	divisor := int64(1)
+	for i := 0; i < exponent; i++ {
+		divisor *= 10
+	}
+	return fmt.Sprintf("%d.%0*d %s", m.minor/divisor, exponent, m.minor%divisor, m.currency)
+}

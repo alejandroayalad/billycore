@@ -21,6 +21,7 @@ import (
 
 	"github.com/alejandroayalad/billycore/internal/adapter/api"
 	"github.com/alejandroayalad/billycore/internal/adapter/config"
+	"github.com/alejandroayalad/billycore/internal/adapter/parser/profile"
 	"github.com/alejandroayalad/billycore/internal/adapter/source/gmail"
 	"github.com/alejandroayalad/billycore/internal/adapter/store/sqlite"
 	"github.com/alejandroayalad/billycore/internal/app"
@@ -64,10 +65,12 @@ func run() error {
 			return runAuth(args)
 		case "peek":
 			return runPeek(args)
+		case "tx":
+			return runTx(args)
 		case "serve":
 			return runServe(args)
 		default:
-			return fmt.Errorf("unknown command %q (commands: serve, auth, peek)", cmd)
+			return fmt.Errorf("unknown command %q (commands: serve, auth, peek, tx)", cmd)
 		}
 	}
 	return runServe(os.Args[1:])
@@ -115,7 +118,7 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	if len(targets) == 0 {
+	if len(sources) == 0 {
 		// Not a startup failure: BillyCore serves, and every sync answers 404
 		// until a Source is configured (D26).
 		slog.Warn("no Source is configured: every sync will answer 404",
@@ -123,9 +126,23 @@ func runServe(args []string) error {
 	}
 
 	evidence := sqlite.NewEvidenceRepository(db)
-	server := api.NewServer(app.NewIngestor(evidence), evidence, targets, db)
 
-	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(targets))
+	// The pipeline: one background worker draining extraction and then
+	// Transaction construction, woken by whoever records Evidence (D45).
+	// One queue object serving both stages. They are separate ports because they
+	// are consumed by separate use cases (D6), not because two things move rows
+	// through one table.
+	queue := sqlite.NewEvidenceQueue(db)
+	extractor := app.NewExtractor(queue, sqlite.NewClaimRepository(db), profile.New())
+	transactions := sqlite.NewTransactionRepository(db)
+	reconciler := app.NewReconciler(queue, transactions)
+	matcher := app.NewMatcher(sqlite.NewReconciliationRepository(db))
+	pipelineWake, wakePipeline := newWakeSignal()
+	worker := newPipelineWorker(extractor, reconciler, matcher, pipelineWake)
+
+	server := api.NewServer(app.NewIngestor(evidence), evidence, transactions, configuredSources(sources), targets, db, wakePipeline)
+
+	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(sources))
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -133,8 +150,20 @@ func runServe(args []string) error {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signalled, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// The worker runs under a context this function can end, not only one a
+	// signal can: a listener that dies must take the pipeline down with it
+	// rather than leaving a worker draining a database nobody is serving from.
+	ctx, cancel := context.WithCancel(signalled)
+	defer cancel()
+
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		worker.Run(ctx)
+	}()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -143,17 +172,35 @@ func runServe(args []string) error {
 		}
 	}()
 
+	var serveErr error
 	select {
-	case err := <-errCh:
-		return err
+	case serveErr = <-errCh:
 	case <-ctx.Done():
 		slog.Info("shutting down")
-		// A sync in flight may be most of the way through a mailbox. Give it
-		// room to finish rather than abandoning work that is already fetched.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
 	}
+
+	// Cancelling first is what lets the worker stop cleanly: Extractor and
+	// Reconciler release rows they claimed and had not yet attempted, so a
+	// restart finds them claimable at once instead of waiting out a lease.
+	cancel()
+
+	// A sync in flight may be most of the way through a mailbox. Give it room
+	// to finish rather than abandoning work that is already fetched. The same
+	// grace bounds the wait for the worker: one budget for the shutdown, not
+	// one per goroutine.
+	shutdownCtx, done := context.WithTimeout(context.Background(), shutdownGrace)
+	defer done()
+	shutdownErr := srv.Shutdown(shutdownCtx)
+
+	select {
+	case <-workerDone:
+	case <-shutdownCtx.Done():
+		// It is mid-batch and holding leases. They lapse on their own within a
+		// minute, which is the whole reason the lock is a timestamp (D39).
+		slog.Warn("the pipeline worker did not stop within the shutdown grace")
+	}
+
+	return errors.Join(serveErr, shutdownErr)
 }
 
 // syncTargets turns configuration into something the API can sync.
@@ -168,7 +215,7 @@ func syncTargets(sources []config.Source, dir string) (map[string]api.SyncTarget
 		case domain.SourceGmail:
 			query := source.Query
 			targets[source.ID] = api.SyncTarget{
-				Source: app.Source{ID: source.ID, Type: source.Type},
+				Source: app.Source{ID: source.ID, Type: source.Type, Profile: source.ExtractionProfile},
 				Fetcher: func(ctx context.Context) (app.SourceFetcher, error) {
 					client, err := gmail.NewClient(ctx, dir)
 					if err != nil {
@@ -177,6 +224,10 @@ func syncTargets(sources []config.Source, dir string) (map[string]api.SyncTarget
 					return gmail.NewFetcher(client, query), nil
 				},
 			}
+		case domain.SourceBankStatement, domain.SourceManual:
+			// Direct Sources are configured so POST /v1/evidence can resolve
+			// their type and profile. They have no fetcher (D53).
+			continue
 		default:
 			// Configuration that names a Source kind BillyCore cannot fetch is
 			// a startup error, not a 404 discovered later.
@@ -184,6 +235,16 @@ func syncTargets(sources []config.Source, dir string) (map[string]api.SyncTarget
 		}
 	}
 	return targets, nil
+}
+
+func configuredSources(sources []config.Source) map[string]app.Source {
+	configured := make(map[string]app.Source, len(sources))
+	for _, source := range sources {
+		configured[source.ID] = app.Source{
+			ID: source.ID, Type: source.Type, Profile: source.ExtractionProfile,
+		}
+	}
+	return configured
 }
 
 // defaultDataDir is ~/.billy — one predictable location the user can name, back

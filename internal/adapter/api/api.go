@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/alejandroayalad/billycore/internal/app"
+	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
 // timeLayout is API.md §1's timestamp: RFC 3339, always UTC, always with
@@ -43,10 +44,22 @@ type SyncTarget struct {
 
 // Server holds what the handlers need. One per process.
 type Server struct {
-	ingestor *app.Ingestor
-	evidence app.EvidenceRepository
-	sources  map[string]SyncTarget
-	storage  Pinger
+	ingestor     *app.Ingestor
+	evidence     app.EvidenceRepository
+	transactions app.TransactionReader
+	sources      map[string]app.Source
+	syncTargets  map[string]SyncTarget
+	storage      Pinger
+
+	// onEvidenceAvailable is called after Evidence has been recorded, and it is
+	// how the pipeline learns there is something to do. Deliberately unnamed
+	// about *which* Evidence and deliberately not about sync: POST /v1/evidence
+	// will call the same callback, and so will anything else that writes an
+	// artifact. It is a notification, not a handoff — the work happens on a
+	// background pass, and this handler does not wait for it (D45).
+	//
+	// Nil is valid and means nothing is listening.
+	onEvidenceAvailable func()
 
 	// syncing guards against two syncs of one Source overlapping — API.md §5
 	// promises a 409 for that, and without it the second one would re-list the
@@ -55,13 +68,16 @@ type Server struct {
 	syncing map[string]bool
 }
 
-func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, sources map[string]SyncTarget, storage Pinger) *Server {
+func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, transactions app.TransactionReader, sources map[string]app.Source, syncTargets map[string]SyncTarget, storage Pinger, onEvidenceAvailable func()) *Server {
 	return &Server{
-		ingestor: ingestor,
-		evidence: evidence,
-		sources:  sources,
-		storage:  storage,
-		syncing:  map[string]bool{},
+		ingestor:            ingestor,
+		evidence:            evidence,
+		transactions:        transactions,
+		sources:             sources,
+		syncTargets:         syncTargets,
+		storage:             storage,
+		onEvidenceAvailable: onEvidenceAvailable,
+		syncing:             map[string]bool{},
 	}
 }
 
@@ -73,7 +89,10 @@ func (s *Server) Handler(token string) http.Handler {
 
 	v1 := http.NewServeMux()
 	v1.HandleFunc("POST /v1/sources/{id}/sync", s.handleSync)
+	v1.HandleFunc("POST /v1/evidence", s.handlePostEvidence)
 	v1.HandleFunc("GET /v1/evidence/{id}", s.handleGetEvidence)
+	v1.HandleFunc("GET /v1/transactions", s.handleListTransactions)
+	v1.HandleFunc("GET /v1/transactions/summary", s.handleTransactionTotals)
 	mux.Handle("/v1/", authenticate(token, v1))
 
 	return recoverPanics(logRequests(mux))
@@ -108,13 +127,24 @@ type syncResponse struct {
 // imply an asynchronous HTTP contract: sync records Evidence, and extraction
 // advances behind it on its own pass. There is no job resource and nothing to
 // poll.
+//
+// The counts it answers with are therefore about *recording*, not about
+// interpreting. A sync that reports three Evidence created has created three
+// artifacts; whether they have become Claims yet is a question for the moment
+// after the pipeline has drained, and the response deliberately does not
+// pretend to answer it.
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	sourceID := r.PathValue("id")
 
-	target, configured := s.sources[sourceID]
+	_, configured := s.sources[sourceID]
 	if !configured {
 		// The Source is not in sources.json (D26).
 		writeError(w, http.StatusNotFound, typeNotFound, "No such Source is configured.")
+		return
+	}
+	target, fetchable := s.syncTargets[sourceID]
+	if !fetchable {
+		writeError(w, http.StatusConflict, typeConflict, "This Source does not support synchronization.")
 		return
 	}
 	if !s.beginSync(sourceID) {
@@ -142,6 +172,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, typeInternalError,
 			"The sync did not complete. Evidence recorded before the failure was kept; running it again resumes.")
 		return
+	}
+
+	// Only after a sync that completed. A failed one has left Evidence behind
+	// too — the ingestor keeps what it recorded before the failure — but that
+	// artifact is picked up by the retry tick rather than by a wake, and waking
+	// on a failure would mean every unreachable Source drove the pipeline.
+	if s.onEvidenceAvailable != nil {
+		s.onEvidenceAvailable()
 	}
 
 	writeJSON(w, http.StatusOK, syncResponse{
@@ -201,6 +239,10 @@ func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeJSON(w, http.StatusOK, evidenceRepresentation(evidence, true))
+}
+
+func evidenceRepresentation(evidence domain.Evidence, includeRaw bool) evidenceResponse {
 	response := evidenceResponse{
 		ID:                evidence.ID(),
 		SourceID:          evidence.SourceID(),
@@ -209,10 +251,10 @@ func (s *Server) handleGetEvidence(w http.ResponseWriter, r *http.Request) {
 		ContentType:       evidence.ContentType(),
 		ContentBytes:      evidence.ContentBytes(),
 	}
-	if evidence.HasRawContent() {
+	if includeRaw && evidence.HasRawContent() {
 		response.RawContent = base64.StdEncoding.EncodeToString(evidence.RawContent())
 	}
-	writeJSON(w, http.StatusOK, response)
+	return response
 }
 
 // logRequests records what was asked and what was answered. Method, path,

@@ -147,6 +147,16 @@ earns its place (D5, D6).
 - English for code, comments, commits, and documentation.° The repository is going
   public.
 
+**Comments follow [ASD-STE100](https://www.asd-ste100.org/) and are at most five lines.**
+Simplified Technical English: short sentences, active voice, present tense, one idea per
+sentence, and the same word for the same thing every time. No metaphor, no argument with
+itself, no aside. If the reasoning needs more than five lines, it belongs in `docs/` or
+in a `DECISIONS.md` entry, and the comment names that entry instead.
+
+The rule exists because the reader may not be a native English speaker, and because a
+comment that has to be read twice is a comment that will be skipped. §9's tone governs
+the documents; this governs the code.
+
 **Commit messages:** Conventional Commits — `feat:`, `fix:`, `docs:`, `test:`, `chore:`.°
 Branch naming is unconstrained while the project is solo.°
 
@@ -179,6 +189,7 @@ Set on 2026-08-23 without confirmation. Each is cheap to change.
 | §5 | `billysat/` and `billyagent/` are untouchable until BillyCore ships |
 | §7 | `go build && go vet && go test` is the check command |
 | §8 | English everywhere in the repository |
+| §8 | ASD-STE100 comments, five lines maximum |
 | §8 | Conventional Commits |
 | §8 | Branch naming unconstrained |
 | §9 | Agents push back before implementing, not after |

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alejandroayalad/billycore/internal/adapter/parser/profile"
 	"github.com/alejandroayalad/billycore/internal/domain"
 )
 
@@ -21,7 +22,8 @@ func writeSources(t *testing.T, content string) string {
 func TestLoadSources(t *testing.T) {
 	dir := writeSources(t, `{
 	  "sources": [
-	    { "id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx" }
+	    { "id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx",
+	      "extraction_profile": "NU_EMAIL_V1" }
 	  ]
 	}`)
 
@@ -32,7 +34,12 @@ func TestLoadSources(t *testing.T) {
 	if len(sources) != 1 {
 		t.Fatalf("loaded %d sources, want 1", len(sources))
 	}
-	want := Source{ID: "gmail_primary", Type: domain.SourceGmail, Query: "from:nu@nu.com.mx"}
+	want := Source{
+		ID:                "gmail_primary",
+		Type:              domain.SourceGmail,
+		Query:             "from:nu@nu.com.mx",
+		ExtractionProfile: profile.NuEmailV1,
+	}
 	if sources[0] != want {
 		t.Errorf("source = %+v, want %+v", sources[0], want)
 	}
@@ -60,23 +67,34 @@ func TestLoadSourcesRejectsBadConfiguration(t *testing.T) {
 			says:    "not valid JSON",
 		},
 		"no id": {
-			content: `{"sources": [{"type": "GMAIL", "query": "from:nu@nu.com.mx"}]}`,
+			content: `{"sources": [{"type": "GMAIL", "query": "from:nu@nu.com.mx", "extraction_profile": "NU_EMAIL_V1"}]}`,
 			says:    "no id",
 		},
 		"duplicate id": {
 			content: `{"sources": [
-			  {"id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx"},
-			  {"id": "gmail_primary", "type": "GMAIL", "query": "from:hsbc@hsbc.com.mx"}
+			  {"id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx", "extraction_profile": "NU_EMAIL_V1"},
+			  {"id": "gmail_primary", "type": "GMAIL", "query": "from:hsbc@hsbc.com.mx", "extraction_profile": "NU_EMAIL_V1"}
 			]}`,
 			says: "twice",
 		},
 		"unknown type": {
-			content: `{"sources": [{"id": "whatsapp", "type": "WHATSAPP", "query": "x"}]}`,
+			content: `{"sources": [{"id": "whatsapp", "type": "WHATSAPP", "query": "x", "extraction_profile": "NU_EMAIL_V1"}]}`,
 			says:    "not a known kind of Source",
 		},
 		"gmail without a query": {
-			content: `{"sources": [{"id": "gmail_primary", "type": "GMAIL"}]}`,
+			content: `{"sources": [{"id": "gmail_primary", "type": "GMAIL", "extraction_profile": "NU_EMAIL_V1"}]}`,
 			says:    "no query",
+		},
+		// The profile names the parser. A Source with none records artifacts
+		// that nothing reads, and a name with a typo does the same.
+		"no extraction profile": {
+			content: `{"sources": [{"id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx"}]}`,
+			says:    "no extraction_profile",
+		},
+		"unsupported extraction profile": {
+			content: `{"sources": [{"id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx",
+			  "extraction_profile": "NU_EMAIL_V2"}]}`,
+			says: "does not support",
 		},
 	}
 	for name, tc := range cases {

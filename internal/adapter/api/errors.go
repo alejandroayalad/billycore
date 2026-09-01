@@ -39,6 +39,7 @@ const (
 	typeInvariantViolated = "invariant_violation"
 	typeInternalError     = "internal_error"
 	typeUnavailable       = "unavailable"
+	typePayloadTooLarge   = "payload_too_large"
 )
 
 // writeError sends the envelope. `violations` is present on 400 and 422 and

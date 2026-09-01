@@ -1,10 +1,18 @@
 package sqlite
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/alejandroayalad/billycore/internal/app"
 )
+
+// testProfile is the reading contract these tests store. The store never
+// interprets the value, so one name serves every case that is not about the
+// profile itself.
+const testProfile = app.ExtractionProfile("NU_EMAIL_V1")
 
 func testDBPath(t *testing.T) string {
 	t.Helper()
@@ -42,8 +50,8 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&userVersion); err != nil {
 		t.Fatalf("user_version: %v", err)
 	}
-	if userVersion != 3 {
-		t.Errorf("user_version = %d, want 3 after migration 003", userVersion)
+	if userVersion != 9 {
+		t.Errorf("user_version = %d, want 9 after migration 009", userVersion)
 	}
 
 	for _, table := range []string{"evidence", "domain_event"} {
@@ -65,9 +73,16 @@ func TestOpenAppliesPragmasAndSchema(t *testing.T) {
 // A table appearing early is a schema nobody has exercised, and
 // DATA_MODEL.md §4 is not a build list.
 //
-// 002 brought the claim tables because M2 writes to them. `transactions` and
-// `transaction_evidence` are specified in §4.5 and §4.6 and still have no code
-// behind them, so they must still be absent.
+// This test asserted the absence of `transactions` and `transaction_evidence`
+// through migrations 002 and 003. It now asserts their presence, because
+// migration 004 arrived with `internal/app/reconcile.go` — the code that writes
+// to them. The rule did not change; the code caught up with the document.
+//
+// It asserted the absence of `reconciliation_candidate` too, through migration
+// 008. It now asserts its presence, because migration 009 arrived with
+// `internal/adapter/store/sqlite/reconciliation.go` — the code that writes to
+// it (D69, D70). The rule caught up with the document a second time; the domain
+// settled what a candidate references, so the columns exist and are exercised.
 func TestMigrationsCreateNoUnusedTables(t *testing.T) {
 	db, err := Open(testDBPath(t))
 	if err != nil {
@@ -75,12 +90,85 @@ func TestMigrationsCreateNoUnusedTables(t *testing.T) {
 	}
 	defer db.Close()
 
-	for _, table := range []string{"transactions", "transaction_evidence"} {
+	for _, table := range []string{"reconciliation_candidate"} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
-		if err == nil {
-			t.Errorf("table %s exists, and nothing writes to it yet", table)
+		if err != nil {
+			t.Errorf("table %s missing, and reconciliation.go writes to it: %v", table, err)
 		}
+	}
+}
+
+// Migration 004 creates what the Transaction aggregate needs: the row, its
+// provenance to Evidence, and the slot that makes building one idempotent.
+//
+// It exercises the tables rather than only looking them up in sqlite_master. A
+// schema nobody has inserted into is a schema nobody has tested, and the two
+// facts worth proving here are physical: Money's halves are nullable together,
+// and `claim_transaction`'s primary key rejects a second Transaction for one
+// Claim (D41).
+func TestMigration004CreatesTheTransactionTables(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	for _, table := range []string{"transactions", "transaction_evidence", "claim_transaction"} {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name); err != nil {
+			t.Errorf("table %s missing: %v", table, err)
+		}
+	}
+	for _, index := range []string{
+		"idx_transactions_cursor",
+		"idx_transaction_evidence_by_evidence",
+		"idx_claim_transaction_by_transaction",
+	} {
+		var name string
+		if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&name); err != nil {
+			t.Errorf("index %s missing: %v", index, err)
+		}
+	}
+
+	// A Transaction with no amount is a legitimate row (DATA_MODEL.md §4.5).
+	// The domain forbids half a Money; the schema deliberately does not, which
+	// is what this asserts — the invariant lives in one place (D6), and it is
+	// not here.
+	if _, err := db.Exec(`
+		INSERT INTO transactions (
+			id, amount_minor, currency, merchant, account_identifier,
+			direction, financial_status, reconciliation_state,
+			occurred_at, created_at, updated_at
+		) VALUES ('tx-1', NULL, NULL, NULL, NULL, 'OUTFLOW', 'UNKNOWN', 'UNRECONCILED',
+			'2026-08-16T23:44:00.000Z', '2026-08-26T12:00:00.000Z', '2026-08-26T12:00:00.000Z')`,
+	); err != nil {
+		t.Fatalf("a Transaction without Money is valid storage: %v", err)
+	}
+
+	// The slot is the natural key. A second Transaction built from one Claim is
+	// the duplicate that puts the same money in the table twice, and the
+	// primary key is what refuses it — not a code path that remembered to look.
+	mustExec(t, db, `INSERT INTO evidence (id, source_id, source_type, source_reference, content_type, raw_content, observed_at, created_at, processing_stage)
+		VALUES ('ev-1', 'gmail_primary', 'EMAIL', 'msg-1', 'message/rfc822', x'00', '2026-08-16T23:44:00.000Z', '2026-08-26T12:00:00.000Z', 'EXTRACTED')`)
+	mustExec(t, db, `INSERT INTO claims (id, state, created_at, updated_at)
+		VALUES ('claim-1', 'ACTIVE', '2026-08-26T12:00:00.000Z', '2026-08-26T12:00:00.000Z')`)
+	mustExec(t, db, `INSERT INTO transaction_evidence (transaction_id, evidence_id) VALUES ('tx-1', 'ev-1')`)
+	mustExec(t, db, `INSERT INTO claim_transaction (claim_id, transaction_id) VALUES ('claim-1', 'tx-1')`)
+
+	mustExec(t, db, `
+		INSERT INTO transactions (id, direction, financial_status, reconciliation_state, occurred_at, created_at, updated_at)
+		VALUES ('tx-2', 'OUTFLOW', 'UNKNOWN', 'UNRECONCILED',
+			'2026-08-16T23:44:00.000Z', '2026-08-26T12:00:00.000Z', '2026-08-26T12:00:00.000Z')`)
+	if _, err := db.Exec(`INSERT INTO claim_transaction (claim_id, transaction_id) VALUES ('claim-1', 'tx-2')`); err == nil {
+		t.Error("a second Transaction for one Claim was accepted; claim_transaction's primary key is the whole idempotency (D41)")
+	}
+}
+
+func mustExec(t *testing.T, db *sql.DB, query string, args ...any) {
+	t.Helper()
+	if _, err := db.Exec(query, args...); err != nil {
+		t.Fatalf("exec: %v", err)
 	}
 }
 
@@ -252,9 +340,10 @@ func TestOpenTightensAWidenedFile(t *testing.T) {
 	}
 }
 
-// Migration 003 creates the constraint that makes extraction idempotent. The
-// primary key is the whole point: it is what a second pass collides with.
-func TestMigration003CreatesTheActiveClaimConstraint(t *testing.T) {
+// Migration 005 moves the constraint one level higher. The artifact points at
+// one interpretation, and that interpretation holds one or many Claims (D46,
+// D47).
+func TestMigration005CreatesTheActiveInterpretationConstraint(t *testing.T) {
 	db, err := Open(testDBPath(t))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -266,23 +355,230 @@ func TestMigration003CreatesTheActiveClaimConstraint(t *testing.T) {
 	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
 		t.Fatalf("seed evidence: %v", err)
 	}
+	for _, id := range []string{"i-1", "i-2"} {
+		if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+			VALUES (?, 'ev-1', '2026-08-26T00:00:00.000Z')`, id); err != nil {
+			t.Fatalf("seed interpretation %s: %v", id, err)
+		}
+	}
+
+	if _, err := db.Exec(`INSERT INTO evidence_active_interpretation (evidence_id, interpretation_id) VALUES ('ev-1', 'i-1')`); err != nil {
+		t.Fatalf("first active interpretation: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO evidence_active_interpretation (evidence_id, interpretation_id) VALUES ('ev-1', 'i-2')`); err == nil {
+		t.Error("the database accepted two active interpretations for one artifact")
+	}
+
+	// The pointer cannot name an interpretation or an artifact that does not
+	// exist.
+	if _, err := db.Exec(`INSERT INTO evidence_active_interpretation (evidence_id, interpretation_id) VALUES ('ev-missing', 'i-2')`); err == nil {
+		t.Error("the database accepted an active interpretation for evidence that does not exist")
+	}
+
+	// Many Claims in one interpretation. Migration 003 could not do this.
 	for _, id := range []string{"c-1", "c-2"} {
 		if _, err := db.Exec(`INSERT INTO claims (id, state, created_at, updated_at)
 			VALUES (?, 'ACTIVE', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z')`, id); err != nil {
 			t.Fatalf("seed claim %s: %v", id, err)
 		}
+		if _, err := db.Exec(`INSERT INTO interpretation_claims (interpretation_id, claim_id) VALUES ('i-1', ?)`, id); err != nil {
+			t.Fatalf("membership for %s: %v — one interpretation must hold many claims", id, err)
+		}
 	}
 
-	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-1', 'c-1')`); err != nil {
-		t.Fatalf("first active claim: %v", err)
+	// The table from 003 is gone, so a query that still reads it fails.
+	var name string
+	if err := db.QueryRow(
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_active_claim'`).Scan(&name); err == nil {
+		t.Error("evidence_active_claim survived migration 005")
 	}
-	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-1', 'c-2')`); err == nil {
-		t.Error("the database accepted two active claims for one artifact")
+}
+
+// The lineage that D47 needs: what Billy believes now, and what Billy believed
+// before.
+func TestMigration005RecordsInterpretationLineage(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	for _, id := range []string{"i-1", "i-2"} {
+		if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+			VALUES (?, 'ev-1', '2026-08-26T00:00:00.000Z')`, id); err != nil {
+			t.Fatalf("seed interpretation %s: %v", id, err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE interpretations SET superseded_by_interpretation_id = 'i-2' WHERE id = 'i-1'`); err != nil {
+		t.Fatalf("record lineage: %v", err)
+	}
+	// The value must be an interpretation that exists, and not any string.
+	if _, err := db.Exec(`UPDATE interpretations SET superseded_by_interpretation_id = 'i-missing' WHERE id = 'i-1'`); err == nil {
+		t.Error("the database accepted lineage pointing at an interpretation that does not exist")
+	}
+}
+
+// D49 — a Transaction's own lifecycle, separate from its reconciliation state.
+func TestMigration005AddsTheTransactionLifecycle(t *testing.T) {
+	db, err := Open(testDBPath(t))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	for _, column := range []string{"transaction_state", "superseded_by_transaction_id"} {
+		var n int
+		if err := db.QueryRow(
+			`SELECT count(*) FROM pragma_table_info('transactions') WHERE name = ?`, column).Scan(&n); err != nil {
+			t.Fatalf("read table info: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("transactions has no %s column", column)
+		}
 	}
 
-	// Provenance is a real reference, not a promise: the pointer cannot name a
-	// Claim or an artifact that does not exist.
-	if _, err := db.Exec(`INSERT INTO evidence_active_claim (evidence_id, claim_id) VALUES ('ev-missing', 'c-2')`); err == nil {
-		t.Error("the database accepted an active claim for evidence that does not exist")
+	// reconciliation_state keeps its three values. The two columns answer
+	// different questions, which is the argument in D49.
+	var notNull int
+	if err := db.QueryRow(
+		`SELECT "notnull" FROM pragma_table_info('transactions') WHERE name = 'transaction_state'`).Scan(&notNull); err != nil {
+		t.Fatalf("read table info: %v", err)
+	}
+	if notNull != 1 {
+		t.Error("transaction_state is nullable; a row that is neither current nor superseded is not a state")
+	}
+}
+
+// Migration 006 gives each artifact the profile that reads it, and each reading
+// the profile that made it (D51 — statement extraction needs both).
+//
+// This is not hypothetical. `~/.billy/billy.db` holds 1,044 Evidence rows and
+// 800 interpretations written before this migration, and every one of them is
+// Nu email that NU_EMAIL_V1 reads (CONTEXT.md §3.1).
+func TestMigration006BackfillsTheExtractionProfile(t *testing.T) {
+	path := testDBPath(t)
+
+	// A database at migration 005, as the email half of M2 left it.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version > 5 {
+			break
+		}
+		if err := applyMigration(db, m); err != nil {
+			t.Fatalf("apply %s: %v", m.name, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+		VALUES ('i-1', 'ev-1', '2026-08-26T00:00:00.000Z')`); err != nil {
+		t.Fatalf("seed interpretation: %v", err)
+	}
+	db.Close()
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a v5 database: %v", err)
+	}
+	defer upgraded.Close()
+
+	for _, tc := range []struct{ what, query string }{
+		{"evidence", `SELECT extraction_profile FROM evidence WHERE id = 'ev-1'`},
+		{"interpretation", `SELECT extraction_profile FROM interpretations WHERE id = 'i-1'`},
+	} {
+		var got string
+		if err := upgraded.QueryRow(tc.query).Scan(&got); err != nil {
+			t.Fatalf("read %s profile: %v", tc.what, err)
+		}
+		if got != "NU_EMAIL_V1" {
+			t.Errorf("%s profile = %q, want NU_EMAIL_V1", tc.what, got)
+		}
+	}
+
+	// The column on evidence is configuration, so it is nullable: a Source that
+	// names no profile records rows that fail extraction with a named reason.
+	if _, err := upgraded.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-2', 's', 'MANUAL', 'r-2', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("insert evidence with no profile: %v", err)
+	}
+	var profile sql.NullString
+	if err := upgraded.QueryRow(`SELECT extraction_profile FROM evidence WHERE id = 'ev-2'`).Scan(&profile); err != nil {
+		t.Fatalf("read evidence profile: %v", err)
+	}
+	if profile.Valid {
+		t.Errorf("evidence profile = %q, want NULL for a row no Source configuration reached", profile.String)
+	}
+}
+
+// Migration 007 gives each reading the count of the movements it did not read.
+//
+// The default is the migration's whole argument: every reading written before
+// it is of one Nu email, and an email is one movement that the parser reads or
+// does not recognise at all. Zero is the true value for all 800 of them (D59).
+func TestMigration007DefaultsUnreadRowsToZero(t *testing.T) {
+	path := testDBPath(t)
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatalf("loadMigrations: %v", err)
+	}
+	for _, m := range migrations {
+		if m.version > 6 {
+			break
+		}
+		if err := applyMigration(db, m); err != nil {
+			t.Fatalf("apply %s: %v", m.name, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO evidence (
+		id, source_id, source_type, source_reference, observed_at, created_at, processing_stage
+	) VALUES ('ev-1', 's', 'GMAIL', 'r-1', '2026-08-26T00:00:00.000Z', '2026-08-26T00:00:00.000Z', 'RECEIVED')`); err != nil {
+		t.Fatalf("seed evidence: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO interpretations (id, evidence_id, created_at)
+		VALUES ('i-1', 'ev-1', '2026-08-26T00:00:00.000Z')`); err != nil {
+		t.Fatalf("seed interpretation: %v", err)
+	}
+	db.Close()
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a v6 database: %v", err)
+	}
+	defer upgraded.Close()
+
+	var unread int
+	if err := upgraded.QueryRow(`SELECT unread_rows FROM interpretations WHERE id = 'i-1'`).Scan(&unread); err != nil {
+		t.Fatalf("read unread_rows: %v", err)
+	}
+	if unread != 0 {
+		t.Errorf("unread_rows = %d on a reading from before the migration, want 0", unread)
+	}
+
+	// The column is NOT NULL, so a reading always states the number. There is
+	// no third answer between "read it all" and "skipped four rows".
+	if _, err := upgraded.Exec(`INSERT INTO interpretations (id, evidence_id, created_at, unread_rows)
+		VALUES ('i-2', 'ev-1', '2026-08-29T00:00:00.000Z', NULL)`); err == nil {
+		t.Error("the database accepted a reading with no count of unread rows")
 	}
 }

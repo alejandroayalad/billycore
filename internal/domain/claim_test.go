@@ -2,6 +2,10 @@ package domain_test
 
 import (
 	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -381,5 +385,97 @@ func TestOccurredAtRejectsBadTimestamps(t *testing.T) {
 				t.Errorf("NewClaim accepted occurred_at = %q", tc.value)
 			}
 		})
+	}
+}
+
+// D61: a transfer names a person or an institution, and neither is a merchant.
+// The two fields stay apart, so a table can show each one for what it is.
+func TestAClaimCanNameACounterpartyAndAMerchantApart(t *testing.T) {
+	counterparty, err := domain.NewTextField("ALVAREZ76", domain.High)
+	if err != nil {
+		t.Fatalf("NewTextField: %v", err)
+	}
+	merchant, err := domain.NewTextField("PANADERIA65", domain.Medium)
+	if err != nil {
+		t.Fatalf("NewTextField: %v", err)
+	}
+
+	claim, err := domain.NewClaim("claim-1", domain.ClaimProposed, []string{"ev-1"},
+		map[domain.FieldName]domain.ClaimField{
+			domain.FieldCounterparty: counterparty,
+			domain.FieldMerchant:     merchant,
+		}, created)
+	if err != nil {
+		t.Fatalf("NewClaim: %v", err)
+	}
+	if f, ok := claim.Field(domain.FieldCounterparty); !ok || f.Text() != "ALVAREZ76" {
+		t.Errorf("counterparty = %q, %v", f.Text(), ok)
+	}
+	if f, ok := claim.Field(domain.FieldMerchant); !ok || f.Text() != "PANADERIA65" {
+		t.Errorf("merchant = %q, %v", f.Text(), ok)
+	}
+}
+
+// D62: a movement between the user's own accounts records the user as the
+// counterparty, with a value no statement can print.
+func TestTheReservedCounterpartyValueIsAccepted(t *testing.T) {
+	self, err := domain.NewTextField(domain.CounterpartySelf, domain.High)
+	if err != nil {
+		t.Fatalf("NewTextField: %v", err)
+	}
+	if _, err := domain.NewClaim("claim-1", domain.ClaimProposed, []string{"ev-1"},
+		map[domain.FieldName]domain.ClaimField{domain.FieldCounterparty: self}, created); err != nil {
+		t.Fatalf("NewClaim: %v", err)
+	}
+}
+
+// Billy owns the namespace, so a near miss inside it is rejected rather than
+// stored as a counterparty named like a URN.
+func TestACounterpartyInTheReservedNamespaceIsRejected(t *testing.T) {
+	for _, value := range []string{"urn:billy:sef", "urn:billy:", "urn:billy:user"} {
+		field, err := domain.NewTextField(value, domain.High)
+		if err != nil {
+			t.Fatalf("NewTextField: %v", err)
+		}
+		if _, err := domain.NewClaim("claim-1", domain.ClaimProposed, []string{"ev-1"},
+			map[domain.FieldName]domain.ClaimField{domain.FieldCounterparty: field}, created); err == nil {
+			t.Errorf("a claim named %q as its counterparty was accepted", value)
+		}
+	}
+}
+
+// The reserved value is declared once and never typed again. A parser that
+// wrote the literal would put a domain decision inside a template reader, and a
+// typo there would become a counterparty that reads like a URN (D62, D65).
+func TestTheReservedCounterpartyValueIsDeclaredInOnePlace(t *testing.T) {
+	root := filepath.Join("..", "..")
+	found := map[string]int{}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if n := strings.Count(string(body), domain.CounterpartySelf); n > 0 {
+			found[path] = n
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(found) != 1 || found[filepath.Join(root, "internal", "domain", "claim.go")] != 1 {
+		t.Errorf("the reserved value appears at %v, want one place: internal/domain/claim.go", found)
 	}
 }

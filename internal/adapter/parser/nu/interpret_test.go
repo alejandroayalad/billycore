@@ -22,11 +22,16 @@ func interpretFixture(t *testing.T, fixture, subject string) map[domain.FieldNam
 	}
 	raw := []byte("Subject: " + subject + "\r\nContent-Type: text/html; charset=utf-8\r\n\r\n" + string(body))
 
-	fields, err := nu.Interpreter{}.Interpret(raw)
+	reading, err := nu.Interpreter{}.Interpret(t.Context(), raw)
 	if err != nil {
 		t.Fatalf("Interpret(%s): %v", fixture, err)
 	}
-	return fields
+	// Each Nu template is a receipt for one movement, so a reading holds one
+	// Claim. The port uses a slice for the statement Source (D46).
+	if len(reading.Fields) != 1 {
+		t.Fatalf("Interpret(%s) returned %d claims, want 1", fixture, len(reading.Fields))
+	}
+	return reading.Fields[0]
 }
 
 func text(t *testing.T, fields map[domain.FieldName]domain.ClaimField, name domain.FieldName) (string, domain.Confidence) {
@@ -189,7 +194,7 @@ func TestNoTemplateClaimsAnAccountIdentifier(t *testing.T) {
 // line is.
 func TestAnUnrecognisedArtifactReportsNoInterpretation(t *testing.T) {
 	raw := []byte("Subject: Tu estado de cuenta ya está disponible\r\n\r\n<html><body>nothing financial</body></html>")
-	_, err := nu.Interpreter{}.Interpret(raw)
+	_, err := nu.Interpreter{}.Interpret(t.Context(), raw)
 	if !errors.Is(err, app.ErrNoInterpretation) {
 		t.Fatalf("err = %v, want app.ErrNoInterpretation", err)
 	}
@@ -209,7 +214,7 @@ func TestAFailureDescribesItselfWithoutTheArtifact(t *testing.T) {
 	</body></html>`
 	raw := []byte("Subject: Tu transferencia fue exitosa\r\nContent-Type: text/html; charset=utf-8\r\n\r\n" + body)
 
-	_, err := nu.Interpreter{}.Interpret(raw)
+	_, err := nu.Interpreter{}.Interpret(t.Context(), raw)
 	if err == nil {
 		t.Fatal("a malformed amount parsed")
 	}
@@ -241,7 +246,7 @@ func TestTemplateDriftIsClassifiedAsSuch(t *testing.T) {
 	raw := []byte("Subject: ¡Recibiste una transferencia!\r\nContent-Type: text/html; charset=utf-8\r\n\r\n" +
 		`<html><body><p>Monto: $500.00</p><p>Fecha: 18 AGO 2026</p><p>Hora: 10:00</p></body></html>`)
 
-	_, err := nu.Interpreter{}.Interpret(raw)
+	_, err := nu.Interpreter{}.Interpret(t.Context(), raw)
 	if err == nil {
 		t.Fatal("an inflow with no sender parsed")
 	}

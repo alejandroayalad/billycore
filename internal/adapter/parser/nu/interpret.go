@@ -1,6 +1,7 @@
 package nu
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,24 +31,32 @@ type Interpreter struct{}
 
 // Interpret reads one stored artifact and reports what Billy believes about it.
 //
-// It returns app.ErrNoInterpretation for the 244 artifacts no template
-// recognises, which is an ordinary outcome and not a failure.
-func (Interpreter) Interpret(raw []byte) (map[domain.FieldName]domain.ClaimField, error) {
+// It returns app.ErrNoInterpretation for the 244 artifacts that no template
+// recognises. That is an ordinary result and not a failure.
+//
+// The reading holds one field set and skips nothing. Each of the four Nu
+// templates is a receipt for one movement. The port carries a slice and a
+// skipped count because a bank statement is one artifact with many movements
+// (D46, D59).
+//
+// The context is unused. This parser reads an email in memory and never leaves
+// the process, so it has nothing to stop (D57).
+func (Interpreter) Interpret(_ context.Context, raw []byte) (app.Reading, error) {
 	extraction, err := Parse(raw)
 	if errors.Is(err, parser.ErrNoTemplate) {
 		// Translated at the boundary. The use case knows "nothing recognised
 		// this"; it does not know that recognising means matching an email
 		// subject line.
-		return nil, app.ErrNoInterpretation
+		return app.Reading{}, app.ErrNoInterpretation
 	}
 	if err != nil {
-		return nil, classify(err)
+		return app.Reading{}, classify(err)
 	}
 	fields, err := fieldsOf(extraction)
 	if err != nil {
-		return nil, classify(err)
+		return app.Reading{}, classify(err)
 	}
-	return fields, nil
+	return app.Reading{Fields: []map[domain.FieldName]domain.ClaimField{fields}}, nil
 }
 
 // interpretError carries a failure together with a rendering of it that holds
