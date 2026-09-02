@@ -85,6 +85,8 @@ func NewServer(ingestor *app.Ingestor, evidence app.EvidenceRepository, transact
 // the bearer token (API.md §2, §11).
 func (s *Server) Handler(token string) http.Handler {
 	mux := http.NewServeMux()
+	// The viewing page at the exact root, unauthenticated like /healthz (D73).
+	mux.HandleFunc("GET /{$}", s.handleApp)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	v1 := http.NewServeMux()
