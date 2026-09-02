@@ -1858,6 +1858,51 @@ prints `22` and the cover prints `09/06/2026 al 30/06/2026`. Midnight in
 Mexico City remains the clock until an annex hit supplies one (D29, D64).
 **Source.** Author decision, 2026-09-02, on the two HSBC PDFs.
 
+### D75 — A SPEI between two of the user's accounts is neither earned nor spent
+**Status:** Accepted · 2026-09-02 · Reversibility: bounded — it changes income and spending totals
+**Decision.** When two ACTIVE Transactions share a tracking key, have opposite
+direction, and come from two Sources, they are one SPEI between two of the
+user's accounts. Each account keeps its row. Both are excluded from income and
+spending, and the API reports `internal: true`, the same as a Cajita movement
+(D55, D62). The pair is not merged (D70): a merge would pick one direction and
+erase one ledger. `HSB` and `HSBC` are one key: Nu still prints the annex wrap
+that D74 already folds on the HSBC side.
+**Closes.** The household totals that double-counted Flex→Nu transfers of wage.
+**Why.** Payroll is earned once, when it arrives. Sending it to another account
+the user holds is the same money. Opposite direction is what DOMAIN.md §6 uses
+to refuse a merge of two views of one event; here it is the signal that the two
+rows are the two sides of a transfer, not a contradiction.
+**Rejected — merge them.** One Transaction cannot be an outflow on Flex and an
+inflow on Nu. The account ledgers would lie.
+**Rejected — amount and calendar day without a tracking key.** Collisions of
+$1,000 CGO exist on the June statement (D59). Guessing the pair is D21.
+**Consequence — a transfer without a shared key still looks like earned or
+spent.** Three same-day $1,000 Flex outflows, and Nu inflows whose clave Nu
+stored as `HSB…` only after the fold, are the cases this rule covers. A SPEI
+that Nu labelled with a key Flex never received stays income until the other
+Source states the same key.
+**Source.** Author, 2026-09-02, on the combined June–July HSBC and Nu statements.
+
+### D76 — A deposit the user sent to themselves is not earned
+**Status:** Accepted · 2026-09-02 · Reversibility: bounded — it changes income and spending totals
+**Decision.** Once D75 has proved a name is the user — it is the counterparty on the
+inflow side of a keyed SPEI between two Sources — every other ACTIVE inflow with that
+counterparty is the user moving money, not income. The API reports `internal: true`.
+The other ledger (the Flex outflow) is excluded only when the amount and UTC calendar
+day (±1) match exactly one such inflow and exactly one outflow across Sources.
+**Closes.** Wage SPEI that Nu labelled `ALEJANDRO DE JESUS AYALA DIAZ` still counting
+as earned when Flex never stored the clave.
+**Why.** Payroll is earned once, when it arrives. Sending it to another account the
+user holds does not earn it again. The name is evidence the sender is the user; it is
+not a guess about amount and day. D75 already identified that name from a keyed pair.
+**Rejected — amount and calendar day as the primary rule.** Unchanged from D75 / D59:
+three $1,000 CGO on the same day collide. Those Flex outflows stay spending until a
+key exists. The Nu inflows of the same name still drop out of earned.
+**Consequence — net falls when the clave is missing on one side.** The Nu deposit is
+no longer earned; the unmatched Flex cargo is still spent. That is honest. Guessing
+which of three $1,000 cargos is the SPEI is D21.
+**Source.** Author, 2026-09-02, on wage sent Flex → Nu.
+
 ## Template
 
 ```markdown

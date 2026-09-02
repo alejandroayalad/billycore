@@ -23,6 +23,22 @@ func TestAppPageIsServedAtRootWithoutToken(t *testing.T) {
 	}
 }
 
+// The page filters on earned and spent, which exclude internal movements
+// (D55, D67). It does not offer INFLOW and OUTFLOW as the reader labels.
+func TestAppPageFiltersEarnedAndSpent(t *testing.T) {
+	handler := NewServer(nil, newStubRepo(), &stubTransactionReader{}, nil, nil, stubPinger{}, nil).Handler(testToken)
+
+	body := request(t, handler, http.MethodGet, "/", "").Body.String()
+	for _, want := range []string{">Earned<", ">Spent<", ">Internal<", `id="kind"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("page is missing %q", want)
+		}
+	}
+	if strings.Contains(body, "<th>Direction</th>") {
+		t.Error("page still labels the column Direction")
+	}
+}
+
 // The page renders values from hostile Evidence, so its policy must forbid
 // every external reference (D73, SECURITY.md §7).
 func TestAppPageSetsAStrictContentSecurityPolicy(t *testing.T) {

@@ -40,9 +40,10 @@ type transactionResponse struct {
 	Counterparty        *supportedTextResponse `json:"counterparty"`
 	Account             *supportedTextResponse `json:"account"`
 
-	// Internal is true when both sides of the movement are the user (D62). A
-	// client that reports income or spending excludes an internal movement
-	// (D55); this boolean is that fact, so no client hardcodes the URN.
+	// Internal is true when both sides of the movement are the user: a Cajita
+	// or respaldo row (D62), a keyed SPEI between two of the user's accounts
+	// (D75), or an inflow the user sent to themselves (D76). A client that
+	// reports income or spending excludes it (D55).
 	Internal      bool     `json:"internal"`
 	EvidenceIDs   []string `json:"evidence_ids"`
 	Relationships []any    `json:"relationships"`
@@ -225,8 +226,8 @@ func transactionRepresentation(item app.ListedTransaction) transactionResponse {
 	// reads `internal` (D65).
 	if tx.Counterparty() != "" {
 		response.Counterparty = &supportedTextResponse{Value: tx.Counterparty(), Confidence: item.CounterpartyConfidence.String()}
-		response.Internal = tx.Counterparty() == domain.CounterpartySelf
 	}
+	response.Internal = tx.Counterparty() == domain.CounterpartySelf || item.OwnAccountTransfer
 	if tx.AccountIdentifier() != "" {
 		response.Account = &supportedTextResponse{Value: tx.AccountIdentifier(), Confidence: item.AccountConfidence.String()}
 	}

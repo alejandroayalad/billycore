@@ -119,6 +119,24 @@ func TestAnInternalMovementIsMarkedInTheResponse(t *testing.T) {
 	}
 }
 
+// A SPEI between two of the user's accounts is internal on the wire (D75),
+// even when the counterparty is still the printed name.
+func TestAnOwnAccountTransferIsMarkedInternal(t *testing.T) {
+	at := time.Date(2026, 7, 31, 19, 35, 0, 0, time.UTC)
+	tx := apiTransaction(t, "tx-xfer", at)
+	reader := &stubTransactionReader{page: app.TransactionPage{Transactions: []app.ListedTransaction{
+		{Transaction: tx, OwnAccountTransfer: true},
+	}}}
+	w := request(t, transactionHandler(t, reader), http.MethodGet, "/v1/transactions", "Bearer "+testToken)
+	got := decode[transactionListResponse](t, w)
+	if len(got.Data) != 1 {
+		t.Fatalf("response = %+v", got)
+	}
+	if !got.Data[0].Internal {
+		t.Error("internal = false, want true for an own-account transfer")
+	}
+}
+
 func TestListTransactionsParsesFiltersAndCursor(t *testing.T) {
 	reader := &stubTransactionReader{}
 	cursor := encodeTransactionCursor(app.TransactionCursor{OccurredAt: observed, ID: "tx-2"})
