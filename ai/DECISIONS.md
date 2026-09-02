@@ -1804,6 +1804,37 @@ people would merge. Merchant equality is the cheap guard that makes the tuple a
 plausible identity, and BillyAgent widens it later.
 **Source.** Author decision, 2026-09-01; DOMAIN.md §6; builds on D55, D69, D70, D71.
 
+### D73 — Core serves the web page itself, unauthenticated, at `/`; the browser holds the token
+**Status:** Accepted · 2026-09-02 · Reversibility: cheap
+**Decision.** `billycore serve` serves one static HTML page from the binary at
+`GET /`, outside `/v1` and without the bearer token, the way `/healthz` is. The page
+carries no financial data. It reads the token the user pastes into a field, keeps it in
+the browser tab only, and calls `GET /v1/transactions` and
+`GET /v1/transactions/summary` with it. The page is one file with inline style and
+script, embedded with `go:embed`; it renders every value through the DOM as text, never
+as markup, and its `Content-Security-Policy` forbids every external reference.
+**Closes.** The open question D32 left: does Core serve the page, or is it a file the
+user opens?
+**Why.** A `file://` page cannot reach `http://127.0.0.1:8787` — the browser blocks the
+cross-origin call, and there is no second server to serve it same-origin. Serving from
+the binary is the only version that works, which D32 already saw. The token then has to
+reach the browser; a pasted field kept in the tab is the least friction that does not
+write the secret to disk.
+**Consequence — the page is a thin renderer, not a second API.** It computes no
+financial fact: the totals come from `GET /v1/transactions/summary`, and the page only
+formats minor units for display, as `billycore tx` already does (D32).
+**Consequence — a viewing surface renders values derived from hostile input.** A crafted
+email names a counterparty, and that string reaches the page. The page writes it with
+`textContent` and never `innerHTML`, and the CSP blocks script and remote loads, so a
+name that carries markup is shown, not run (SECURITY.md §7 reasoning, one layer out).
+**Consequence — serving `/` unauthenticated leaks nothing.** The page is a static
+template with no row in it; every byte of financial data still crosses the token
+boundary on the `/v1` calls the browser makes (SECURITY.md §4).
+**Rejected — a file the user opens.** It needs no route, but the browser's same-origin
+rule then blocks the API call, and working around that means CORS on a loopback
+financial API — more surface to defend the weaker option.
+**Source.** Author task, 2026-09-02; builds on D32, D18, SECURITY.md §4, §7.
+
 ## Template
 
 ```markdown

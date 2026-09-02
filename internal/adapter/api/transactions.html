@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BillyCore — Transactions</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --line: #2a2f3a;
+    --text: #e7e9ee;
+    --muted: #9aa1ad;
+    --accent: #820ad1;
+    --accent-soft: #b06be6;
+    --in: #3fbf7f;
+    --out: #e0605e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 22px 28px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .tag { color: var(--muted); font-size: 13px; }
+  main { padding: 24px 28px 48px; max-width: 1100px; margin: 0 auto; }
+  .controls {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    margin-bottom: 22px;
+  }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+  input {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 9px 11px;
+    font-size: 14px;
+    outline: none;
+  }
+  input:focus { border-color: var(--accent-soft); }
+  input#token { width: 320px; }
+  input#days { width: 90px; }
+  button {
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    color: white;
+    border-radius: 8px;
+    padding: 9px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: var(--accent-soft); border-color: var(--accent-soft); }
+  .cards { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 18px;
+    min-width: 150px;
+  }
+  .card .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+  .card .v { font-size: 20px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .card .n { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .card.income .v { color: var(--in); }
+  .card.expense .v { color: var(--out); }
+  .tablewrap {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  th {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .6px;
+    color: var(--muted);
+    background: var(--panel-2);
+    font-weight: 600;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,0.02); }
+  td.amount { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  td.date { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .dir { font-weight: 650; font-size: 12px; letter-spacing: .4px; }
+  .dir.INFLOW { color: var(--in); }
+  .dir.OUTFLOW { color: var(--out); }
+  .conf { color: var(--muted); font-size: 12px; }
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+  }
+  .msg { color: var(--muted); padding: 22px 4px; }
+  .msg.error { color: var(--out); }
+  .foot { color: var(--muted); font-size: 12px; margin-top: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BillyCore</h1>
+  <span class="tag">Last month of transactions</span>
+</header>
+<main>
+  <form class="controls" id="controls">
+    <div class="field">
+      <label for="token">API token</label>
+      <input id="token" type="password" placeholder="BILLYCORE_TOKEN" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="days">Days</label>
+      <input id="days" type="number" min="1" max="366" value="30">
+    </div>
+    <button type="submit">Load</button>
+  </form>
+
+  <div class="cards" id="cards" hidden>
+    <div class="card income"><div class="k">Income</div><div class="v" id="income">—</div><div class="n" id="income-n"></div></div>
+    <div class="card expense"><div class="k">Expense</div><div class="v" id="expense">—</div><div class="n" id="expense-n"></div></div>
+    <div class="card"><div class="k">Net</div><div class="v" id="net">—</div><div class="n" id="excluded"></div></div>
+  </div>
+
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th><th>Direction</th><th class="amount">Amount</th>
+          <th>Counterparty</th><th>Internal</th><th>Status</th>
+          <th>Reconciliation</th><th>Evidence</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="msg" id="msg">Enter your token and press Load.</div>
+  </div>
+  <div class="foot">Reads <code>GET /v1/transactions</code> and <code>/v1/transactions/summary</code>. Token stays in this tab only.</div>
+</main>
+
+<script>
+"use strict";
+// Minor-unit exponents for the currencies Core supports (D50). Formatting is
+// display only; the totals are computed by the server (D32, D73).
+const EXPONENTS = { MXN: 2, USD: 2, JPY: 0, KWD: 3 };
+const SELF = "urn:billy:self";
+
+const $ = (id) => document.getElementById(id);
+
+function formatMoney(minor, currency) {
+  const exp = EXPONENTS[currency] ?? 2;
+  const neg = minor < 0;
+  let digits = Math.abs(minor).toString().padStart(exp + 1, "0");
+  let intPart = exp ? digits.slice(0, -exp) : digits;
+  const frac = exp ? digits.slice(-exp) : "";
+  intPart = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  const body = exp ? intPart + "." + frac : intPart;
+  return (neg ? "-" : "") + body + " " + currency;
+}
+
+function formatDate(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+    " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
+// otherParty mirrors `billycore tx`: counterparty first, then merchant, with
+// the reserved self value shown as "self" and never the raw URN (D65).
+function otherParty(tx) {
+  if (tx.counterparty) {
+    if (tx.counterparty.value === SELF) return { text: "self", conf: "" };
+    return { text: tx.counterparty.value, conf: tx.counterparty.confidence };
+  }
+  if (tx.merchant) return { text: tx.merchant.value, conf: tx.merchant.confidence };
+  return { text: "—", conf: "" };
+}
+
+function cell(text, className) {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text;              // text only — never innerHTML (D73)
+  return td;
+}
+
+function renderRows(data) {
+  const body = $("rows");
+  body.replaceChildren();
+  for (const tx of data) {
+    const tr = document.createElement("tr");
+    tr.appendChild(cell(formatDate(tx.occurred_at), "date"));
+
+    const dir = document.createElement("td");
+    const span = document.createElement("span");
+    span.className = "dir " + tx.direction;
+    span.textContent = tx.direction;
+    dir.appendChild(span);
+    tr.appendChild(dir);
+
+    tr.appendChild(cell(tx.amount ? formatMoney(tx.amount.amount_minor, tx.amount.currency) : "—", "amount"));
+
+    const party = otherParty(tx);
+    const p = document.createElement("td");
+    p.textContent = party.text;
+    if (party.conf) {
+      const c = document.createElement("span");
+      c.className = "conf";
+      c.textContent = "  " + party.conf;
+      p.appendChild(c);
+    }
+    tr.appendChild(p);
+
+    tr.appendChild(cell(tx.internal ? "yes" : "—"));
+
+    const st = document.createElement("td");
+    const stp = document.createElement("span");
+    stp.className = "pill";
+    stp.textContent = tx.financial_status;
+    st.appendChild(stp);
+    tr.appendChild(st);
+
+    tr.appendChild(cell(tx.reconciliation_state));
+    tr.appendChild(cell(String((tx.evidence_ids || []).length)));
+    body.appendChild(tr);
+  }
+}
+
+function renderTotals(t) {
+  $("cards").hidden = false;
+  $("income").textContent = formatMoney(t.income.amount_minor, t.currency);
+  $("income-n").textContent = t.income.count + (t.income.count === 1 ? " movement" : " movements");
+  $("expense").textContent = formatMoney(t.expense.amount_minor, t.currency);
+  $("expense-n").textContent = t.expense.count + (t.expense.count === 1 ? " movement" : " movements");
+  $("net").textContent = formatMoney(t.net_minor, t.currency);
+  $("excluded").textContent = t.excluded_internal + " internal excluded";
+}
+
+async function fetchJSON(path, token) {
+  const res = await fetch(path, { headers: { "Authorization": "Bearer " + token } });
+  if (res.status === 401) throw new Error("Invalid or missing token.");
+  if (!res.ok) throw new Error("Server returned " + res.status + ".");
+  return res.json();
+}
+
+function setMessage(text, isError) {
+  const m = $("msg");
+  m.textContent = text;
+  m.hidden = !text;
+  m.className = "msg" + (isError ? " error" : "");
+}
+
+async function load(token, days) {
+  const from = new Date(Date.now() - days * 86400000).toISOString();
+  const q = "from=" + encodeURIComponent(from);
+  setMessage("Loading…", false);
+  try {
+    const [list, totals] = await Promise.all([
+      fetchJSON("/v1/transactions?" + q + "&limit=200", token),
+      fetchJSON("/v1/transactions/summary?" + q, token),
+    ]);
+    renderTotals(totals);
+    if (!list.data || list.data.length === 0) {
+      $("rows").replaceChildren();
+      setMessage("No transactions in the last " + days + " days.", false);
+    } else {
+      renderRows(list.data);
+      setMessage("", false);
+    }
+    sessionStorage.setItem("billycore_token", token);
+  } catch (err) {
+    $("cards").hidden = true;
+    $("rows").replaceChildren();
+    setMessage(err.message, true);
+  }
+}
+
+$("controls").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const token = $("token").value.trim();
+  const days = Math.max(1, parseInt($("days").value, 10) || 30);
+  if (!token) { setMessage("Enter your API token.", true); return; }
+  load(token, days);
+});
+
+// Restore the token for this tab so a reload does not ask again (D73).
+const saved = sessionStorage.getItem("billycore_token");
+if (saved) { $("token").value = saved; load(saved, 30); }
+</script>
+</body>
+</html>

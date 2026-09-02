@@ -142,7 +142,9 @@ func runServe(args []string) error {
 
 	server := api.NewServer(app.NewIngestor(evidence), evidence, transactions, configuredSources(sources), targets, db, wakePipeline)
 
-	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(sources))
+	// The viewing page is served at the bind address root (D32, D73).
+	slog.Info("billycore starting", "addr", *addr, "dir", *dir, "sources", len(sources),
+		"transactions", "http://"+*addr+"/")
 
 	srv := &http.Server{
 		Addr:              *addr,
