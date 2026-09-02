@@ -7,7 +7,8 @@ import (
 )
 
 // Row is one movement, as the coordinates give it. Every field is text. The
-// statement parser above reads the money and the date (D54).
+// statement parser above reads the money and the date (D54). Cargo, Abono,
+// Balance and Reference are empty on the Nu geometry.
 type Row struct {
 	Page        int
 	Y           float64
@@ -16,6 +17,10 @@ type Row struct {
 	Description []string
 	Detail      []string
 	Exchange    []string
+	Reference   []string
+	Cargo       string
+	Abono       string
+	Balance     string
 }
 
 // Geometry states where one layout puts its columns. It is a value and not a
