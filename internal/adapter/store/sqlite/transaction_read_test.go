@@ -235,6 +235,123 @@ func TestTotalsExcludeInternalMovements(t *testing.T) {
 	}
 }
 
+// A SPEI that leaves one of the user's accounts and arrives in another is the
+// same money, not income and not spending (D75). The two rows stay; only the
+// totals drop them. HSB and HSBC are one key: Nu still prints the wrap.
+func TestTotalsExcludeOwnAccountTransfers(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	day := time.Date(2026, 7, 31, 19, 35, 0, 0, time.UTC)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc", "hsbc_statements", domain.SourceBankStatement,
+		"HSBC825834", domain.Outflow, 500000, "o", day)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu", "nu_statements", domain.SourceBankStatement,
+		"HSB825834", domain.Inflow, 500000, "ALEJANDRO", day)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-pay", "hsbc_statements", domain.SourceBankStatement,
+		"PAYROLL1", domain.Inflow, 1784458, "", day)
+
+	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.IncomeMinor != 1784458 || totals.IncomeCount != 1 {
+		t.Errorf("income = %d (%d), want payroll only 1784458 (1)", totals.IncomeMinor, totals.IncomeCount)
+	}
+	if totals.ExpenseMinor != 0 || totals.ExpenseCount != 0 {
+		t.Errorf("expense = %d (%d), want none: the Flex outflow is a transfer", totals.ExpenseMinor, totals.ExpenseCount)
+	}
+	if totals.ExcludedInternal != 2 {
+		t.Errorf("excluded internal = %d, want 2 transfer rows", totals.ExcludedInternal)
+	}
+
+	page, err := transactions.List(context.Background(), app.TransactionQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flag := map[string]bool{}
+	for _, item := range page.Transactions {
+		flag[item.Transaction.ID()] = item.OwnAccountTransfer
+	}
+	if !flag["tx-hsbc"] || !flag["tx-nu"] {
+		t.Errorf("transfer flags = %v, want both SPEI sides true", flag)
+	}
+	if flag["tx-pay"] {
+		t.Error("payroll was flagged as an own-account transfer")
+	}
+}
+
+// storeSourcedKeyed writes one Transaction from a named Source with a tracking
+// key, so D75 can pair it with the other side.
+func storeSourcedKeyed(t *testing.T, transactions *TransactionRepository, claims *ClaimRepository,
+	evidence *EvidenceRepository, id, sourceID string, sourceType domain.SourceType,
+	trackingKey string, direction domain.TransactionDirection, minor int64, counterparty string, at time.Time) {
+	t.Helper()
+	evidenceID, claimID := "ev-"+id, "claim-"+id
+	e, err := domain.NewEvidence(evidenceID, sourceID, sourceType, "ref-"+id,
+		"application/pdf", []byte("%PDF-test"), at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created, err := evidence.Insert(context.Background(), e, testProfile, ingestedAt); err != nil || !created {
+		t.Fatalf("Insert %s: created=%v err=%v", id, created, err)
+	}
+
+	amount, err := domain.NewIntField(minor, domain.High)
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurred, err := domain.NewTimeField(at, domain.High)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := func(v string, c domain.Confidence) domain.ClaimField {
+		t.Helper()
+		f, err := domain.NewTextField(v, c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	fields := map[domain.FieldName]domain.ClaimField{
+		domain.FieldAmountMinor:     amount,
+		domain.FieldCurrency:        text("MXN", domain.Low),
+		domain.FieldDirection:       text(string(direction), domain.High),
+		domain.FieldFinancialStatus: text("SETTLED", domain.High),
+		domain.FieldOccurredAt:      occurred,
+		domain.FieldTrackingKey:     text(trackingKey, domain.High),
+	}
+	if counterparty != "" {
+		fields[domain.FieldCounterparty] = text(counterparty, domain.High)
+	}
+	proposed, err := domain.NewClaim(claimID, domain.ClaimProposed, []string{evidenceID}, fields, claimedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := proposed.Activate(claimedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := interpretationOf(t, "interp-"+evidenceID, evidenceID, "", claim)
+	if created, err := claims.Save(context.Background(), in, testProfile, claimedAt); err != nil || !created {
+		t.Fatalf("Save interpretation %s: created=%v err=%v", id, created, err)
+	}
+
+	money, err := domain.NewMoney(minor, "MXN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := domain.TransactionDraft{
+		ID: id, Money: money, Counterparty: counterparty, Direction: direction,
+		FinancialStatus: domain.StatusSettled, ReconciliationState: domain.Unreconciled,
+		State: domain.TransactionActive, OccurredAt: at, EvidenceIDs: []string{evidenceID}, CreatedAt: builtAt,
+	}
+	tx, err := domain.NewTransaction(draft)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created, err := transactions.Save(context.Background(), one(tx, claimID), builtAt); err != nil || !created {
+		t.Fatalf("Save %s: created=%v err=%v", id, created, err)
+	}
+}
+
 // The from and to window filters the totals, as it filters the list.
 func TestTotalsHonourTheWindow(t *testing.T) {
 	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)

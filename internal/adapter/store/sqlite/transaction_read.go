@@ -42,9 +42,9 @@ func (r *TransactionRepository) List(ctx context.Context, q app.TransactionQuery
 }
 
 func transactionListSQL(q app.TransactionQuery) (string, []any) {
+	cte, args := ownAccountTransferSQL()
 	var where []string
-	args := []any{string(domain.TransactionActive)}
-	where = append(where, "t.transaction_state = ?")
+	where, args = append(where, "t.transaction_state = ?"), append(args, string(domain.TransactionActive))
 	if q.From != nil {
 		where, args = append(where, "t.occurred_at >= ?"), append(args, formatTime(*q.From))
 	}
@@ -64,7 +64,7 @@ func transactionListSQL(q app.TransactionQuery) (string, []any) {
 	}
 
 	args = append(args, q.Limit+1)
-	return `SELECT
+	return cte + `SELECT
 		t.id, t.amount_minor, t.currency, t.merchant, t.counterparty,
 		t.account_identifier,
 		t.direction, t.financial_status, t.reconciliation_state,
@@ -82,11 +82,39 @@ func transactionListSQL(q app.TransactionQuery) (string, []any) {
 		 WHERE ct.transaction_id = t.id AND cf.field_name = 'account_identifier'
 		 ORDER BY ct.claim_id LIMIT 1),
 		(SELECT json_group_array(te.evidence_id) FROM transaction_evidence te
-		 WHERE te.transaction_id = t.id)
+		 WHERE te.transaction_id = t.id),
+		EXISTS (SELECT 1 FROM own_account_transfer x WHERE x.id = t.id)
 	FROM transactions t
 	WHERE ` + strings.Join(where, " AND ") + `
 	ORDER BY t.occurred_at DESC, t.id DESC
 	LIMIT ?`, args
+}
+
+// ownAccountTransferSQL is the pair that D75 excludes from earned and spent:
+// same tracking key, opposite direction, two Sources. The HSB → HSBC fold is
+// the annex wrap D74 already normalises on one Source and that Nu still prints.
+func ownAccountTransferSQL() (string, []any) {
+	return `WITH tracking_keyed AS (
+		SELECT ct.transaction_id, e.source_id, t.direction,
+			CASE
+				WHEN cf.value_text LIKE 'HSB%' AND cf.value_text NOT LIKE 'HSBC%'
+				THEN 'HSBC' || substr(cf.value_text, 4)
+				ELSE cf.value_text
+			END AS key
+		FROM claim_transaction ct
+		JOIN claim_fields cf ON cf.claim_id = ct.claim_id AND cf.field_name = ?
+		JOIN transactions t ON t.id = ct.transaction_id AND t.transaction_state = ?
+		JOIN transaction_evidence te ON te.transaction_id = t.id
+		JOIN evidence e ON e.id = te.evidence_id
+		WHERE cf.value_text IS NOT NULL AND length(cf.value_text) > 0
+	), own_account_transfer AS (
+		SELECT DISTINCT a.transaction_id AS id
+		FROM tracking_keyed a
+		JOIN tracking_keyed b
+			ON a.key = b.key
+			AND a.source_id <> b.source_id
+			AND a.direction <> b.direction
+	) `, []any{string(domain.FieldTrackingKey), string(domain.TransactionActive)}
 }
 
 func appendSet(where []string, args []any, column string, values []string) ([]string, []any) {
@@ -113,10 +141,11 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 	var amount sql.NullInt64
 	var currency, merchant, counterparty, account sql.NullString
 	var merchantConfidence, counterpartyConfidence, accountConfidence sql.NullString
+	var ownAccountTransfer bool
 	if err := rows.Scan(&id, &amount, &currency, &merchant, &counterparty, &account,
 		&direction, &status, &reconciliation, &state, &occurredText, &createdText,
 		&merchantConfidence, &counterpartyConfidence, &accountConfidence,
-		&evidenceJSON); err != nil {
+		&evidenceJSON, &ownAccountTransfer); err != nil {
 		return app.ListedTransaction{}, fmt.Errorf("list transactions: scan: %w", err)
 	}
 
@@ -157,7 +186,7 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 	if err != nil {
 		return app.ListedTransaction{}, fmt.Errorf("list transaction %s: %w", id, err)
 	}
-	item := app.ListedTransaction{Transaction: tx}
+	item := app.ListedTransaction{Transaction: tx, OwnAccountTransfer: ownAccountTransfer}
 	if merchantConfidence.Valid {
 		item.MerchantConfidence = domain.Confidence(merchantConfidence.String)
 		if err := item.MerchantConfidence.Validate(); err != nil {
@@ -180,9 +209,9 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 }
 
 // Totals sums income and spending over the Transactions the query selects. An
-// internal movement is the user's own money and counts as neither (D55); the
-// exclusion uses the reserved counterparty value, passed as a parameter so the
-// domain owns it and no literal lives in this SQL (D65).
+// internal movement is the user's own money and counts as neither (D55, D75);
+// Cajita uses the reserved counterparty, and a SPEI between two of the user's
+// accounts uses the tracking key. Both values are parameters (D65).
 func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQuery) (app.TransactionTotals, error) {
 	// Totals are single-currency: mixing minor units of two currencies is
 	// meaningless. BillyCore supports one currency today (D50), so the default
@@ -193,23 +222,32 @@ func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQue
 	}
 	totals := app.TransactionTotals{Currency: currency}
 
+	cte, cteArgs := ownAccountTransferSQL()
 	where := []string{"t.transaction_state = ?", "t.currency = ?", "t.amount_minor IS NOT NULL"}
-	args := []any{string(domain.TransactionActive), string(currency)}
+	filterArgs := []any{string(domain.TransactionActive), string(currency)}
 	if q.From != nil {
-		where, args = append(where, "t.occurred_at >= ?"), append(args, formatTime(*q.From))
+		where, filterArgs = append(where, "t.occurred_at >= ?"), append(filterArgs, formatTime(*q.From))
 	}
 	if q.To != nil {
-		where, args = append(where, "t.occurred_at < ?"), append(args, formatTime(*q.To))
+		where, filterArgs = append(where, "t.occurred_at < ?"), append(filterArgs, formatTime(*q.To))
 	}
 
-	// Income and spending, excluding the internal movement.
-	external := append([]string{"(t.counterparty IS NULL OR t.counterparty <> ?)"}, where...)
-	rows, err := r.db.QueryContext(ctx, `
+	bind := func(head any) []any {
+		out := append(append([]any{}, cteArgs...), head)
+		return append(out, filterArgs...)
+	}
+
+	// Income and spending, excluding Cajita (D55) and own-account SPEI (D75).
+	external := append([]string{
+		"(t.counterparty IS NULL OR t.counterparty <> ?)",
+		"t.id NOT IN (SELECT id FROM own_account_transfer)",
+	}, where...)
+	rows, err := r.db.QueryContext(ctx, cte+`
 		SELECT t.direction, COALESCE(SUM(t.amount_minor), 0), COUNT(*)
 		FROM transactions t
 		WHERE `+strings.Join(external, " AND ")+`
 		GROUP BY t.direction`,
-		append([]any{domain.CounterpartySelf}, args...)...)
+		bind(domain.CounterpartySelf)...)
 	if err != nil {
 		return app.TransactionTotals{}, fmt.Errorf("transaction totals: %w", err)
 	}
@@ -232,11 +270,11 @@ func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQue
 		return app.TransactionTotals{}, fmt.Errorf("transaction totals: %w", err)
 	}
 
-	// The internal movements that were left out, so the reader can say so.
-	internal := append([]string{"t.counterparty = ?"}, where...)
-	if err := r.db.QueryRowContext(ctx, `
+	// Cajita rows and own-account SPEI that were left out, so the reader can say so.
+	internal := append([]string{"(t.counterparty = ? OR t.id IN (SELECT id FROM own_account_transfer))"}, where...)
+	if err := r.db.QueryRowContext(ctx, cte+`
 		SELECT COUNT(*) FROM transactions t WHERE `+strings.Join(internal, " AND "),
-		append([]any{domain.CounterpartySelf}, args...)...,
+		bind(domain.CounterpartySelf)...,
 	).Scan(&totals.ExcludedInternal); err != nil {
 		return app.TransactionTotals{}, fmt.Errorf("transaction totals: internal: %w", err)
 	}
