@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/alejandroayalad/billycore/internal/adapter/extractor/pdftotext"
+	"github.com/alejandroayalad/billycore/internal/adapter/parser/hsbcstatement"
 	"github.com/alejandroayalad/billycore/internal/adapter/parser/nu"
 	"github.com/alejandroayalad/billycore/internal/adapter/parser/nustatement"
 	"github.com/alejandroayalad/billycore/internal/app"
@@ -65,6 +66,7 @@ var registered = map[app.ExtractionProfile]entry{
 	HSBCStatementV1: {
 		contentTypes: []string{"application/pdf"},
 		magic:        pdfMagic,
+		interpreter:  hsbcstatement.New(pdftotext.New()),
 	},
 }
 
