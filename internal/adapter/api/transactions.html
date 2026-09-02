@@ -44,7 +44,7 @@
   }
   .field { display: flex; flex-direction: column; gap: 6px; }
   .field label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
-  input {
+  input, select {
     background: var(--panel-2);
     border: 1px solid var(--line);
     color: var(--text);
@@ -53,9 +53,10 @@
     font-size: 14px;
     outline: none;
   }
-  input:focus { border-color: var(--accent-soft); }
+  input:focus, select:focus { border-color: var(--accent-soft); }
   input#token { width: 320px; }
   input#days { width: 90px; }
+  select#kind { width: 140px; }
   button {
     background: var(--accent);
     border: 1px solid var(--accent);
@@ -74,7 +75,13 @@
     border-radius: 12px;
     padding: 14px 18px;
     min-width: 150px;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
   }
+  .card:hover { border-color: var(--accent-soft); }
+  .card[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
   .card .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
   .card .v { font-size: 20px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .card .n { font-size: 12px; color: var(--muted); margin-top: 2px; }
@@ -106,8 +113,9 @@
   td.amount { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
   td.date { color: var(--muted); font-variant-numeric: tabular-nums; }
   .dir { font-weight: 650; font-size: 12px; letter-spacing: .4px; }
-  .dir.INFLOW { color: var(--in); }
-  .dir.OUTFLOW { color: var(--out); }
+  .dir.earned { color: var(--in); }
+  .dir.spent { color: var(--out); }
+  .dir.internal { color: var(--muted); }
   .conf { color: var(--muted); font-size: 12px; }
   .pill {
     display: inline-block;
@@ -137,21 +145,36 @@
       <label for="days">Days</label>
       <input id="days" type="number" min="1" max="366" value="30">
     </div>
+    <div class="field">
+      <label for="kind">Show</label>
+      <select id="kind">
+        <option value="all">All</option>
+        <option value="earned">Earned</option>
+        <option value="spent">Spent</option>
+        <option value="internal">Internal</option>
+      </select>
+    </div>
     <button type="submit">Load</button>
   </form>
 
   <div class="cards" id="cards" hidden>
-    <div class="card income"><div class="k">Income</div><div class="v" id="income">—</div><div class="n" id="income-n"></div></div>
-    <div class="card expense"><div class="k">Expense</div><div class="v" id="expense">—</div><div class="n" id="expense-n"></div></div>
-    <div class="card"><div class="k">Net</div><div class="v" id="net">—</div><div class="n" id="excluded"></div></div>
+    <button type="button" class="card income" id="card-earned" data-kind="earned" aria-pressed="false">
+      <div class="k">Earned</div><div class="v" id="income">—</div><div class="n" id="income-n"></div>
+    </button>
+    <button type="button" class="card expense" id="card-spent" data-kind="spent" aria-pressed="false">
+      <div class="k">Spent</div><div class="v" id="expense">—</div><div class="n" id="expense-n"></div>
+    </button>
+    <button type="button" class="card" id="card-all" data-kind="all" aria-pressed="true">
+      <div class="k">Net</div><div class="v" id="net">—</div><div class="n" id="excluded"></div>
+    </button>
   </div>
 
   <div class="tablewrap">
     <table>
       <thead>
         <tr>
-          <th>Date</th><th>Direction</th><th class="amount">Amount</th>
-          <th>Counterparty</th><th>Internal</th><th>Status</th>
+          <th>Date</th><th>Kind</th><th class="amount">Amount</th>
+          <th>Counterparty</th><th>Status</th>
           <th>Reconciliation</th><th>Evidence</th>
         </tr>
       </thead>
@@ -159,7 +182,7 @@
     </table>
     <div class="msg" id="msg">Enter your token and press Load.</div>
   </div>
-  <div class="foot">Reads <code>GET /v1/transactions</code> and <code>/v1/transactions/summary</code>. Token stays in this tab only.</div>
+  <div class="foot">Reads <code>GET /v1/transactions</code> and <code>/v1/transactions/summary</code>. Token stays in this tab only. Earned and spent exclude internal movements (D55).</div>
 </main>
 
 <script>
@@ -168,8 +191,11 @@
 // display only; the totals are computed by the server (D32, D73).
 const EXPONENTS = { MXN: 2, USD: 2, JPY: 0, KWD: 3 };
 const SELF = "urn:billy:self";
+const KIND_LABEL = { earned: "Earned", spent: "Spent", internal: "Internal" };
 
 const $ = (id) => document.getElementById(id);
+
+let loaded = [];
 
 function formatMoney(minor, currency) {
   const exp = EXPONENTS[currency] ?? 2;
@@ -190,6 +216,26 @@ function formatDate(iso) {
     " " + p(d.getHours()) + ":" + p(d.getMinutes());
 }
 
+// kindOf is D67 on one row: internal is neither earned nor spent (D55).
+function kindOf(tx) {
+  if (tx.internal) return "internal";
+  if (tx.direction === "INFLOW") return "earned";
+  if (tx.direction === "OUTFLOW") return "spent";
+  return "";
+}
+
+function currentKind() {
+  return $("kind").value || "all";
+}
+
+function setKind(kind) {
+  $("kind").value = kind;
+  $("card-earned").setAttribute("aria-pressed", kind === "earned" ? "true" : "false");
+  $("card-spent").setAttribute("aria-pressed", kind === "spent" ? "true" : "false");
+  $("card-all").setAttribute("aria-pressed", kind === "all" ? "true" : "false");
+  renderTable();
+}
+
 // otherParty mirrors `billycore tx`: counterparty first, then merchant, with
 // the reserved self value shown as "self" and never the raw URN (D65).
 function otherParty(tx) {
@@ -208,17 +254,20 @@ function cell(text, className) {
   return td;
 }
 
-function renderRows(data) {
+function renderTable() {
+  const kind = currentKind();
+  const rows = kind === "all" ? loaded : loaded.filter((tx) => kindOf(tx) === kind);
   const body = $("rows");
   body.replaceChildren();
-  for (const tx of data) {
+  for (const tx of rows) {
     const tr = document.createElement("tr");
     tr.appendChild(cell(formatDate(tx.occurred_at), "date"));
 
+    const k = kindOf(tx);
     const dir = document.createElement("td");
     const span = document.createElement("span");
-    span.className = "dir " + tx.direction;
-    span.textContent = tx.direction;
+    span.className = "dir " + k;
+    span.textContent = KIND_LABEL[k] || "—";
     dir.appendChild(span);
     tr.appendChild(dir);
 
@@ -235,8 +284,6 @@ function renderRows(data) {
     }
     tr.appendChild(p);
 
-    tr.appendChild(cell(tx.internal ? "yes" : "—"));
-
     const st = document.createElement("td");
     const stp = document.createElement("span");
     stp.className = "pill";
@@ -247,6 +294,14 @@ function renderRows(data) {
     tr.appendChild(cell(tx.reconciliation_state));
     tr.appendChild(cell(String((tx.evidence_ids || []).length)));
     body.appendChild(tr);
+  }
+
+  if (loaded.length === 0) return;
+  if (rows.length === 0) {
+    const label = KIND_LABEL[kind] ? KIND_LABEL[kind].toLowerCase() : "matching";
+    setMessage("No " + label + " movements in this list.", false);
+  } else {
+    setMessage("", false);
   }
 }
 
@@ -283,16 +338,17 @@ async function load(token, days) {
       fetchJSON("/v1/transactions?" + q + "&limit=200", token),
       fetchJSON("/v1/transactions/summary?" + q, token),
     ]);
+    loaded = list.data || [];
     renderTotals(totals);
-    if (!list.data || list.data.length === 0) {
+    if (loaded.length === 0) {
       $("rows").replaceChildren();
       setMessage("No transactions in the last " + days + " days.", false);
     } else {
-      renderRows(list.data);
-      setMessage("", false);
+      renderTable();
     }
     sessionStorage.setItem("billycore_token", token);
   } catch (err) {
+    loaded = [];
     $("cards").hidden = true;
     $("rows").replaceChildren();
     setMessage(err.message, true);
@@ -305,6 +361,11 @@ $("controls").addEventListener("submit", (e) => {
   const days = Math.max(1, parseInt($("days").value, 10) || 30);
   if (!token) { setMessage("Enter your API token.", true); return; }
   load(token, days);
+});
+
+$("kind").addEventListener("change", () => setKind(currentKind()));
+document.querySelectorAll(".card[data-kind]").forEach((card) => {
+  card.addEventListener("click", () => setKind(card.getAttribute("data-kind")));
 });
 
 // Restore the token for this tab so a reload does not ask again (D73).
