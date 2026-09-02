@@ -1835,6 +1835,29 @@ rule then blocks the API call, and working around that means CORS on a loopback
 financial API — more surface to defend the weaker option.
 **Source.** Author task, 2026-09-02; builds on D32, D18, SECURITY.md §4, §7.
 
+### D74 — An HSBC ledger row is the Claim; the SPEI annex enriches it
+**Status:** Accepted · 2026-09-02 · Reversibility: bounded — it changes which rows become Transactions
+**Decision.** On an HSBC `Cuenta Flexible Simple` statement, each row of
+`DETALLE MOVIMIENTOS` is one Claim. Cargo is `OUTFLOW` and abono is `INFLOW`.
+The SPEI Enviados / Recibidos annex is not a second Claim. It enriches the
+ledger row that shares its amount, calendar day and direction, and only when
+that triple identifies exactly one ledger row on that statement. The annex
+supplies `tracking_key` and the clock for `occurred_at`. It does not replace
+the ledger party: the beneficiary on an outbound SPEI is often the user.
+**Closes.** The two-table identity question the June and July 2026 PDFs posed.
+**Why.** Two Claims from one Evidence become two Transactions (D42, D46), and
+the Matcher will not collapse them: D72 requires two Sources. The ledger is the
+account movement, including payroll and card rows that the annex never lists.
+The annex is where `Clave de rastreo` lives, which is what merges with Nu email.
+**Rejected — the annex row is the Claim.** It drops every non-SPEI movement
+and still needs the ledger for card purchases and `NETNM DEPOSITO DE NOMINA`.
+**Consequence — a collision stays unenriched.** Three same-day `CGO` outflows
+of $1,000 keep their ledger fields and receive no key. That is D59, not a guess.
+**Consequence — the day-of-month takes the statement period.** The ledger
+prints `22` and the cover prints `09/06/2026 al 30/06/2026`. Midnight in
+Mexico City remains the clock until an annex hit supplies one (D29, D64).
+**Source.** Author decision, 2026-09-02, on the two HSBC PDFs.
+
 ## Template
 
 ```markdown
