@@ -90,9 +90,11 @@ func transactionListSQL(q app.TransactionQuery) (string, []any) {
 	LIMIT ?`, args
 }
 
-// ownAccountTransferSQL is the pair that D75 excludes from earned and spent:
-// same tracking key, opposite direction, two Sources. The HSB → HSBC fold is
-// the annex wrap D74 already normalises on one Source and that Nu still prints.
+// ownAccountTransferSQL is the movement D75 and D76 leave out of earned and
+// spent. A keyed SPEI across two Sources is both sides (D75). An inflow whose
+// counterparty is a name those keyed SPEI already proved is the user is also
+// the user's own money (D76). The other ledger joins only when the amount and
+// calendar day are unique; a collision stays unmatched (D59, D21).
 func ownAccountTransferSQL() (string, []any) {
 	return `WITH tracking_keyed AS (
 		SELECT ct.transaction_id, e.source_id, t.direction,
@@ -107,14 +109,56 @@ func ownAccountTransferSQL() (string, []any) {
 		JOIN transaction_evidence te ON te.transaction_id = t.id
 		JOIN evidence e ON e.id = te.evidence_id
 		WHERE cf.value_text IS NOT NULL AND length(cf.value_text) > 0
-	), own_account_transfer AS (
+	), keyed_transfer AS (
 		SELECT DISTINCT a.transaction_id AS id
 		FROM tracking_keyed a
 		JOIN tracking_keyed b
 			ON a.key = b.key
 			AND a.source_id <> b.source_id
 			AND a.direction <> b.direction
-	) `, []any{string(domain.FieldTrackingKey), string(domain.TransactionActive)}
+	), self_name AS (
+		SELECT DISTINCT t.counterparty AS name
+		FROM keyed_transfer k
+		JOIN transactions t ON t.id = k.id
+		WHERE t.direction = ?
+			AND t.counterparty IS NOT NULL
+			AND t.counterparty <> ?
+			AND length(t.counterparty) > 0
+	), self_named_inflow AS (
+		SELECT t.id, t.amount_minor, t.occurred_at
+		FROM transactions t
+		JOIN self_name s ON s.name = t.counterparty
+		WHERE t.direction = ?
+			AND t.transaction_state = ?
+	), candidate AS (
+		SELECT DISTINCT o.id AS out_id, i.id AS in_id
+		FROM transactions o
+		JOIN transaction_evidence teo ON teo.transaction_id = o.id
+		JOIN evidence eo ON eo.id = teo.evidence_id
+		JOIN self_named_inflow i ON i.amount_minor = o.amount_minor
+		JOIN transaction_evidence tei ON tei.transaction_id = i.id
+		JOIN evidence ei ON ei.id = tei.evidence_id
+		WHERE o.direction = ?
+			AND o.transaction_state = ?
+			AND eo.source_id <> ei.source_id
+			AND abs(julianday(substr(o.occurred_at, 1, 10)) - julianday(substr(i.occurred_at, 1, 10))) <= 1
+	), unique_other_side AS (
+		SELECT c.out_id AS id
+		FROM candidate c
+		WHERE (SELECT COUNT(*) FROM candidate x WHERE x.out_id = c.out_id) = 1
+			AND (SELECT COUNT(*) FROM candidate x WHERE x.in_id = c.in_id) = 1
+	), own_account_transfer AS (
+		SELECT id FROM keyed_transfer
+		UNION
+		SELECT id FROM self_named_inflow
+		UNION
+		SELECT id FROM unique_other_side
+	) `, []any{
+			string(domain.FieldTrackingKey), string(domain.TransactionActive),
+			string(domain.Inflow), domain.CounterpartySelf,
+			string(domain.Inflow), string(domain.TransactionActive),
+			string(domain.Outflow), string(domain.TransactionActive),
+		}
 }
 
 func appendSet(where []string, args []any, column string, values []string) ([]string, []any) {
@@ -209,9 +253,9 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 }
 
 // Totals sums income and spending over the Transactions the query selects. An
-// internal movement is the user's own money and counts as neither (D55, D75);
-// Cajita uses the reserved counterparty, and a SPEI between two of the user's
-// accounts uses the tracking key. Both values are parameters (D65).
+// internal movement is the user's own money and counts as neither (D55, D75,
+// D76); Cajita uses the reserved counterparty, a keyed SPEI uses the tracking
+// key, and a self-named inflow uses the name those SPEI already proved.
 func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQuery) (app.TransactionTotals, error) {
 	// Totals are single-currency: mixing minor units of two currencies is
 	// meaningless. BillyCore supports one currency today (D50), so the default
@@ -237,7 +281,7 @@ func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQue
 		return append(out, filterArgs...)
 	}
 
-	// Income and spending, excluding Cajita (D55) and own-account SPEI (D75).
+	// Income and spending, excluding Cajita (D55) and own-account SPEI (D75, D76).
 	external := append([]string{
 		"(t.counterparty IS NULL OR t.counterparty <> ?)",
 		"t.id NOT IN (SELECT id FROM own_account_transfer)",

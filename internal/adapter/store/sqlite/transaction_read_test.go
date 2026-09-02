@@ -278,6 +278,67 @@ func TestTotalsExcludeOwnAccountTransfers(t *testing.T) {
 	}
 }
 
+// A wage SPEI that Nu labelled with the user's name is not earned even when
+// Flex never stored the clave (D76). The other ledger drops only when the
+// amount and calendar day are unique. A $1,000 collision stays spending.
+func TestSelfNamedInflowIsNotEarned(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	day := time.Date(2026, 7, 31, 19, 35, 0, 0, time.UTC)
+	same := time.Date(2026, 6, 30, 21, 18, 0, 0, time.UTC)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc", "hsbc_statements", domain.SourceBankStatement,
+		"HSBC825834", domain.Outflow, 500000, "o", day)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu", "nu_statements", domain.SourceBankStatement,
+		"HSB825834", domain.Inflow, 500000, "ALEJANDRO DE JESUS AYALA DIAZ", day)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-pay", "hsbc_statements", domain.SourceBankStatement,
+		"PAYROLL1", domain.Inflow, 1784458, "", day)
+
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu-wage", "nu_statements", domain.SourceBankStatement,
+		"HSBC219254", domain.Inflow, 492100, "ALEJANDRO DE JESUS AYALA DIAZ", same)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc-wage", "hsbc_statements", domain.SourceBankStatement,
+		"", domain.Outflow, 492100, "Pau", same)
+
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu-a", "nu_statements", domain.SourceBankStatement,
+		"HSBC797701", domain.Inflow, 100000, "ALEJANDRO DE JESUS AYALA DIAZ", same)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu-b", "nu_statements", domain.SourceBankStatement,
+		"HSBC807761", domain.Inflow, 100000, "ALEJANDRO DE JESUS AYALA DIAZ", same)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc-a", "hsbc_statements", domain.SourceBankStatement,
+		"", domain.Outflow, 100000, "o", same)
+	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc-b", "hsbc_statements", domain.SourceBankStatement,
+		"", domain.Outflow, 100000, "o", same)
+
+	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.IncomeMinor != 1784458 || totals.IncomeCount != 1 {
+		t.Errorf("income = %d (%d), want payroll only", totals.IncomeMinor, totals.IncomeCount)
+	}
+	if totals.ExpenseMinor != 200000 || totals.ExpenseCount != 2 {
+		t.Errorf("expense = %d (%d), want the $1,000 collision only", totals.ExpenseMinor, totals.ExpenseCount)
+	}
+
+	page, err := transactions.List(context.Background(), app.TransactionQuery{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flag := map[string]bool{}
+	for _, item := range page.Transactions {
+		flag[item.Transaction.ID()] = item.OwnAccountTransfer
+	}
+	if !flag["tx-nu-wage"] || !flag["tx-hsbc-wage"] {
+		t.Errorf("unique wage SPEI flags = %v, want both sides true", flag)
+	}
+	if !flag["tx-nu-a"] || !flag["tx-nu-b"] {
+		t.Error("self-named $1,000 inflows were left as earned")
+	}
+	if flag["tx-hsbc-a"] || flag["tx-hsbc-b"] {
+		t.Error("colliding $1,000 Flex outflows were guessed as a transfer")
+	}
+	if flag["tx-pay"] {
+		t.Error("payroll was flagged as an own-account transfer")
+	}
+}
+
 // storeSourcedKeyed writes one Transaction from a named Source with a tracking
 // key, so D75 can pair it with the other side.
 func storeSourcedKeyed(t *testing.T, transactions *TransactionRepository, claims *ClaimRepository,
@@ -316,7 +377,9 @@ func storeSourcedKeyed(t *testing.T, transactions *TransactionRepository, claims
 		domain.FieldDirection:       text(string(direction), domain.High),
 		domain.FieldFinancialStatus: text("SETTLED", domain.High),
 		domain.FieldOccurredAt:      occurred,
-		domain.FieldTrackingKey:     text(trackingKey, domain.High),
+	}
+	if trackingKey != "" {
+		fields[domain.FieldTrackingKey] = text(trackingKey, domain.High)
 	}
 	if counterparty != "" {
 		fields[domain.FieldCounterparty] = text(counterparty, domain.High)

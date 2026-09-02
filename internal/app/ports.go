@@ -260,9 +260,10 @@ type ListedTransaction struct {
 	CounterpartyConfidence domain.Confidence
 	AccountConfidence      domain.Confidence
 
-	// OwnAccountTransfer is true when this row is one side of a SPEI between
-	// two of the user's accounts: same tracking key, opposite direction, two
-	// Sources (D75). It is neither income nor spending, like a Cajita move.
+	// OwnAccountTransfer is true when this row is the user's own money moving
+	// between accounts they hold: a keyed SPEI across two Sources (D75), or an
+	// inflow whose counterparty those SPEI already proved is the user (D76).
+	// It is neither income nor spending, like a Cajita move.
 	OwnAccountTransfer bool
 }
 
@@ -275,7 +276,7 @@ type TransactionPage struct {
 // TransactionTotals is income and spending over a filtered set of Transactions.
 //
 // An internal movement is money between the user's own accounts, so it is not
-// income and not spending, and it is excluded from both totals (D55, D62, D75).
+// income and not spending, and it is excluded from both totals (D55, D62, D75, D76).
 // It is still counted here, so a reader can say how many were left out.
 //
 // The amounts are minor units of one currency. BillyCore supports one currency
