@@ -1903,6 +1903,26 @@ no longer earned; the unmatched Flex cargo is still spent. That is honest. Guess
 which of three $1,000 cargos is the SPEI is D21.
 **Source.** Author, 2026-09-02, on wage sent Flex → Nu.
 
+### D77 — The Klar Principal ledger is the Claim; interest is skipped
+**Status:** Accepted · 2026-09-03 · Reversibility: cheap — it is one parser
+**Decision.** `KLAR_STATEMENT_V1` reads the Cuenta Principal table. Cargo is
+OUTFLOW, abono is INFLOW, MXN, midnight in Mexico City (D29, D64). A card mask
+(`************2099`) marks a merchant; every other concept is a counterparty.
+The document prints no tracking key. Rows outside the cover period are skipped.
+**Closes.** Klar as a third Source of BANK_STATEMENT, so household identity can
+see Nu → Klar and Flex → Klar instead of treating `klar` as a merchant.
+**Why.** The June cover states 41 movements, $9,214.00 in, $9,228.34 out. The
+July cover states 48, $19,107.00 in, $19,024.39 out. Those figures are the
+ledger, not the interest table.
+**Rejected — read weekly interest as income.** Rendimiento is real, and a
+contador would count it. It lives in a second table with $0.00 cargos. Parsing
+it now mixes Principal with a pot that the cover already splits as Ganancias.
+It waits until household identity has a place for interest.
+**Consequence — no clave.** D75 cannot pair a Klar row by tracking key. Unique
+amount and day across Sources is still D76's secondary join, and only after a
+keyed SPEI has proved a name.
+**Source.** Author, 2026-09-03, on the June and July Klar PDFs.
+
 ## Template
 
 ```markdown

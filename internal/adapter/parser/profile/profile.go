@@ -13,6 +13,7 @@ import (
 
 	"github.com/alejandroayalad/billycore/internal/adapter/extractor/pdftotext"
 	"github.com/alejandroayalad/billycore/internal/adapter/parser/hsbcstatement"
+	"github.com/alejandroayalad/billycore/internal/adapter/parser/klarstatement"
 	"github.com/alejandroayalad/billycore/internal/adapter/parser/nu"
 	"github.com/alejandroayalad/billycore/internal/adapter/parser/nustatement"
 	"github.com/alejandroayalad/billycore/internal/app"
@@ -28,6 +29,7 @@ const (
 	NuEmailV1       app.ExtractionProfile = "NU_EMAIL_V1"
 	NuStatementV1   app.ExtractionProfile = "NU_STATEMENT_V1"
 	HSBCStatementV1 app.ExtractionProfile = "HSBC_STATEMENT_V1"
+	KlarStatementV1 app.ExtractionProfile = "KLAR_STATEMENT_V1"
 )
 
 // pdfMagic is the first bytes of a PDF file. A statement that does not start
@@ -67,6 +69,11 @@ var registered = map[app.ExtractionProfile]entry{
 		contentTypes: []string{"application/pdf"},
 		magic:        pdfMagic,
 		interpreter:  hsbcstatement.New(pdftotext.New()),
+	},
+	KlarStatementV1: {
+		contentTypes: []string{"application/pdf"},
+		magic:        pdfMagic,
+		interpreter:  klarstatement.New(pdftotext.New()),
 	},
 }
 
