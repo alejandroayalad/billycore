@@ -45,6 +45,41 @@ func TestLoadSources(t *testing.T) {
 	}
 }
 
+func TestLoadFileBindsStatementSourcesToOwnedAccounts(t *testing.T) {
+	dir := writeSources(t, `{
+	  "accounts": [
+	    { "id": "flex", "aliases": ["ALEJANDRO DE JESUS AYALA DIAZ"] },
+	    { "id": "nu" },
+	    { "id": "klar", "aliases": ["klar"] }
+	  ],
+	  "sources": [
+	    { "id": "hsbc_statements", "type": "BANK_STATEMENT",
+	      "extraction_profile": "HSBC_STATEMENT_V1", "owned_account": "flex" },
+	    { "id": "nu_statements", "type": "BANK_STATEMENT",
+	      "extraction_profile": "NU_STATEMENT_V1", "owned_account": "nu" },
+	    { "id": "klar_statements", "type": "BANK_STATEMENT",
+	      "extraction_profile": "KLAR_STATEMENT_V1", "owned_account": "klar" }
+	  ]
+	}`)
+
+	sources, household, err := LoadFile(dir)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if len(sources) != 3 {
+		t.Fatalf("loaded %d sources, want 3", len(sources))
+	}
+	if household.SourceAccount["klar_statements"] != "klar" {
+		t.Errorf("klar Source bound to %q", household.SourceAccount["klar_statements"])
+	}
+	if household.AliasAccount["klar"] != "klar" {
+		t.Errorf("alias klar points at %q", household.AliasAccount["klar"])
+	}
+	if household.AliasAccount["ALEJANDRO DE JESUS AYALA DIAZ"] != "flex" {
+		t.Errorf("ALEJANDRO alias points at %q", household.AliasAccount["ALEJANDRO DE JESUS AYALA DIAZ"])
+	}
+}
+
 // No file means no Source configured, which sync reports as a 404. It is not a
 // reason to refuse to start.
 func TestLoadSourcesAcceptsAMissingFile(t *testing.T) {
@@ -95,6 +130,26 @@ func TestLoadSourcesRejectsBadConfiguration(t *testing.T) {
 			content: `{"sources": [{"id": "gmail_primary", "type": "GMAIL", "query": "from:nu@nu.com.mx",
 			  "extraction_profile": "NU_EMAIL_V2"}]}`,
 			says: "does not support",
+		},
+		"statement without an owned account": {
+			content: `{"accounts": [{"id": "nu"}], "sources": [
+			  {"id": "nu_statements", "type": "BANK_STATEMENT", "extraction_profile": "NU_STATEMENT_V1"}
+			]}`,
+			says: "no owned_account",
+		},
+		"owned account that does not exist": {
+			content: `{"accounts": [{"id": "nu"}], "sources": [
+			  {"id": "hsbc_statements", "type": "BANK_STATEMENT", "extraction_profile": "HSBC_STATEMENT_V1",
+			   "owned_account": "flex"}
+			]}`,
+			says: "not configured",
+		},
+		"duplicate alias": {
+			content: `{"accounts": [
+			  {"id": "flex", "aliases": ["klar"]},
+			  {"id": "klar", "aliases": ["klar"]}
+			], "sources": []}`,
+			says: "points at",
 		},
 	}
 	for name, tc := range cases {

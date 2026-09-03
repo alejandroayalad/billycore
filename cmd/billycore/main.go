@@ -110,7 +110,7 @@ func runServe(args []string) error {
 	}
 	defer db.Close()
 
-	sources, err := config.LoadSources(*dir)
+	sources, household, err := config.LoadFile(*dir)
 	if err != nil {
 		return err
 	}
@@ -134,7 +134,7 @@ func runServe(args []string) error {
 	// through one table.
 	queue := sqlite.NewEvidenceQueue(db)
 	extractor := app.NewExtractor(queue, sqlite.NewClaimRepository(db), profile.New())
-	transactions := sqlite.NewTransactionRepository(db)
+	transactions := sqlite.NewTransactionRepository(db).WithHousehold(household)
 	reconciler := app.NewReconciler(queue, transactions)
 	matcher := app.NewMatcher(sqlite.NewReconciliationRepository(db))
 	pipelineWake, wakePipeline := newWakeSignal()
