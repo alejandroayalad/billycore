@@ -76,6 +76,16 @@ func TestSelectRejectsWhatTheProfileDoesNotExpect(t *testing.T) {
 
 // The signature is validated before the parser. A wrong file reports what it
 // is, and not what BillyCore cannot do with it.
+func TestTheKlarStatementProfileSelectsTheStatementParser(t *testing.T) {
+	interpreter, err := profile.New().Select(profile.KlarStatementV1, "application/pdf", []byte("%PDF-1.7\n1 0 obj"))
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if interpreter == nil {
+		t.Fatal("Select returned no interpreter and no error")
+	}
+}
+
 func TestTheHSBCStatementProfileSelectsTheStatementParser(t *testing.T) {
 	interpreter, err := profile.New().Select(profile.HSBCStatementV1, "application/pdf", []byte("%PDF-1.7\n1 0 obj"))
 	if err != nil {
@@ -97,8 +107,8 @@ func TestTheSignatureIsCheckedBeforeTheParser(t *testing.T) {
 // reports and Known denies is a Source that cannot start (D26).
 func TestEveryNameIsKnown(t *testing.T) {
 	names := profile.Names()
-	if len(names) != 3 {
-		t.Errorf("Names returned %v, want the three supported profiles", names)
+	if len(names) != 4 {
+		t.Errorf("Names returned %v, want the four supported profiles", names)
 	}
 	for _, name := range names {
 		if !profile.Known(app.ExtractionProfile(name)) {
