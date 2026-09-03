@@ -240,13 +240,25 @@ func TestTotalsExcludeInternalMovements(t *testing.T) {
 // totals drop them. HSB and HSBC are one key: Nu still prints the wrap.
 func TestTotalsExcludeOwnAccountTransfers(t *testing.T) {
 	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	transactions.WithHousehold(app.Household{
+		SourceAccount: map[string]string{
+			"hsbc_statements": "flex",
+			"nu_statements":   "nu",
+		},
+	})
 	day := time.Date(2026, 7, 31, 19, 35, 0, 0, time.UTC)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc", "hsbc_statements", domain.SourceBankStatement,
-		"HSBC825834", domain.Outflow, 500000, "o", day)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu", "nu_statements", domain.SourceBankStatement,
-		"HSB825834", domain.Inflow, 500000, "ALEJANDRO", day)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-pay", "hsbc_statements", domain.SourceBankStatement,
-		"PAYROLL1", domain.Inflow, 1784458, "", day)
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-hsbc", SourceID: "hsbc_statements", TrackingKey: "HSBC825834",
+		Direction: domain.Outflow, Minor: 500000, Counterparty: "o", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu", SourceID: "nu_statements", TrackingKey: "HSB825834",
+		Direction: domain.Inflow, Minor: 500000, Counterparty: "ALEJANDRO", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-pay", SourceID: "hsbc_statements", TrackingKey: "PAYROLL1",
+		Direction: domain.Inflow, Minor: 1784458, At: day,
+	})
 
 	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
 	if err != nil {
@@ -278,43 +290,70 @@ func TestTotalsExcludeOwnAccountTransfers(t *testing.T) {
 	}
 }
 
-// A wage SPEI that Nu labelled with the user's name is not earned even when
-// Flex never stored the clave (D76). The other ledger drops only when the
-// amount and calendar day are unique. A $1,000 collision stays spending.
+// An alias names an owned account. A unique amount, currency and day then
+// pairs the other ledger. A $1,000 collision is AMBIGUOUS: neither side is
+// internal (D78). Amount and day alone never mark a row internal.
 func TestSelfNamedInflowIsNotEarned(t *testing.T) {
 	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	transactions.WithHousehold(app.Household{
+		SourceAccount: map[string]string{
+			"hsbc_statements": "flex",
+			"nu_statements":   "nu",
+		},
+		AliasAccount: map[string]string{
+			"ALEJANDRO DE JESUS AYALA DIAZ": "flex",
+		},
+	})
 	day := time.Date(2026, 7, 31, 19, 35, 0, 0, time.UTC)
 	same := time.Date(2026, 6, 30, 21, 18, 0, 0, time.UTC)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc", "hsbc_statements", domain.SourceBankStatement,
-		"HSBC825834", domain.Outflow, 500000, "o", day)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu", "nu_statements", domain.SourceBankStatement,
-		"HSB825834", domain.Inflow, 500000, "ALEJANDRO DE JESUS AYALA DIAZ", day)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-pay", "hsbc_statements", domain.SourceBankStatement,
-		"PAYROLL1", domain.Inflow, 1784458, "", day)
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-hsbc", SourceID: "hsbc_statements", TrackingKey: "HSBC825834",
+		Direction: domain.Outflow, Minor: 500000, Counterparty: "o", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu", SourceID: "nu_statements", TrackingKey: "HSB825834",
+		Direction: domain.Inflow, Minor: 500000, Counterparty: "ALEJANDRO DE JESUS AYALA DIAZ", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-pay", SourceID: "hsbc_statements", TrackingKey: "PAYROLL1",
+		Direction: domain.Inflow, Minor: 1784458, At: day,
+	})
 
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu-wage", "nu_statements", domain.SourceBankStatement,
-		"HSBC219254", domain.Inflow, 492100, "ALEJANDRO DE JESUS AYALA DIAZ", same)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc-wage", "hsbc_statements", domain.SourceBankStatement,
-		"", domain.Outflow, 492100, "Pau", same)
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu-wage", SourceID: "nu_statements", TrackingKey: "HSBC219254",
+		Direction: domain.Inflow, Minor: 492100, Counterparty: "ALEJANDRO DE JESUS AYALA DIAZ", At: same,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-hsbc-wage", SourceID: "hsbc_statements",
+		Direction: domain.Outflow, Minor: 492100, Counterparty: "Pau", At: same,
+	})
 
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu-a", "nu_statements", domain.SourceBankStatement,
-		"HSBC797701", domain.Inflow, 100000, "ALEJANDRO DE JESUS AYALA DIAZ", same)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-nu-b", "nu_statements", domain.SourceBankStatement,
-		"HSBC807761", domain.Inflow, 100000, "ALEJANDRO DE JESUS AYALA DIAZ", same)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc-a", "hsbc_statements", domain.SourceBankStatement,
-		"", domain.Outflow, 100000, "o", same)
-	storeSourcedKeyed(t, transactions, claims, evidence, "tx-hsbc-b", "hsbc_statements", domain.SourceBankStatement,
-		"", domain.Outflow, 100000, "o", same)
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu-a", SourceID: "nu_statements", TrackingKey: "HSBC797701",
+		Direction: domain.Inflow, Minor: 100000, Counterparty: "ALEJANDRO DE JESUS AYALA DIAZ", At: same,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu-b", SourceID: "nu_statements", TrackingKey: "HSBC807761",
+		Direction: domain.Inflow, Minor: 100000, Counterparty: "ALEJANDRO DE JESUS AYALA DIAZ", At: same,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-hsbc-a", SourceID: "hsbc_statements",
+		Direction: domain.Outflow, Minor: 100000, Counterparty: "o", At: same,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-hsbc-b", SourceID: "hsbc_statements",
+		Direction: domain.Outflow, Minor: 100000, Counterparty: "o", At: same,
+	})
 
 	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if totals.IncomeMinor != 1784458 || totals.IncomeCount != 1 {
-		t.Errorf("income = %d (%d), want payroll only", totals.IncomeMinor, totals.IncomeCount)
+	if totals.IncomeMinor != 1784458+200000 || totals.IncomeCount != 3 {
+		t.Errorf("income = %d (%d), want payroll plus the AMBIGUOUS $1,000 inflows", totals.IncomeMinor, totals.IncomeCount)
 	}
 	if totals.ExpenseMinor != 200000 || totals.ExpenseCount != 2 {
-		t.Errorf("expense = %d (%d), want the $1,000 collision only", totals.ExpenseMinor, totals.ExpenseCount)
+		t.Errorf("expense = %d (%d), want the AMBIGUOUS $1,000 Flex outflows", totals.ExpenseMinor, totals.ExpenseCount)
 	}
 
 	page, err := transactions.List(context.Background(), app.TransactionQuery{Limit: 20})
@@ -328,38 +367,153 @@ func TestSelfNamedInflowIsNotEarned(t *testing.T) {
 	if !flag["tx-nu-wage"] || !flag["tx-hsbc-wage"] {
 		t.Errorf("unique wage SPEI flags = %v, want both sides true", flag)
 	}
-	if !flag["tx-nu-a"] || !flag["tx-nu-b"] {
-		t.Error("self-named $1,000 inflows were left as earned")
-	}
-	if flag["tx-hsbc-a"] || flag["tx-hsbc-b"] {
-		t.Error("colliding $1,000 Flex outflows were guessed as a transfer")
+	if flag["tx-nu-a"] || flag["tx-nu-b"] || flag["tx-hsbc-a"] || flag["tx-hsbc-b"] {
+		t.Error("the $1,000 collision was guessed as a transfer")
 	}
 	if flag["tx-pay"] {
 		t.Error("payroll was flagged as an own-account transfer")
 	}
 }
 
-// storeSourcedKeyed writes one Transaction from a named Source with a tracking
-// key, so D75 can pair it with the other side.
-func storeSourcedKeyed(t *testing.T, transactions *TransactionRepository, claims *ClaimRepository,
-	evidence *EvidenceRepository, id, sourceID string, sourceType domain.SourceType,
-	trackingKey string, direction domain.TransactionDirection, minor int64, counterparty string, at time.Time) {
+// Klar SPEI nicknames collide with ALEJANDRO inflows on amount and day. That
+// is not ownership. D76 marked them internal; D78 must not (D21).
+func TestAmountAndDayDoNotMarkKlarNicknamesInternal(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	transactions.WithHousehold(threeBankHousehold())
+	day := time.Date(2026, 6, 18, 19, 17, 36, 0, time.UTC)
+	midnight := time.Date(2026, 6, 18, 6, 0, 0, 0, time.UTC)
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-alejandro", SourceID: "nu_statements",
+		Direction: domain.Inflow, Minor: 120000, Counterparty: "ALEJANDRO DE JESUS AYALA DIAZ", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-lol", SourceID: "klar_statements",
+		Direction: domain.Outflow, Minor: 120000, Counterparty: "lol", At: midnight,
+	})
+
+	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.IncomeMinor != 120000 || totals.ExpenseMinor != 120000 {
+		t.Errorf("income/expense = %d/%d, want both 120000: lol is not an owned alias",
+			totals.IncomeMinor, totals.ExpenseMinor)
+	}
+	if totals.ExcludedInternal != 0 {
+		t.Errorf("excluded internal = %d, want 0", totals.ExcludedInternal)
+	}
+}
+
+// The merchant "klar" is an exact alias of the Klar account. A unique Nu
+// outflow and Klar inflow of the same amount and day are one transfer (D78).
+func TestKlarAliasPairsNuOutflowWithKlarInflow(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	transactions.WithHousehold(threeBankHousehold())
+	outAt := time.Date(2026, 6, 18, 19, 17, 36, 0, time.UTC)
+	inAt := time.Date(2026, 6, 18, 6, 0, 0, 0, time.UTC)
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu-klar", SourceID: "nu_statements",
+		Direction: domain.Outflow, Minor: 5000, Merchant: "klar", At: outAt,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-klar-in", SourceID: "klar_statements",
+		Direction: domain.Inflow, Minor: 5000, Counterparty: "Transferencia", At: inAt,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-oxxo", SourceID: "klar_statements",
+		Direction: domain.Outflow, Minor: 5000, Merchant: "Oxxo", At: inAt,
+	})
+
+	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.IncomeMinor != 0 || totals.IncomeCount != 0 {
+		t.Errorf("income = %d (%d), want none", totals.IncomeMinor, totals.IncomeCount)
+	}
+	if totals.ExpenseMinor != 5000 || totals.ExpenseCount != 1 {
+		t.Errorf("expense = %d (%d), want the Oxxo cargo only", totals.ExpenseMinor, totals.ExpenseCount)
+	}
+	if totals.ExcludedInternal != 2 {
+		t.Errorf("excluded internal = %d, want the Nu→Klar pair", totals.ExcludedInternal)
+	}
+}
+
+// Two Nu "klar" outflows and two Klar inflows of $1,000 on one day are
+// AMBIGUOUS. Ownership is valid and Core still does not guess (D78).
+func TestAmbiguousOwnedAliasPairsStayEarnedAndSpent(t *testing.T) {
+	transactions, claims, _, evidence, _ := newTransactionTestRepo(t)
+	transactions.WithHousehold(threeBankHousehold())
+	day := time.Date(2026, 6, 25, 6, 0, 0, 0, time.UTC)
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu-a", SourceID: "nu_statements",
+		Direction: domain.Outflow, Minor: 100000, Merchant: "klar", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-nu-b", SourceID: "nu_statements",
+		Direction: domain.Outflow, Minor: 100000, Merchant: "klar", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-klar-a", SourceID: "klar_statements",
+		Direction: domain.Inflow, Minor: 100000, Counterparty: "Transferencia", At: day,
+	})
+	storeSourced(t, transactions, claims, evidence, sourcedTx{
+		ID: "tx-klar-b", SourceID: "klar_statements",
+		Direction: domain.Inflow, Minor: 100000, Counterparty: "MERCADO*PAGO", At: day,
+	})
+
+	totals, err := transactions.Totals(context.Background(), app.TransactionQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if totals.IncomeMinor != 200000 || totals.ExpenseMinor != 200000 || totals.ExcludedInternal != 0 {
+		t.Errorf("income/expense/internal = %d/%d/%d, want 200000/200000/0",
+			totals.IncomeMinor, totals.ExpenseMinor, totals.ExcludedInternal)
+	}
+}
+
+func threeBankHousehold() app.Household {
+	return app.Household{
+		SourceAccount: map[string]string{
+			"hsbc_statements": "flex",
+			"nu_statements":   "nu",
+			"klar_statements": "klar",
+		},
+		AliasAccount: map[string]string{
+			"ALEJANDRO DE JESUS AYALA DIAZ": "flex",
+			"klar":                          "klar",
+		},
+	}
+}
+
+type sourcedTx struct {
+	ID, SourceID, TrackingKey, Counterparty, Merchant string
+	Direction                                         domain.TransactionDirection
+	Minor                                             int64
+	At                                                time.Time
+}
+
+func storeSourced(t *testing.T, transactions *TransactionRepository, claims *ClaimRepository,
+	evidence *EvidenceRepository, row sourcedTx) {
 	t.Helper()
-	evidenceID, claimID := "ev-"+id, "claim-"+id
-	e, err := domain.NewEvidence(evidenceID, sourceID, sourceType, "ref-"+id,
-		"application/pdf", []byte("%PDF-test"), at)
+	if row.At.IsZero() {
+		t.Fatal("sourcedTx.At is required")
+	}
+	evidenceID, claimID := "ev-"+row.ID, "claim-"+row.ID
+	e, err := domain.NewEvidence(evidenceID, row.SourceID, domain.SourceBankStatement, "ref-"+row.ID,
+		"application/pdf", []byte("%PDF-test"), row.At)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if created, err := evidence.Insert(context.Background(), e, testProfile, ingestedAt); err != nil || !created {
-		t.Fatalf("Insert %s: created=%v err=%v", id, created, err)
+		t.Fatalf("Insert %s: created=%v err=%v", row.ID, created, err)
 	}
 
-	amount, err := domain.NewIntField(minor, domain.High)
+	amount, err := domain.NewIntField(row.Minor, domain.High)
 	if err != nil {
 		t.Fatal(err)
 	}
-	occurred, err := domain.NewTimeField(at, domain.High)
+	occurred, err := domain.NewTimeField(row.At, domain.High)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,15 +528,18 @@ func storeSourcedKeyed(t *testing.T, transactions *TransactionRepository, claims
 	fields := map[domain.FieldName]domain.ClaimField{
 		domain.FieldAmountMinor:     amount,
 		domain.FieldCurrency:        text("MXN", domain.Low),
-		domain.FieldDirection:       text(string(direction), domain.High),
+		domain.FieldDirection:       text(string(row.Direction), domain.High),
 		domain.FieldFinancialStatus: text("SETTLED", domain.High),
 		domain.FieldOccurredAt:      occurred,
 	}
-	if trackingKey != "" {
-		fields[domain.FieldTrackingKey] = text(trackingKey, domain.High)
+	if row.TrackingKey != "" {
+		fields[domain.FieldTrackingKey] = text(row.TrackingKey, domain.High)
 	}
-	if counterparty != "" {
-		fields[domain.FieldCounterparty] = text(counterparty, domain.High)
+	if row.Counterparty != "" {
+		fields[domain.FieldCounterparty] = text(row.Counterparty, domain.High)
+	}
+	if row.Merchant != "" {
+		fields[domain.FieldMerchant] = text(row.Merchant, domain.Medium)
 	}
 	proposed, err := domain.NewClaim(claimID, domain.ClaimProposed, []string{evidenceID}, fields, claimedAt)
 	if err != nil {
@@ -394,24 +551,24 @@ func storeSourcedKeyed(t *testing.T, transactions *TransactionRepository, claims
 	}
 	in := interpretationOf(t, "interp-"+evidenceID, evidenceID, "", claim)
 	if created, err := claims.Save(context.Background(), in, testProfile, claimedAt); err != nil || !created {
-		t.Fatalf("Save interpretation %s: created=%v err=%v", id, created, err)
+		t.Fatalf("Save interpretation %s: created=%v err=%v", row.ID, created, err)
 	}
 
-	money, err := domain.NewMoney(minor, "MXN")
+	money, err := domain.NewMoney(row.Minor, "MXN")
 	if err != nil {
 		t.Fatal(err)
 	}
 	draft := domain.TransactionDraft{
-		ID: id, Money: money, Counterparty: counterparty, Direction: direction,
-		FinancialStatus: domain.StatusSettled, ReconciliationState: domain.Unreconciled,
-		State: domain.TransactionActive, OccurredAt: at, EvidenceIDs: []string{evidenceID}, CreatedAt: builtAt,
+		ID: row.ID, Money: money, Counterparty: row.Counterparty, Merchant: row.Merchant,
+		Direction: row.Direction, FinancialStatus: domain.StatusSettled, ReconciliationState: domain.Unreconciled,
+		State: domain.TransactionActive, OccurredAt: row.At, EvidenceIDs: []string{evidenceID}, CreatedAt: builtAt,
 	}
 	tx, err := domain.NewTransaction(draft)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if created, err := transactions.Save(context.Background(), one(tx, claimID), builtAt); err != nil || !created {
-		t.Fatalf("Save %s: created=%v err=%v", id, created, err)
+		t.Fatalf("Save %s: created=%v err=%v", row.ID, created, err)
 	}
 }
 

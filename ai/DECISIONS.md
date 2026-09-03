@@ -1923,6 +1923,31 @@ amount and day across Sources is still D76's secondary join, and only after a
 keyed SPEI has proved a name.
 **Source.** Author, 2026-09-03, on the June and July Klar PDFs.
 
+### D78 — Owned-account identity is configured; amount and time never stand alone
+**Status:** Accepted · 2026-09-03 · Reversibility: bounded — it changes which rows totals treat as internal
+**Decision.** `sources.json` names the accounts the user owns. Each `BANK_STATEMENT`
+Source names exactly one of them. An alias is an exact merchant or counterparty
+string that points at one owned account. An internal-transfer candidate is an
+outflow and an inflow on two different owned accounts that share a tracking key
+or an owned alias, and then the same amount, currency, and UTC calendar day ±1.
+A unique pair is `internal: true` on both rows; the rows stay (D75). Several
+movements that fit the same identity are AMBIGUOUS: none of them is internal.
+**Closes.** D76 treating every proved name as internal, and D76's unique
+amount+day join marking Klar `lol` as a Flex→Nu wage. Nu merchant `klar` can
+now name the Klar account without a clave.
+**Why.** Amount and day describe a coincidence. Ownership describes a household.
+Klar SPEI nicknames collide with ALEJANDRO inflows; guessing the pair is D21.
+An explicit alias is a fact the user wrote down.
+**Rejected — amount and calendar day as a standalone reason for INTERNAL.**
+That is the rule that produced the false D76 matches. It is no longer a rule.
+**Rejected — inferring the user's name from a keyed SPEI (D76).** The name is
+an alias if and only if `sources.json` says so. A collision of that alias is
+AMBIGUOUS, not "the inflows are internal and the outflows are not".
+**Consequence — unpaired ALEJANDRO inflows are earned again** until a unique
+owned pair exists. That is honest. Net is no longer helped by dropping one
+ledger and keeping the other.
+**Source.** Author, 2026-09-03, on the three-bank June–July run.
+
 ## Template
 
 ```markdown

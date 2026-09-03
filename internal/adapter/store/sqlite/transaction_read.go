@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 
 // List returns ACTIVE Transactions in the order required by API.md section 7.
 func (r *TransactionRepository) List(ctx context.Context, q app.TransactionQuery) (app.TransactionPage, error) {
-	query, args := transactionListSQL(q)
+	query, args := r.transactionListSQL(q)
 	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return app.TransactionPage{}, fmt.Errorf("list transactions: %w", err)
@@ -41,8 +42,8 @@ func (r *TransactionRepository) List(ctx context.Context, q app.TransactionQuery
 	return page, nil
 }
 
-func transactionListSQL(q app.TransactionQuery) (string, []any) {
-	cte, args := ownAccountTransferSQL()
+func (r *TransactionRepository) transactionListSQL(q app.TransactionQuery) (string, []any) {
+	cte, args := r.ownAccountTransferSQL()
 	var where []string
 	where, args = append(where, "t.transaction_state = ?"), append(args, string(domain.TransactionActive))
 	if q.From != nil {
@@ -90,75 +91,101 @@ func transactionListSQL(q app.TransactionQuery) (string, []any) {
 	LIMIT ?`, args
 }
 
-// ownAccountTransferSQL is the movement D75 and D76 leave out of earned and
-// spent. A keyed SPEI across two Sources is both sides (D75). An inflow whose
-// counterparty is a name those keyed SPEI already proved is the user is also
-// the user's own money (D76). The other ledger joins only when the amount and
-// calendar day are unique; a collision stays unmatched (D59, D21).
-func ownAccountTransferSQL() (string, []any) {
-	return `WITH tracking_keyed AS (
-		SELECT ct.transaction_id, e.source_id, t.direction,
+// ownAccountTransferSQL is the movement D75 and D78 leave out of earned and
+// spent. Identity is a tracking key or an owned alias. Amount, currency and
+// UTC day ±1 pick the pair. A collision is AMBIGUOUS and stays in the totals.
+func (r *TransactionRepository) ownAccountTransferSQL() (string, []any) {
+	if r.household.Empty() {
+		return `WITH own_account_transfer AS (SELECT CAST(NULL AS TEXT) AS id WHERE 0) `, nil
+	}
+
+	sourceSQL, sourceArgs := sqlNamedValues("source_id", "account_id", sortedPairs(r.household.SourceAccount))
+	aliasSQL, aliasArgs := sqlNamedValues("alias", "account_id", sortedPairs(r.household.AliasAccount))
+	args := append(append([]any{}, sourceArgs...), aliasArgs...)
+	args = append(args, string(domain.FieldTrackingKey), string(domain.TransactionActive),
+		string(domain.Outflow), string(domain.Inflow))
+
+	return `WITH source_account(source_id, account_id) AS (` + sourceSQL + `),
+	alias_account(alias, account_id) AS (` + aliasSQL + `),
+	movement AS (
+		SELECT t.id, t.direction, t.amount_minor, t.currency, t.occurred_at,
+			sa.account_id AS home,
 			CASE
+				WHEN ca.account_id IS NOT NULL AND ma.account_id IS NOT NULL
+					AND ca.account_id <> ma.account_id THEN NULL
+				ELSE COALESCE(ca.account_id, ma.account_id)
+			END AS pointed,
+			(SELECT CASE
 				WHEN cf.value_text LIKE 'HSB%' AND cf.value_text NOT LIKE 'HSBC%'
 				THEN 'HSBC' || substr(cf.value_text, 4)
 				ELSE cf.value_text
-			END AS key
-		FROM claim_transaction ct
-		JOIN claim_fields cf ON cf.claim_id = ct.claim_id AND cf.field_name = ?
-		JOIN transactions t ON t.id = ct.transaction_id AND t.transaction_state = ?
+			END
+			FROM claim_transaction ct
+			JOIN claim_fields cf ON cf.claim_id = ct.claim_id AND cf.field_name = ?
+			WHERE ct.transaction_id = t.id
+				AND cf.value_text IS NOT NULL AND length(cf.value_text) > 0
+			LIMIT 1) AS key
+		FROM transactions t
 		JOIN transaction_evidence te ON te.transaction_id = t.id
 		JOIN evidence e ON e.id = te.evidence_id
-		WHERE cf.value_text IS NOT NULL AND length(cf.value_text) > 0
-	), keyed_transfer AS (
-		SELECT DISTINCT a.transaction_id AS id
-		FROM tracking_keyed a
-		JOIN tracking_keyed b
-			ON a.key = b.key
-			AND a.source_id <> b.source_id
-			AND a.direction <> b.direction
-	), self_name AS (
-		SELECT DISTINCT t.counterparty AS name
-		FROM keyed_transfer k
-		JOIN transactions t ON t.id = k.id
-		WHERE t.direction = ?
-			AND t.counterparty IS NOT NULL
-			AND t.counterparty <> ?
-			AND length(t.counterparty) > 0
-	), self_named_inflow AS (
-		SELECT t.id, t.amount_minor, t.occurred_at
-		FROM transactions t
-		JOIN self_name s ON s.name = t.counterparty
-		WHERE t.direction = ?
-			AND t.transaction_state = ?
+		JOIN source_account sa ON sa.source_id = e.source_id
+		LEFT JOIN alias_account ca ON ca.alias = t.counterparty
+		LEFT JOIN alias_account ma ON ma.alias = t.merchant
+		WHERE t.transaction_state = ?
 	), candidate AS (
 		SELECT DISTINCT o.id AS out_id, i.id AS in_id
-		FROM transactions o
-		JOIN transaction_evidence teo ON teo.transaction_id = o.id
-		JOIN evidence eo ON eo.id = teo.evidence_id
-		JOIN self_named_inflow i ON i.amount_minor = o.amount_minor
-		JOIN transaction_evidence tei ON tei.transaction_id = i.id
-		JOIN evidence ei ON ei.id = tei.evidence_id
-		WHERE o.direction = ?
-			AND o.transaction_state = ?
-			AND eo.source_id <> ei.source_id
+		FROM movement o
+		JOIN movement i
+			ON o.direction = ?
+			AND i.direction = ?
+			AND o.home <> i.home
+			AND o.amount_minor = i.amount_minor
+			AND o.currency = i.currency
 			AND abs(julianday(substr(o.occurred_at, 1, 10)) - julianday(substr(i.occurred_at, 1, 10))) <= 1
-	), unique_other_side AS (
-		SELECT c.out_id AS id
+			AND (
+				(o.key IS NOT NULL AND i.key IS NOT NULL AND o.key = i.key)
+				OR o.pointed = i.home
+				OR i.pointed = o.home
+			)
+	), unique_pair AS (
+		SELECT c.out_id, c.in_id
 		FROM candidate c
 		WHERE (SELECT COUNT(*) FROM candidate x WHERE x.out_id = c.out_id) = 1
 			AND (SELECT COUNT(*) FROM candidate x WHERE x.in_id = c.in_id) = 1
 	), own_account_transfer AS (
-		SELECT id FROM keyed_transfer
+		SELECT out_id AS id FROM unique_pair
 		UNION
-		SELECT id FROM self_named_inflow
-		UNION
-		SELECT id FROM unique_other_side
-	) `, []any{
-			string(domain.FieldTrackingKey), string(domain.TransactionActive),
-			string(domain.Inflow), domain.CounterpartySelf,
-			string(domain.Inflow), string(domain.TransactionActive),
-			string(domain.Outflow), string(domain.TransactionActive),
+		SELECT in_id AS id FROM unique_pair
+	) `, args
+}
+
+func sortedPairs(m map[string]string) [][2]string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][2]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, [2]string{k, m[k]})
+	}
+	return out
+}
+
+func sqlNamedValues(colA, colB string, rows [][2]string) (string, []any) {
+	if len(rows) == 0 {
+		return fmt.Sprintf("SELECT CAST(NULL AS TEXT) AS %s, CAST(NULL AS TEXT) AS %s WHERE 0", colA, colB), nil
+	}
+	var b strings.Builder
+	args := make([]any, 0, len(rows)*2)
+	for i, row := range rows {
+		if i > 0 {
+			b.WriteString(", ")
 		}
+		b.WriteString("(?, ?)")
+		args = append(args, row[0], row[1])
+	}
+	return "VALUES " + b.String(), args
 }
 
 func appendSet(where []string, args []any, column string, values []string) ([]string, []any) {
@@ -254,8 +281,8 @@ func scanListedTransaction(rows *sql.Rows) (app.ListedTransaction, error) {
 
 // Totals sums income and spending over the Transactions the query selects. An
 // internal movement is the user's own money and counts as neither (D55, D75,
-// D76); Cajita uses the reserved counterparty, a keyed SPEI uses the tracking
-// key, and a self-named inflow uses the name those SPEI already proved.
+// D78); Cajita uses the reserved counterparty, and an owned-account pair uses
+// tracking key or alias first, then amount, currency and time.
 func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQuery) (app.TransactionTotals, error) {
 	// Totals are single-currency: mixing minor units of two currencies is
 	// meaningless. BillyCore supports one currency today (D50), so the default
@@ -266,7 +293,7 @@ func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQue
 	}
 	totals := app.TransactionTotals{Currency: currency}
 
-	cte, cteArgs := ownAccountTransferSQL()
+	cte, cteArgs := r.ownAccountTransferSQL()
 	where := []string{"t.transaction_state = ?", "t.currency = ?", "t.amount_minor IS NOT NULL"}
 	filterArgs := []any{string(domain.TransactionActive), string(currency)}
 	if q.From != nil {
@@ -281,7 +308,7 @@ func (r *TransactionRepository) Totals(ctx context.Context, q app.TransactionQue
 		return append(out, filterArgs...)
 	}
 
-	// Income and spending, excluding Cajita (D55) and own-account SPEI (D75, D76).
+	// Income and spending, excluding Cajita (D55) and own-account transfers (D75, D78).
 	external := append([]string{
 		"(t.counterparty IS NULL OR t.counterparty <> ?)",
 		"t.id NOT IN (SELECT id FROM own_account_transfer)",

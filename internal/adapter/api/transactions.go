@@ -41,9 +41,8 @@ type transactionResponse struct {
 	Account             *supportedTextResponse `json:"account"`
 
 	// Internal is true when both sides of the movement are the user: a Cajita
-	// or respaldo row (D62), a keyed SPEI between two of the user's accounts
-	// (D75), or an inflow the user sent to themselves (D76). A client that
-	// reports income or spending excludes it (D55).
+	// or respaldo row (D62), or a unique transfer between two owned accounts
+	// (D75, D78). A client that reports income or spending excludes it (D55).
 	Internal      bool     `json:"internal"`
 	EvidenceIDs   []string `json:"evidence_ids"`
 	Relationships []any    `json:"relationships"`

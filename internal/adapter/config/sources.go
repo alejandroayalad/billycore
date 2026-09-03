@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/alejandroayalad/billycore/internal/adapter/parser/profile"
@@ -39,39 +40,52 @@ type Source struct {
 	// extraction selects the parser from it. There is no default: a guess reads
 	// a statement with an email parser.
 	ExtractionProfile app.ExtractionProfile `json:"extraction_profile"`
+
+	// OwnedAccount is the household account this Source posts (D78). A
+	// BANK_STATEMENT Source must name one. Gmail may omit it.
+	OwnedAccount string `json:"owned_account"`
+}
+
+// Account is one account the user owns (D78). Aliases are exact merchant or
+// counterparty strings that name this account on another ledger.
+type Account struct {
+	ID      string   `json:"id"`
+	Aliases []string `json:"aliases"`
 }
 
 type sourcesDocument struct {
-	Sources []Source `json:"sources"`
+	Accounts []Account `json:"accounts"`
+	Sources  []Source  `json:"sources"`
 }
 
-// LoadSources reads sources.json.
-//
-// A missing file is not an error: BillyCore starts with no Source configured,
-// and `POST /v1/sources/{id}/sync` answers 404 for every id, which is exactly
-// what API.md §5 specifies for an unconfigured Source. A file that exists and is
-// wrong *is* an error — a typo that silently produced an empty set would surface
-// as a 404 from sync, which is the least informative way possible to learn about
-// it (D26).
-func LoadSources(dir string) ([]Source, error) {
+// LoadFile reads sources.json: the Sources and the household they belong to.
+func LoadFile(dir string) ([]Source, app.Household, error) {
 	path := filepath.Join(dir, SourcesFile)
 
 	content, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return nil, app.Household{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("cannot read %s: %w", path, err)
+		return nil, app.Household{}, fmt.Errorf("cannot read %s: %w", path, err)
 	}
 
 	var document sourcesDocument
 	if err := json.Unmarshal(content, &document); err != nil {
-		return nil, fmt.Errorf("%s is not valid JSON: %w", path, err)
+		return nil, app.Household{}, fmt.Errorf("%s is not valid JSON: %w", path, err)
 	}
-	if err := validate(document.Sources); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	household, err := validate(document)
+	if err != nil {
+		return nil, app.Household{}, fmt.Errorf("%s: %w", path, err)
 	}
-	return document.Sources, nil
+	return document.Sources, household, nil
+}
+
+// LoadSources reads sources.json. A missing file is not an error: BillyCore
+// starts with no Source configured (D26).
+func LoadSources(dir string) ([]Source, error) {
+	sources, _, err := LoadFile(dir)
+	return sources, err
 }
 
 // validateProfile holds the configuration to the closed vocabulary of
@@ -90,31 +104,69 @@ func validateProfile(s Source) error {
 	return nil
 }
 
-func validate(sources []Source) error {
-	seen := make(map[string]bool, len(sources))
-	for i, s := range sources {
+func validate(document sourcesDocument) (app.Household, error) {
+	accounts := make(map[string]bool, len(document.Accounts))
+	household := app.Household{
+		SourceAccount: map[string]string{},
+		AliasAccount:  map[string]string{},
+	}
+	for i, a := range document.Accounts {
+		if a.ID == "" {
+			return app.Household{}, fmt.Errorf("account %d has no id", i)
+		}
+		if accounts[a.ID] {
+			return app.Household{}, fmt.Errorf("account id %q appears twice", a.ID)
+		}
+		accounts[a.ID] = true
+		for _, alias := range a.Aliases {
+			if alias == "" {
+				return app.Household{}, fmt.Errorf("account %q has an empty alias", a.ID)
+			}
+			if other, exists := household.AliasAccount[alias]; exists {
+				return app.Household{}, fmt.Errorf("alias %q points at %q and %q", alias, other, a.ID)
+			}
+			household.AliasAccount[alias] = a.ID
+		}
+	}
+
+	seen := make(map[string]bool, len(document.Sources))
+	for i, s := range document.Sources {
 		if s.ID == "" {
-			return fmt.Errorf("source %d has no id", i)
+			return app.Household{}, fmt.Errorf("source %d has no id", i)
 		}
 		if seen[s.ID] {
-			// Two Sources sharing an id means one of them is unreachable, and
-			// worse, their Evidence would share an identity namespace (D10).
-			return fmt.Errorf("source id %q appears twice", s.ID)
+			return app.Household{}, fmt.Errorf("source id %q appears twice", s.ID)
 		}
 		seen[s.ID] = true
 
 		if err := s.Type.Validate(); err != nil {
-			return fmt.Errorf("source %q: %w", s.ID, err)
+			return app.Household{}, fmt.Errorf("source %q: %w", s.ID, err)
 		}
 		if err := validateProfile(s); err != nil {
-			return err
+			return app.Household{}, err
 		}
 		if s.Type == domain.SourceGmail && s.Query == "" {
-			// An empty Gmail query matches the entire mailbox. That is not a
-			// configuration anyone means to write, and it is not a mistake to
-			// discover after a thousand unrelated artifacts are recorded.
-			return fmt.Errorf("source %q is GMAIL and has no query", s.ID)
+			return app.Household{}, fmt.Errorf("source %q is GMAIL and has no query", s.ID)
+		}
+		if s.Type == domain.SourceBankStatement && s.OwnedAccount == "" {
+			return app.Household{}, fmt.Errorf("source %q is BANK_STATEMENT and has no owned_account", s.ID)
+		}
+		if s.OwnedAccount != "" {
+			if !accounts[s.OwnedAccount] {
+				ids := make([]string, 0, len(accounts))
+				for id := range accounts {
+					ids = append(ids, id)
+				}
+				sort.Strings(ids)
+				if len(ids) == 0 {
+					return app.Household{}, fmt.Errorf("source %q names owned_account %q, and no account is configured",
+						s.ID, s.OwnedAccount)
+				}
+				return app.Household{}, fmt.Errorf("source %q names owned_account %q, which is not configured: use one of %s",
+					s.ID, s.OwnedAccount, strings.Join(ids, ", "))
+			}
+			household.SourceAccount[s.ID] = s.OwnedAccount
 		}
 	}
-	return nil
+	return household, nil
 }

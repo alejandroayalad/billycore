@@ -21,11 +21,18 @@ const eventTransactionCreated = "TransactionCreated"
 
 // TransactionRepository stores Transactions.
 type TransactionRepository struct {
-	db *sql.DB
+	db        *sql.DB
+	household app.Household
 }
 
 func NewTransactionRepository(db *sql.DB) *TransactionRepository {
 	return &TransactionRepository{db: db}
+}
+
+// WithHousehold sets the owned accounts that List and Totals use (D78).
+func (r *TransactionRepository) WithHousehold(h app.Household) *TransactionRepository {
+	r.household = h
+	return r
 }
 
 // Save writes each Transaction of one artifact in one database transaction: the
